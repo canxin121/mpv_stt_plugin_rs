@@ -1,0 +1,6 @@
+[env]
+BINDGEN_EXTRA_CLANG_ARGS = "-I/mnt/disk1/shared/git/mpv/include"
+
+[build]
+# 可选：设置默认 target
+# target = "x86_64-unknown-linux-gnu"
