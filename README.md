@@ -160,6 +160,26 @@ dist/android/x86_64/libwhispersubs_rs.so
 
 > 说明：**一个 `.so` 无法同时运行在所有 ABI 上**，必须按 ABI 分别编译与打包。
 
+### 中间产物 / 依赖库获取位置（Android）
+
+这些依赖由 `mpv-android/buildscripts` 构建并安装到 prefix 目录：
+
+- 目录模板：
+  - `mpv-android/buildscripts/prefix/<arch>/usr/local/lib/`
+  - `<arch>` 为：`arm64` / `armv7l` / `x86` / `x86_64`
+
+常用库文件位置示例（以 arm64 为例）：
+- `libmpv.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libmpv.so`
+- `libavcodec.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libavcodec.so`
+- `libavdevice.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libavdevice.so`
+- `libavformat.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libavformat.so`
+- `libavutil.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libavutil.so`
+- `libswresample.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libswresample.so`
+
+`libc++_shared.so` 来自 NDK：
+- `.../android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/<triple>/libc++_shared.so`
+  - 例如 arm64：`.../sysroot/usr/lib/aarch64-linux-android/libc++_shared.so`
+
 ### 关键环境变量（脚本已自动处理）
 - `ANDROID_NDK_HOME`/`NDK`：NDK 路径
 - `MPV_ANDROID`：mpv-android 仓库路径（默认 `/mnt/disk1/shared/git/mpv-android`）
