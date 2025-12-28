@@ -22,6 +22,14 @@ pub struct WhisperConfig {
     pub timeout_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+pub struct WhisperDeviceNotice {
+    pub requested: InferenceDevice,
+    pub effective: InferenceDevice,
+    pub reason: String,
+    pub gpu_device: i32,
+}
+
 impl Default for WhisperConfig {
     fn default() -> Self {
         Self {
@@ -79,6 +87,7 @@ pub struct WhisperRunner {
     config: WhisperConfig,
     ctx: Option<WhisperContext>,
     active_device: Option<InferenceDevice>,
+    pending_device_notice: Option<WhisperDeviceNotice>,
 }
 
 impl WhisperRunner {
@@ -87,7 +96,12 @@ impl WhisperRunner {
             config,
             ctx: None,
             active_device: None,
+            pending_device_notice: None,
         }
+    }
+
+    pub fn take_device_notice(&mut self) -> Option<WhisperDeviceNotice> {
+        self.pending_device_notice.take()
     }
 
     fn select_effective_device(&self) -> (InferenceDevice, String) {
@@ -106,6 +120,22 @@ impl WhisperRunner {
                     (
                         InferenceDevice::CPU,
                         "whisper-cuda feature disabled".to_string(),
+                    )
+                }
+            }
+            InferenceDevice::OPENCL => {
+                if cfg!(feature = "whisper-opencl") {
+                    (
+                        InferenceDevice::OPENCL,
+                        "requested opencl and whisper-opencl feature enabled".to_string(),
+                    )
+                } else {
+                    warn!(
+                        "inference_device=OPENCL but whisper-opencl feature is disabled; falling back to CPU"
+                    );
+                    (
+                        InferenceDevice::CPU,
+                        "whisper-opencl feature disabled".to_string(),
                     )
                 }
             }
@@ -158,6 +188,12 @@ impl WhisperRunner {
 
         self.ctx = Some(ctx);
         self.active_device = Some(device);
+        self.pending_device_notice = Some(WhisperDeviceNotice {
+            requested: self.config.inference_device,
+            effective: device,
+            reason: reason.to_string(),
+            gpu_device: self.config.gpu_device,
+        });
         Ok(())
     }
 

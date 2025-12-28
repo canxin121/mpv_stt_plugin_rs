@@ -3,6 +3,9 @@ use mpv_client::{Event, Handle, mpv_handle};
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
+#[cfg(target_os = "android")]
+use std::ffi::CString;
+
 use crate::audio::AudioExtractor;
 use crate::config::Config;
 use crate::srt::{self, SrtFile};
@@ -634,6 +637,7 @@ impl PluginState {
             error!("Whisper transcription failed: {}", e);
             return false;
         }
+        self.show_device_notice(client);
 
         // Offset timestamps
         let append_srt = format!("{}.srt", append_path);
@@ -683,6 +687,26 @@ impl PluginState {
             self.subtitle_manager.len()
         );
         true
+    }
+
+    fn show_device_notice(&mut self, client: &mut Handle) {
+        let Some(notice) = self.whisper_runner.take_device_notice() else {
+            return;
+        };
+
+        let mut msg = format!("Whisper device: {}", notice.effective);
+        if notice.effective.is_gpu() {
+            msg.push_str(&format!(" (gpu_device: {})", notice.gpu_device));
+        }
+        if notice.effective != notice.requested {
+            msg.push_str(&format!(
+                " (fallback from {}: {})",
+                notice.requested, notice.reason
+            ));
+        }
+
+        let _ = client.command(&["show-text", &msg, "3000"]);
+        info!("Whisper device notice: {}", msg);
     }
 
     /// Process completed translation results from async queue
@@ -832,123 +856,164 @@ impl PluginState {
 /// MPV C plugin entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_int {
-    init_logger();
+    #[cfg(target_os = "android")]
+    init_panic_logger();
 
-    let client = Handle::from_ptr(handle);
+    let result = std::panic::catch_unwind(|| {
+        init_logger();
 
-    info!("WhisperSubs Rust plugin initializing...");
+        let client = Handle::from_ptr(handle);
 
-    // Print welcome message
-    let _ = client.command(&["show-text", "WhisperSubs Rust plugin loaded!", "3000"]);
-    info!("Plugin loaded, client name: {}", client.name());
+        info!("WhisperSubs Rust plugin initializing...");
 
-    // Initialize plugin state with configuration
-    let config = Config::load();
-    let auto_start = config.auto_start;
-    let mut state = PluginState::new(config);
+        // Print welcome message
+        let _ = client.command(&["show-text", "WhisperSubs Rust plugin loaded!", "3000"]);
+        info!("Plugin loaded, client name: {}", client.name());
 
-    // Get client name first
-    let client_name = client.name().to_string();
+        // Initialize plugin state with configuration
+        let config = Config::load();
+        let auto_start = config.auto_start;
+        let mut state = PluginState::new(config);
 
-    // Register key binding
-    let key_binding = format!("Ctrl+. script-message-to {} toggle-whisper", client_name);
-    let section_name = format!("{}-input", client_name);
+        // Get client name first
+        let client_name = client.name().to_string();
 
-    let _ = client.command(&["define-section", &section_name, &key_binding, "default"]);
-    let _ = client.command(&["enable-section", &section_name]);
+        // Register key binding
+        let key_binding = format!("Ctrl+. script-message-to {} toggle-whisper", client_name);
+        let section_name = format!("{}-input", client_name);
 
-    // Set auto-start flag (will start after file loads)
-    if auto_start {
-        info!("Auto-start enabled, waiting for file to load...");
-        state.pending_auto_start = true;
-    }
+        let _ = client.command(&["define-section", &section_name, &key_binding, "default"]);
+        let _ = client.command(&["enable-section", &section_name]);
 
-    // Main event loop with short timeout for continuous processing
-    loop {
-        // Use 0.1 second timeout to allow continuous processing
-        match client.wait_event(0.1) {
-            Event::Shutdown => {
-                info!("Shutting down...");
-                state.shutting_down = true;
-                state.running = false;
-                state.cleanup(client);
-                info!("Shutdown complete");
-                return 0;
-            }
-            Event::ClientMessage(msg) => {
-                if state.shutting_down {
-                    continue;
-                }
-                let args = msg.args();
-                if !args.is_empty() {
-                    let command = if args[0] == "toggle-whisper" {
-                        Some("toggle-whisper")
-                    } else if args.len() > 1 && args[1] == "toggle-whisper" {
-                        Some("toggle-whisper")
-                    } else {
-                        None
-                    };
+        // Set auto-start flag (will start after file loads)
+        if auto_start {
+            info!("Auto-start enabled, waiting for file to load...");
+            state.pending_auto_start = true;
+        }
 
-                    if command.is_some() {
-                        debug!("Toggling whisper...");
-                        state.toggle_whisper(client);
-                    }
-                }
-            }
-            Event::FileLoaded => {
-                if state.shutting_down {
-                    continue;
-                }
-                debug!("File loaded event received");
-                state.file_loaded = true;
-
-                // Trigger auto-start if pending
-                if state.pending_auto_start && !state.running {
-                    info!("Auto-starting Whisper transcription after file load");
-                    state.pending_auto_start = false;
-                    state.running = true;
-                    state.start_transcription(client);
-                }
-            }
-            Event::PlaybackRestart => {
-                if state.shutting_down {
-                    continue;
-                }
-                debug!("Playback restart event received");
-
-                // Also trigger auto-start on playback restart (backup mechanism)
-                if state.pending_auto_start && !state.running && state.file_loaded {
-                    info!("Auto-starting Whisper transcription after playback restart");
-                    state.pending_auto_start = false;
-                    state.running = true;
-                    state.start_transcription(client);
-                }
-
-                state.tick(client);
-            }
-            Event::EndFile(_) => {
-                if state.running && !state.shutting_down {
+        // Main event loop with short timeout for continuous processing
+        loop {
+            // Use 0.1 second timeout to allow continuous processing
+            match client.wait_event(0.1) {
+                Event::Shutdown => {
+                    info!("Shutting down...");
+                    state.shutting_down = true;
                     state.running = false;
                     state.cleanup(client);
+                    info!("Shutdown complete");
+                    return 0;
                 }
-                state.file_loaded = false; // Reset for next file
-            }
-            Event::None => {
-                if state.shutting_down {
-                    continue;
+                Event::ClientMessage(msg) => {
+                    if state.shutting_down {
+                        continue;
+                    }
+                    let args = msg.args();
+                    if !args.is_empty() {
+                        let command = if args[0] == "toggle-whisper" {
+                            Some("toggle-whisper")
+                        } else if args.len() > 1 && args[1] == "toggle-whisper" {
+                            Some("toggle-whisper")
+                        } else {
+                            None
+                        };
+
+                        if command.is_some() {
+                            debug!("Toggling whisper...");
+                            state.toggle_whisper(client);
+                        }
+                    }
                 }
-                // Timeout - use this to tick the processing
-                state.tick(client);
-            }
-            _ => {
-                if state.shutting_down {
-                    continue;
+                Event::FileLoaded => {
+                    if state.shutting_down {
+                        continue;
+                    }
+                    debug!("File loaded event received");
+                    state.file_loaded = true;
+
+                    // Trigger auto-start if pending
+                    if state.pending_auto_start && !state.running {
+                        info!("Auto-starting Whisper transcription after file load");
+                        state.pending_auto_start = false;
+                        state.running = true;
+                        state.start_transcription(client);
+                    }
                 }
-                // Other events - still tick
-                state.tick(client);
+                Event::PlaybackRestart => {
+                    if state.shutting_down {
+                        continue;
+                    }
+                    debug!("Playback restart event received");
+
+                    // Also trigger auto-start on playback restart (backup mechanism)
+                    if state.pending_auto_start && !state.running && state.file_loaded {
+                        info!("Auto-starting Whisper transcription after playback restart");
+                        state.pending_auto_start = false;
+                        state.running = true;
+                        state.start_transcription(client);
+                    }
+
+                    state.tick(client);
+                }
+                Event::EndFile(_) => {
+                    if state.running && !state.shutting_down {
+                        state.running = false;
+                        state.cleanup(client);
+                    }
+                    state.file_loaded = false; // Reset for next file
+                }
+                Event::None => {
+                    if state.shutting_down {
+                        continue;
+                    }
+                    // Timeout - use this to tick the processing
+                    state.tick(client);
+                }
+                _ => {
+                    if state.shutting_down {
+                        continue;
+                    }
+                    // Other events - still tick
+                    state.tick(client);
+                }
             }
         }
+    });
+
+    if let Err(err) = result {
+        #[cfg(target_os = "android")]
+        log_android_error(&format!("mpv_open_cplugin panicked: {:?}", err));
+        #[cfg(not(target_os = "android"))]
+        eprintln!("mpv_open_cplugin panicked: {:?}", err);
+        return -1;
     }
+
+    0
+}
+
+#[cfg(target_os = "android")]
+fn init_panic_logger() {
+    std::panic::set_hook(Box::new(|info| {
+        log_android_error(&format!("panic: {}", info));
+    }));
+}
+
+#[cfg(target_os = "android")]
+fn log_android_error(message: &str) {
+    const ANDROID_LOG_ERROR: libc::c_int = 6;
+    let tag = CString::new("whispersubs_rs").unwrap_or_default();
+    let msg = CString::new(message).unwrap_or_default();
+    unsafe {
+        __android_log_write(ANDROID_LOG_ERROR, tag.as_ptr(), msg.as_ptr());
+    }
+}
+
+#[cfg(target_os = "android")]
+unsafe extern "C" {
+    fn __android_log_write(
+        prio: libc::c_int,
+        tag: *const libc::c_char,
+        text: *const libc::c_char,
+    ) -> libc::c_int;
 }
 
 fn init_logger() {

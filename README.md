@@ -81,7 +81,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
    # 识别语言：固定语言用 "ja" / "en" 等，自动识别用 "auto"
    language = "ja"
 
-   # 推理设备：cpu / cuda
+   # 推理设备：cpu / cuda / opencl
    inference_device = "cpu"
    # GPU 设备编号（多 GPU 环境下选择）
    gpu_device = 0
@@ -124,6 +124,12 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
    - 运行时配置：`inference_device = "cuda"`（或环境变量 `WHISPERSUBS_INFERENCE_DEVICE=cuda`）
    - 运行时确保系统能找到 CUDA 运行库（例如配置 `LD_LIBRARY_PATH` 或系统动态链接器路径）
 
+   OpenCL（Android GPU）说明：
+   - 编译时开启：`cargo build --release --features whisper-opencl`
+   - 运行时配置：`inference_device = "opencl"`（或环境变量 `WHISPERSUBS_INFERENCE_DEVICE=opencl`）
+   - 构建机需提供 OpenCL headers 与 `libOpenCL.so`（脚本可自动从设备拉取库）
+   - 设备需支持 OpenCL 2.0+；不可用时会自动回退到 CPU
+
 
 ## Android 构建
 
@@ -141,6 +147,12 @@ dist/android/arm64-v8a/libwhispersubs_rs.so
 dist/android/armeabi-v7a/libwhispersubs_rs.so
 dist/android/x86/libwhispersubs_rs.so
 dist/android/x86_64/libwhispersubs_rs.so
+```
+
+启用 OpenCL（GPU）构建：
+```bash
+cd ~/.config/mpv/scripts/whispersubs_rs
+WHISPERSUBS_OPENCL=1 ./scripts/build-android-all.sh
 ```
 
 ### 依赖说明（Android 动态链接）

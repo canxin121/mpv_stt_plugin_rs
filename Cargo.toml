@@ -39,9 +39,14 @@ ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg" }
 [features]
 default = []
 whisper-cuda = ["whisper-rs/cuda"]
+whisper-opencl = ["whisper-rs/opencl"]
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
+
+[patch.crates-io]
+whisper-rs = { path = "/mnt/disk1/shared/git/whisper-rs" }
+whisper-rs-sys = { path = "/mnt/disk1/shared/git/whisper-rs/sys" }
