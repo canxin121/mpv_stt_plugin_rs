@@ -39,7 +39,6 @@ ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg" }
 [features]
 default = []
 whisper-cuda = ["whisper-rs/cuda"]
-whisper-vulkan = ["whisper-rs/vulkan"]
 
 [profile.release]
 opt-level = 3

@@ -89,7 +89,7 @@ impl PluginState {
             .with_language(config.language.clone())
             .with_inference_device(config.inference_device)
             .with_gpu_device(config.gpu_device)
-            .with_cuda_flash_attn(config.cuda_flash_attn)
+            .with_flash_attn(config.flash_attn)
             .with_timeout_ms(config.whisper_timeout_ms);
 
         let whisper_runner = WhisperRunner::new(whisper_config);

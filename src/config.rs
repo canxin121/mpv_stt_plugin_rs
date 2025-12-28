@@ -13,7 +13,6 @@ use std::path::PathBuf;
 pub enum InferenceDevice {
     CPU,
     CUDA,
-    VULKAN,
 }
 
 impl Default for InferenceDevice {
@@ -24,13 +23,12 @@ impl Default for InferenceDevice {
 
 impl InferenceDevice {
     pub fn is_gpu(self) -> bool {
-        matches!(self, InferenceDevice::CUDA | InferenceDevice::VULKAN)
+        matches!(self, InferenceDevice::CUDA)
     }
 
     pub fn from_i32(value: i32) -> Self {
         match value {
             1 => InferenceDevice::CUDA,
-            2 => InferenceDevice::VULKAN,
             _ => InferenceDevice::CPU,
         }
     }
@@ -41,7 +39,6 @@ impl fmt::Display for InferenceDevice {
         let label = match self {
             InferenceDevice::CPU => "cpu",
             InferenceDevice::CUDA => "cuda",
-            InferenceDevice::VULKAN => "vulkan",
         };
         write!(f, "{label}")
     }
@@ -54,7 +51,8 @@ pub struct Config {
     pub language: String,
     pub inference_device: InferenceDevice,
     pub gpu_device: i32,
-    pub cuda_flash_attn: bool,
+    #[serde(alias = "cuda_flash_attn")]
+    pub flash_attn: bool,
 
     // Translation settings (builtin Google Translate)
     pub from_lang: String,
@@ -91,7 +89,7 @@ impl Default for Config {
             language: "en".to_string(),
             inference_device: InferenceDevice::CPU,
             gpu_device: 0,
-            cuda_flash_attn: false,
+            flash_attn: false,
 
             // Translation defaults (builtin Google Translate)
             from_lang: "en".to_string(),
@@ -145,12 +143,30 @@ impl Config {
         figment = figment.merge(Env::prefixed("WHISPERSUBS_"));
 
         match figment.extract::<Config>() {
-            Ok(cfg) => cfg,
+            Ok(mut cfg) => {
+                // Backward-compatible env var for old config name.
+                if !cfg.flash_attn {
+                    if let Ok(value) = std::env::var("WHISPERSUBS_CUDA_FLASH_ATTN") {
+                        if let Some(parsed) = parse_env_bool(&value) {
+                            cfg.flash_attn = parsed;
+                        }
+                    }
+                }
+                cfg
+            }
             Err(err) => {
                 // Logging might not be initialized yet; fall back silently.
                 warn!("Failed to load config, using defaults: {err}");
                 Config::default()
             }
         }
+    }
+}
+
+fn parse_env_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
     }
 }

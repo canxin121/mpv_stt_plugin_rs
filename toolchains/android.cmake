@@ -31,23 +31,6 @@ if(NOT DEFINED ANDROID_ABI)
   endif()
 endif()
 
-# Vulkan-Headers: provide vulkan.hpp for ggml-vulkan when cross-compiling.
-if(DEFINED ENV{VULKAN_HEADERS})
-  set(_VULKAN_HEADERS_ROOT "$ENV{VULKAN_HEADERS}")
-elseif(DEFINED ENV{VULKAN_SDK})
-  set(_VULKAN_HEADERS_ROOT "$ENV{VULKAN_SDK}")
-endif()
-
-if(DEFINED _VULKAN_HEADERS_ROOT)
-  if(EXISTS "${_VULKAN_HEADERS_ROOT}/include/vulkan/vulkan.hpp")
-    set(Vulkan_INCLUDE_DIR "${_VULKAN_HEADERS_ROOT}/include" CACHE PATH "" FORCE)
-    set(Vulkan_INCLUDE_DIRS "${_VULKAN_HEADERS_ROOT}/include" CACHE PATH "" FORCE)
-  elseif(EXISTS "${_VULKAN_HEADERS_ROOT}/vulkan/vulkan.hpp")
-    set(Vulkan_INCLUDE_DIR "${_VULKAN_HEADERS_ROOT}" CACHE PATH "" FORCE)
-    set(Vulkan_INCLUDE_DIRS "${_VULKAN_HEADERS_ROOT}" CACHE PATH "" FORCE)
-  endif()
-endif()
-
 set(ANDROID_PLATFORM android-${ANDROID_API})
 set(CMAKE_ANDROID_NDK "${ANDROID_NDK}")
 set(CMAKE_ANDROID_STL_TYPE c++_shared)

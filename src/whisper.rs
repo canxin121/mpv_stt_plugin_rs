@@ -9,9 +9,6 @@ use whisper_rs::{
 };
 use crate::config::InferenceDevice;
 
-#[cfg(all(target_os = "android", feature = "whisper-vulkan"))]
-use std::ffi::{CStr, CString};
-
 const EXPECTED_SAMPLE_RATE: u32 = 16_000;
 const EXPECTED_CHANNELS: u16 = 1;
 
@@ -21,7 +18,7 @@ pub struct WhisperConfig {
     pub language: String,
     pub inference_device: InferenceDevice,
     pub gpu_device: i32,
-    pub cuda_flash_attn: bool,
+    pub flash_attn: bool,
     pub timeout_ms: u64,
 }
 
@@ -33,7 +30,7 @@ impl Default for WhisperConfig {
             language: "auto".to_string(),
             inference_device: InferenceDevice::CPU,
             gpu_device: 0,
-            cuda_flash_attn: false,
+            flash_attn: false,
             timeout_ms: 120_000,
         }
     }
@@ -67,8 +64,8 @@ impl WhisperConfig {
         self
     }
 
-    pub fn with_cuda_flash_attn(mut self, enabled: bool) -> Self {
-        self.cuda_flash_attn = enabled;
+    pub fn with_flash_attn(mut self, enabled: bool) -> Self {
+        self.flash_attn = enabled;
         self
     }
 
@@ -95,46 +92,25 @@ impl WhisperRunner {
 
     fn select_effective_device(&self) -> (InferenceDevice, String) {
         let requested_device = self.config.inference_device;
-        let mut effective_device = InferenceDevice::CPU;
-        let mut reason = "requested cpu".to_string();
-
-        match requested_device {
+        let (effective_device, reason) = match requested_device {
             InferenceDevice::CUDA => {
                 if cfg!(feature = "whisper-cuda") {
-                    effective_device = InferenceDevice::CUDA;
-                    reason = "requested cuda and whisper-cuda feature enabled".to_string();
+                    (
+                        InferenceDevice::CUDA,
+                        "requested cuda and whisper-cuda feature enabled".to_string(),
+                    )
                 } else {
-                    reason = "whisper-cuda feature disabled".to_string();
                     warn!(
                         "inference_device=CUDA but whisper-cuda feature is disabled; falling back to CPU"
                     );
+                    (
+                        InferenceDevice::CPU,
+                        "whisper-cuda feature disabled".to_string(),
+                    )
                 }
             }
-            InferenceDevice::VULKAN => {
-                if cfg!(feature = "whisper-vulkan") {
-                    effective_device = InferenceDevice::VULKAN;
-                    reason = "requested vulkan and whisper-vulkan feature enabled".to_string();
-                } else {
-                    reason = "whisper-vulkan feature disabled".to_string();
-                    warn!(
-                        "inference_device=VULKAN but whisper-vulkan feature is disabled; falling back to CPU"
-                    );
-                }
-            }
-            InferenceDevice::CPU => {
-                reason = "requested cpu".to_string();
-            }
-        }
-
-        if effective_device == InferenceDevice::VULKAN
-            && cfg!(all(target_os = "android", feature = "whisper-vulkan"))
-        {
-            if !android_vulkan_1_2_available() {
-                reason = "vulkan 1.2 not detected".to_string();
-                warn!("Vulkan 1.2 not detected; falling back to CPU to avoid crash");
-                effective_device = InferenceDevice::CPU;
-            }
-        }
+            InferenceDevice::CPU => (InferenceDevice::CPU, "requested cpu".to_string()),
+        };
 
         if effective_device != requested_device {
             warn!(
@@ -162,7 +138,7 @@ impl WhisperRunner {
         params
             .use_gpu(use_gpu)
             .gpu_device(self.config.gpu_device)
-            .flash_attn(self.config.cuda_flash_attn);
+            .flash_attn(self.config.flash_attn);
 
         params
     }
@@ -316,25 +292,27 @@ impl WhisperRunner {
             ));
         }
 
-        let mut segments = self.run_inference(&audio, duration_ms);
-        if let Err(err) = segments {
-            if self.active_device.map_or(false, |device| device.is_gpu()) {
-                let failed_device = self.active_device.unwrap_or(InferenceDevice::CPU);
-                warn!(
-                    "Whisper inference failed on {} ({}); retrying on CPU",
-                    failed_device, err
-                );
-                self.ctx = None;
-                self.active_device = None;
-                self.ensure_context_for_device(
-                    InferenceDevice::CPU,
-                    "fallback after gpu inference failure",
-                )?;
-                segments = self.run_inference(&audio, duration_ms);
+        let segments = match self.run_inference(&audio, duration_ms) {
+            Ok(segments) => Ok(segments),
+            Err(err) => {
+                if self.active_device.map_or(false, |device| device.is_gpu()) {
+                    let failed_device = self.active_device.unwrap_or(InferenceDevice::CPU);
+                    warn!(
+                        "Whisper inference failed on {} ({}); retrying on CPU",
+                        failed_device, err
+                    );
+                    self.ctx = None;
+                    self.active_device = None;
+                    self.ensure_context_for_device(
+                        InferenceDevice::CPU,
+                        "fallback after gpu inference failure",
+                    )?;
+                    self.run_inference(&audio, duration_ms)
+                } else {
+                    Err(err)
+                }
             }
-        }
-
-        let segments = segments?;
+        }?;
         self.write_srt(output_prefix, &segments)?;
 
         debug!("Whisper transcription completed successfully");
@@ -359,72 +337,6 @@ impl WhisperRunner {
 
         collect_segments(&state)
     }
-}
-
-fn android_vulkan_1_2_available() -> bool {
-    android_vulkan_1_2_available_impl()
-}
-
-#[cfg(all(target_os = "android", feature = "whisper-vulkan"))]
-fn android_vulkan_1_2_available_impl() -> bool {
-    let version = android_system_property_u32("ro.hardware.vulkan.version");
-    if let Some(v) = version {
-        let major = v >> 22;
-        let minor = (v >> 12) & 0x3ff;
-        if major > 1 || (major == 1 && minor >= 2) {
-            return true;
-        }
-        warn!(
-            "ro.hardware.vulkan.version={}, parsed Vulkan {}.{}",
-            v, major, minor
-        );
-        return false;
-    }
-
-    warn!(
-        "ro.hardware.vulkan.version not available; treating as no Vulkan 1.2 (strict)"
-    );
-    if let Some(hw) = android_system_property("ro.hardware.vulkan") {
-        warn!("ro.hardware.vulkan={}", hw);
-    }
-    if let Some(hwui) = android_system_property("ro.hwui.use_vulkan") {
-        warn!("ro.hwui.use_vulkan={}", hwui);
-    }
-    false
-}
-
-#[cfg(all(target_os = "android", feature = "whisper-vulkan"))]
-fn android_system_property_u32(key: &str) -> Option<u32> {
-    let value = android_system_property(key)?;
-    let value = value.trim();
-    if value.starts_with("0x") || value.starts_with("0X") {
-        u32::from_str_radix(&value[2..], 16).ok()
-    } else {
-        value.parse::<u32>().ok()
-    }
-}
-
-#[cfg(all(target_os = "android", feature = "whisper-vulkan"))]
-fn android_system_property(key: &str) -> Option<String> {
-    const PROP_VALUE_MAX: usize = 92;
-    let c_key = CString::new(key).ok()?;
-    let mut buf = [0 as libc::c_char; PROP_VALUE_MAX];
-    let len = unsafe { __system_property_get(c_key.as_ptr(), buf.as_mut_ptr()) };
-    if len <= 0 {
-        return None;
-    }
-    let value = unsafe { CStr::from_ptr(buf.as_ptr()) };
-    Some(value.to_string_lossy().into_owned())
-}
-
-#[cfg(all(target_os = "android", feature = "whisper-vulkan"))]
-unsafe extern "C" {
-    fn __system_property_get(name: *const libc::c_char, value: *mut libc::c_char) -> libc::c_int;
-}
-
-#[cfg(not(all(target_os = "android", feature = "whisper-vulkan")))]
-fn android_vulkan_1_2_available_impl() -> bool {
-    true
 }
 
 struct SegmentData {
@@ -484,13 +396,13 @@ mod tests {
             .with_language("en".to_string())
             .with_inference_device(InferenceDevice::CUDA)
             .with_gpu_device(1)
-            .with_cuda_flash_attn(true);
+            .with_flash_attn(true);
 
         assert_eq!(config.model_path, "/path/to/model");
         assert_eq!(config.threads, 4);
         assert_eq!(config.language, "en");
         assert_eq!(config.inference_device, InferenceDevice::CUDA);
         assert_eq!(config.gpu_device, 1);
-        assert!(config.cuda_flash_attn);
+        assert!(config.flash_attn);
     }
 }

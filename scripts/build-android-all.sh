@@ -14,63 +14,10 @@ if [[ ! -d "$NDK" ]]; then
   exit 1
 fi
 
-# Vulkan loader is only available in NDK sysroot from API 24+,
-# and Vulkan 1.2 symbols used by ggml-vulkan appear from API 31+.
-if [[ "${WHISPERSUBS_GPU:-}" == "1" || "${WHISPERSUBS_VULKAN:-}" == "1" ]]; then
-  if [[ "$API" -lt 31 ]]; then
-    echo "WHISPERSUBS_GPU=1 requires ANDROID_API >= 31; bumping API $API -> 31"
-    API=31
-  fi
-fi
-
 if [[ ! -d "$MPV_ANDROID" ]]; then
   echo "mpv-android not found: $MPV_ANDROID" >&2
   echo "Set MPV_ANDROID to your mpv-android repo." >&2
   exit 1
-fi
-
-ensure_vulkan_headers() {
-  local headers_root=""
-
-  if [[ -n "${VULKAN_HEADERS:-}" ]]; then
-    if [[ -f "$VULKAN_HEADERS/include/vulkan/vulkan.hpp" || -f "$VULKAN_HEADERS/vulkan/vulkan.hpp" ]]; then
-      headers_root="$VULKAN_HEADERS"
-    fi
-  fi
-
-  if [[ -z "$headers_root" && -f "/usr/include/vulkan/vulkan.hpp" ]]; then
-    headers_root="/usr"
-  fi
-
-  if [[ -z "$headers_root" ]]; then
-    local cache_dir="$ROOT_DIR/toolchains/vulkan-headers"
-    if [[ -f "$cache_dir/include/vulkan/vulkan.hpp" ]]; then
-      headers_root="$cache_dir"
-    else
-      echo "Vulkan-Headers not found; downloading to $cache_dir"
-      mkdir -p "$cache_dir"
-      local url="https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/vulkan-sdk-1.3.275.0.tar.gz"
-      if command -v curl >/dev/null 2>&1; then
-        curl -L "$url" | tar -xz -C "$cache_dir" --strip-components=1
-      elif command -v wget >/dev/null 2>&1; then
-        wget -O- "$url" | tar -xz -C "$cache_dir" --strip-components=1
-      else
-        echo "Neither curl nor wget is available; please install one or set VULKAN_HEADERS." >&2
-        exit 1
-      fi
-      headers_root="$cache_dir"
-    fi
-  fi
-
-  export VULKAN_HEADERS="$headers_root"
-}
-
-if [[ "${WHISPERSUBS_GPU:-}" == "1" || "${WHISPERSUBS_VULKAN:-}" == "1" ]]; then
-  ensure_vulkan_headers
-  if ! command -v glslc >/dev/null 2>&1; then
-    echo "glslc not found in PATH; please install Vulkan SDK or provide glslc." >&2
-    exit 1
-  fi
 fi
 
 # Rust targets needed for Android ABIs.
@@ -128,12 +75,7 @@ for spec in "${abis[@]}"; do
   export MPV_PREFIX="$PREFIX"
   export RUSTFLAGS="-C link-arg=-Wl,-z,defs"
 
-  cargo_features=()
-  if [[ "${WHISPERSUBS_GPU:-}" == "1" || "${WHISPERSUBS_VULKAN:-}" == "1" ]]; then
-    cargo_features+=(--features whisper-vulkan)
-  fi
-
-  (cd "$ROOT_DIR" && cargo build --target "$rust_target" --release "${cargo_features[@]}")
+  (cd "$ROOT_DIR" && cargo build --target "$rust_target" --release)
 
   OUT_DIR="$ROOT_DIR/dist/android/$abi"
   mkdir -p "$OUT_DIR"

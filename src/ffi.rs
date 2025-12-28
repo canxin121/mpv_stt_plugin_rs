@@ -47,7 +47,7 @@ pub extern "C" fn whispersubs_whisper_init(
     language: *const c_char,
     inference_device: i32,
     gpu_device: i32,
-    cuda_flash_attn: bool,
+    flash_attn: bool,
 ) -> i32 {
     unsafe {
         let model_path = match c_str_to_string(model_path) {
@@ -63,7 +63,7 @@ pub extern "C" fn whispersubs_whisper_init(
             .with_language(language)
             .with_inference_device(inference_device)
             .with_gpu_device(gpu_device)
-            .with_cuda_flash_attn(cuda_flash_attn);
+            .with_flash_attn(flash_attn);
 
         let runner = WhisperRunner::new(config);
         *whisper_runner().lock() = Some(runner);
