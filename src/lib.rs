@@ -11,7 +11,7 @@ pub mod whisper;
 
 // Re-export main types for convenience
 pub use audio::AudioExtractor;
-pub use config::Config;
+pub use config::{Config, InferenceDevice};
 pub use error::{Result, WhisperSubsError};
 pub use srt::{SrtFile, SubtitleEntry};
 pub use subtitle_manager::SubtitleManager;

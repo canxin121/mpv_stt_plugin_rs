@@ -5,15 +5,55 @@ use figment::{
 };
 use log::warn;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InferenceDevice {
+    CPU,
+    CUDA,
+    VULKAN,
+}
+
+impl Default for InferenceDevice {
+    fn default() -> Self {
+        InferenceDevice::CPU
+    }
+}
+
+impl InferenceDevice {
+    pub fn is_gpu(self) -> bool {
+        matches!(self, InferenceDevice::CUDA | InferenceDevice::VULKAN)
+    }
+
+    pub fn from_i32(value: i32) -> Self {
+        match value {
+            1 => InferenceDevice::CUDA,
+            2 => InferenceDevice::VULKAN,
+            _ => InferenceDevice::CPU,
+        }
+    }
+}
+
+impl fmt::Display for InferenceDevice {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            InferenceDevice::CPU => "cpu",
+            InferenceDevice::CUDA => "cuda",
+            InferenceDevice::VULKAN => "vulkan",
+        };
+        write!(f, "{label}")
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub model_path: String,
     pub threads: u8,
     pub language: String,
-    pub use_cuda: bool,
-    pub cuda_device: i32,
+    pub inference_device: InferenceDevice,
+    pub gpu_device: i32,
     pub cuda_flash_attn: bool,
 
     // Translation settings (builtin Google Translate)
@@ -49,8 +89,8 @@ impl Default for Config {
             model_path: "ggml-base.bin".to_string(),
             threads: 8,
             language: "en".to_string(),
-            use_cuda: false,
-            cuda_device: 0,
+            inference_device: InferenceDevice::CPU,
+            gpu_device: 0,
             cuda_flash_attn: false,
 
             // Translation defaults (builtin Google Translate)

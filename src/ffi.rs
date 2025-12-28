@@ -1,6 +1,7 @@
 use crate::audio::AudioExtractor;
 use crate::srt;
 use crate::translate::{Translator, TranslatorConfig};
+use crate::config::InferenceDevice;
 use crate::whisper::{WhisperConfig, WhisperRunner};
 use log::{debug, error};
 use std::ffi::{CStr, CString};
@@ -44,8 +45,8 @@ pub extern "C" fn whispersubs_whisper_init(
     model_path: *const c_char,
     threads: u8,
     language: *const c_char,
-    use_cuda: bool,
-    cuda_device: i32,
+    inference_device: i32,
+    gpu_device: i32,
     cuda_flash_attn: bool,
 ) -> i32 {
     unsafe {
@@ -55,12 +56,13 @@ pub extern "C" fn whispersubs_whisper_init(
         };
 
         let language = c_str_to_string(language).unwrap_or_else(|| "auto".to_string());
+        let inference_device = InferenceDevice::from_i32(inference_device);
 
         let config = WhisperConfig::new(model_path)
             .with_threads(threads)
             .with_language(language)
-            .with_cuda(use_cuda)
-            .with_cuda_device(cuda_device)
+            .with_inference_device(inference_device)
+            .with_gpu_device(gpu_device)
             .with_cuda_flash_attn(cuda_flash_attn);
 
         let runner = WhisperRunner::new(config);

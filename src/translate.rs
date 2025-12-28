@@ -1,5 +1,6 @@
 use crate::error::{Result, WhisperSubsError};
 use crate::srt::SrtFile;
+use futures::stream::{FuturesUnordered, StreamExt};
 use log::{debug, trace, warn};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -164,7 +165,19 @@ impl AsyncTranslationQueue {
         let current_playback_ms_clone = current_playback_ms.clone();
 
         let worker_handle = thread::spawn(move || {
-            Self::worker_thread(task_receiver, result_sender, config, shutdown_flag_clone, current_playback_ms_clone);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .enable_io()
+                .build()
+                .expect("failed to build tokio runtime for translator");
+            Self::worker_thread(
+                task_receiver,
+                result_sender,
+                config,
+                shutdown_flag_clone,
+                current_playback_ms_clone,
+                &runtime,
+            );
         });
 
         Self {
@@ -202,6 +215,7 @@ impl AsyncTranslationQueue {
         config: Arc<TranslatorConfig>,
         shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
         current_playback_ms: Arc<std::sync::atomic::AtomicU64>,
+        runtime: &tokio::runtime::Runtime,
     ) {
 
         loop {
@@ -238,7 +252,14 @@ impl AsyncTranslationQueue {
             debug!("Processing {} translation tasks", task_count);
 
             // Process using builtin Google Translate
-            Self::process_builtin(&tasks, &result_sender, &config, &shutdown_flag, &current_playback_ms);
+            Self::process_builtin(
+                &tasks,
+                &result_sender,
+                &config,
+                &shutdown_flag,
+                &current_playback_ms,
+                runtime,
+            );
 
             debug!("Completed batch of {} translations", task_count);
         }
@@ -251,6 +272,7 @@ impl AsyncTranslationQueue {
         config: &Arc<TranslatorConfig>,
         shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
         current_playback_ms: &Arc<std::sync::atomic::AtomicU64>,
+        runtime: &tokio::runtime::Runtime,
     ) {
         // Filter out expired tasks (already played past)
         // Keep tasks that are within 30 seconds behind playback or in the future
@@ -272,47 +294,55 @@ impl AsyncTranslationQueue {
             return;
         }
 
-        debug!("Translating {} active tasks in parallel", active_tasks.len());
+        debug!(
+            "Translating {} active tasks using single-thread tokio runtime",
+            active_tasks.len()
+        );
 
-        // Process tasks in parallel using thread::scope
-        std::thread::scope(|scope| {
-            let mut handles = Vec::new();
+        let active_tasks: Vec<TranslationTask> = active_tasks.into_iter().cloned().collect();
+        let config = Arc::clone(config);
+        let shutdown_flag = Arc::clone(shutdown_flag);
+        let sender = result_sender.clone();
+
+        runtime.block_on(async move {
+            let mut futures = FuturesUnordered::new();
 
             for task in active_tasks {
-                // Check shutdown flag before spawning
                 if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
                     debug!("Aborting builtin translation due to shutdown");
                     break;
                 }
 
-                let config_clone = Arc::clone(config);
-                let sender_clone = result_sender.clone();
-                let shutdown_clone = Arc::clone(shutdown_flag);
-                let task_clone = task.clone();
-
-                // Spawn a thread for each translation task
-                let handle = scope.spawn(move || {
-                    Self::translate_single_task(&task_clone, &sender_clone, &config_clone, &shutdown_clone);
-                });
-
-                handles.push(handle);
+                let config_clone = Arc::clone(&config);
+                let shutdown_clone = Arc::clone(&shutdown_flag);
+                futures.push(Self::translate_single_task_async(
+                    task,
+                    config_clone,
+                    shutdown_clone,
+                ));
             }
 
-            // Wait for all threads to complete
-            for handle in handles {
-                let _ = handle.join();
+            while let Some(result) = futures.next().await {
+                if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(result) = result {
+                    if sender.send(result).is_err() {
+                        debug!("Main thread dropped receiver, exiting");
+                        break;
+                    }
+                }
             }
         });
     }
 
     /// Translate a single task with retry logic
-    fn translate_single_task(
-        task: &TranslationTask,
-        result_sender: &Sender<TranslationResult>,
-        config: &Arc<TranslatorConfig>,
-        shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
-    ) {
-        let translator = build_google_translator(config);
+    async fn translate_single_task_async(
+        task: TranslationTask,
+        config: Arc<TranslatorConfig>,
+        shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Option<TranslationResult> {
+        let translator = build_google_translator(&config);
         let from_lang = normalize_lang_code(&config.from_lang, true);
         let to_lang = normalize_lang_code(&config.to_lang, false);
 
@@ -322,21 +352,16 @@ impl AsyncTranslationQueue {
         loop {
             // Check shutdown flag
             if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                return;
+                return None;
             }
 
-            match translator.translate_sync(&task.text, &from_lang, &to_lang) {
+            match translator.translate_async(&task.text, &from_lang, &to_lang).await {
                 Ok(translated) if !translated.trim().is_empty() => {
-                    let result = TranslationResult {
+                    return Some(TranslationResult {
                         start_ms: task.start_ms,
                         original: task.text.clone(),
                         translated,
-                    };
-
-                    if result_sender.send(result).is_err() {
-                        debug!("Main thread dropped receiver, exiting");
-                    }
-                    break;
+                    });
                 }
                 Ok(_) => {
                     warn!(
@@ -357,10 +382,10 @@ impl AsyncTranslationQueue {
 
             attempt += 1;
             if attempt > MAX_TRANSLATE_RETRIES {
-                break;
+                return None;
             }
 
-            std::thread::sleep(Duration::from_millis(delay_ms));
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             delay_ms = (delay_ms * 2).min(2_000);
         }
     }

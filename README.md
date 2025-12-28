@@ -81,10 +81,10 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
    # 识别语言：固定语言用 "ja" / "en" 等，自动识别用 "auto"
    language = "ja"
 
-   # 是否启用 CUDA（需要编译时开启 whisper-cuda 特性）
-   use_cuda = false
-   # CUDA 设备编号（多 GPU 环境下选择）
-   cuda_device = 0
+   # 推理设备：cpu / cuda / vulkan
+   inference_device = "cpu"
+   # GPU 设备编号（多 GPU 环境下选择）
+   gpu_device = 0
    # CUDA flash attention（实验性）
    cuda_flash_attn = false
 
@@ -121,7 +121,15 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 
    CUDA 支持说明：
    - 编译时开启：`cargo build --release --features whisper-cuda`
+   - 运行时配置：`inference_device = "cuda"`（或环境变量 `WHISPERSUBS_INFERENCE_DEVICE=cuda`）
    - 运行时确保系统能找到 CUDA 运行库（例如配置 `LD_LIBRARY_PATH` 或系统动态链接器路径）
+
+   Vulkan（Android GPU）说明：
+   - 编译时开启：`cargo build --release --features whisper-vulkan`
+   - 运行时配置：`inference_device = "vulkan"`（或环境变量 `WHISPERSUBS_INFERENCE_DEVICE=vulkan`）
+   - 构建机需提供 `glslc`（Vulkan SDK 或等效工具）
+  - 设备需支持 Vulkan 1.2+；低于 1.2 或无法读取版本属性时会自动回退到 CPU（避免 ggml-vulkan 抛异常崩溃）
+   - 构建脚本会将 `ANDROID_API` 提升到 31+ 以匹配 Vulkan 1.2 符号
 
 ## Android 构建
 
@@ -131,6 +139,12 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 ```bash
 cd ~/.config/mpv/scripts/whispersubs_rs
 ./scripts/build-android-all.sh
+```
+
+启用 Vulkan（GPU）构建：
+```bash
+cd ~/.config/mpv/scripts/whispersubs_rs
+WHISPERSUBS_GPU=1 ./scripts/build-android-all.sh
 ```
 
 产物输出：

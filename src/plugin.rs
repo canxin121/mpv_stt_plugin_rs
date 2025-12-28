@@ -87,8 +87,8 @@ impl PluginState {
         let whisper_config = WhisperConfig::new(config.model_path.clone())
             .with_threads(config.threads)
             .with_language(config.language.clone())
-            .with_cuda(config.use_cuda)
-            .with_cuda_device(config.cuda_device)
+            .with_inference_device(config.inference_device)
+            .with_gpu_device(config.gpu_device)
             .with_cuda_flash_attn(config.cuda_flash_attn)
             .with_timeout_ms(config.whisper_timeout_ms);
 
@@ -186,8 +186,10 @@ impl PluginState {
                 let file_length_ms = (dur * 1000.0) as u64;
                 trace!("Media file: {}, duration: {}ms", path, file_length_ms);
 
-                // Calculate subtitle path next to the video file
-                let subtitle_path = Self::get_subtitle_path_for_media(&path);
+                // Calculate subtitle path next to the video file when possible.
+                // SAF content:// URIs are not writable as filesystem paths.
+                let subtitle_path = Self::get_subtitle_path_for_media_uri(&path)
+                    .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
                 info!("Subtitle will be saved to: {}", subtitle_path.display());
 
                 let _ =
@@ -813,17 +815,24 @@ impl PluginState {
         // Fallback: just append .srt
         PathBuf::from(format!("{}.srt", media_path))
     }
+
+    /// Try to map a media path/URI to a writable filesystem subtitle path.
+    /// Returns None for non-filesystem URIs like content://.
+    fn get_subtitle_path_for_media_uri(media_path: &str) -> Option<PathBuf> {
+        if let Some(rest) = media_path.strip_prefix("file://") {
+            return Some(Self::get_subtitle_path_for_media(rest));
+        }
+        if media_path.contains("://") {
+            return None;
+        }
+        Some(Self::get_subtitle_path_for_media(media_path))
+    }
 }
 
 /// MPV C plugin entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_int {
-    // Initialize logger
-    // Set WHISPERSUBS_LOG environment variable to control log level (e.g., WHISPERSUBS_LOG=debug)
-    let _ =
-        env_logger::Builder::from_env(env_logger::Env::new().filter_or("WHISPERSUBS_LOG", "info"))
-            .format_timestamp_millis()
-            .try_init();
+    init_logger();
 
     let client = Handle::from_ptr(handle);
 
@@ -939,5 +948,36 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                 state.tick(client);
             }
         }
+    }
+}
+
+fn init_logger() {
+    // Set WHISPERSUBS_LOG environment variable to control log level (e.g., WHISPERSUBS_LOG=debug)
+    #[cfg(target_os = "android")]
+    {
+        use log::LevelFilter;
+
+        let level = std::env::var("WHISPERSUBS_LOG")
+            .ok()
+            .and_then(|s| {
+                s.parse::<LevelFilter>()
+                    .or_else(|_| s.to_lowercase().parse())
+                    .ok()
+            })
+            .unwrap_or(LevelFilter::Info);
+
+        let config = android_logger::Config::default()
+            .with_tag("whispersubs_rs")
+            .with_max_level(level);
+        let _ = android_logger::init_once(config);
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = env_logger::Builder::from_env(
+            env_logger::Env::new().filter_or("WHISPERSUBS_LOG", "info"),
+        )
+        .format_timestamp_millis()
+        .try_init();
     }
 }
