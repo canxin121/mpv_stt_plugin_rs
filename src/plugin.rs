@@ -1,5 +1,8 @@
 use log::{debug, error, info, trace, warn};
 use mpv_client::{Event, Handle, mpv_handle};
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
@@ -51,6 +54,26 @@ impl TempPaths {
     }
 }
 
+#[derive(Clone)]
+struct CachePaths {
+    subtitle_path: PathBuf,
+    manifest_path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TranslationCacheEntry {
+    start_ms: u32,
+    original: String,
+    translated: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+struct CacheManifest {
+    chunk_size_ms: u64,
+    processed_chunks: Vec<u64>,
+    translations: Vec<TranslationCacheEntry>,
+}
+
 enum ProcessingMode {
     Network,
     Local {
@@ -67,6 +90,9 @@ struct PluginState {
     whisper_runner: WhisperRunner,
     async_translation_queue: Option<AsyncTranslationQueue>,
     subtitle_manager: SubtitleManager,
+    translation_cache: HashMap<u32, (String, String)>,
+    processed_chunks: HashSet<u64>,
+    network_cache: Option<CachePaths>,
 
     running: bool,
     shutting_down: bool,
@@ -113,6 +139,9 @@ impl PluginState {
             whisper_runner,
             async_translation_queue,
             subtitle_manager: SubtitleManager::new(),
+            translation_cache: HashMap::new(),
+            processed_chunks: HashSet::new(),
+            network_cache: None,
             running: false,
             shutting_down: false,
             subs_loaded: false,
@@ -167,6 +196,40 @@ impl PluginState {
             }
 
             self.mode = Some(ProcessingMode::Network);
+            self.network_cache = None;
+
+            if self.config.save_srt {
+                if let Some(media_id) = Self::media_id_for_cache(client) {
+                    if let Some(cache_paths) = self.cache_paths_for_media(&media_id) {
+                        if let Some(parent) = cache_paths.subtitle_path.parent() {
+                            if let Err(err) = fs::create_dir_all(parent) {
+                                warn!(
+                                    "Failed to create cache directory {}: {}",
+                                    parent.display(),
+                                    err
+                                );
+                            }
+                        }
+                        if cache_paths.subtitle_path.exists() {
+                            if self.load_cached_subs(
+                                &cache_paths.subtitle_path,
+                                Some(&cache_paths.manifest_path),
+                            ) {
+                                let _ = client.command(&[
+                                    "sub-add",
+                                    cache_paths.subtitle_path.to_str().unwrap(),
+                                ]);
+                                self.subs_loaded = true;
+                                info!(
+                                    "Loaded cached subtitles from {}",
+                                    cache_paths.subtitle_path.display()
+                                );
+                            }
+                        }
+                        self.network_cache = Some(cache_paths);
+                    }
+                }
+            }
 
             info!(
                 "Network stream mode active, current_pos: {}ms",
@@ -201,11 +264,27 @@ impl PluginState {
                     file_length_ms,
                     subtitle_path: subtitle_path.clone(),
                 });
+                self.network_cache = None;
 
-                // Create initial subtitles
-                if self.process_chunk_local(client, &path, &subtitle_path) {
-                    let _ = client.command(&["sub-add", subtitle_path.to_str().unwrap()]);
-                    self.subs_loaded = true;
+                if self.config.save_srt && subtitle_path.exists() {
+                    if self.load_cached_subs(&subtitle_path, None) {
+                        let _ = client.command(&["sub-add", subtitle_path.to_str().unwrap()]);
+                        self.subs_loaded = true;
+                        info!(
+                            "Loaded cached subtitles from {}",
+                            subtitle_path.display()
+                        );
+                    }
+                }
+
+                // Create initial subtitles if this chunk hasn't been processed.
+                if !self.is_chunk_processed(self.current_pos_ms) {
+                    if self.process_chunk_local(client, &path, &subtitle_path) {
+                        if !self.subs_loaded {
+                            let _ = client.command(&["sub-add", subtitle_path.to_str().unwrap()]);
+                            self.subs_loaded = true;
+                        }
+                    }
                 }
 
                 info!(
@@ -248,12 +327,17 @@ impl PluginState {
             }
         }
 
+        let subtitle_path = self
+            .network_cache
+            .as_ref()
+            .map(|cache| cache.subtitle_path.as_path());
+
         // Check for seek first. If cache isn't ready yet after a seek, we still want to update
         // `current_pos_ms` so we don't keep generating subtitles for the old position.
-        self.check_seek(client, None);
+        self.check_seek(client);
 
         // Check for completed translations from async queue
-        self.process_translation_results(client, None);
+        self.process_translation_results(client, subtitle_path);
 
         // Get cache end time
         let cache_end_sec: Option<f64> = client.get_property("demuxer-cache-time").ok();
@@ -361,11 +445,19 @@ impl PluginState {
                 );
             }
 
-            if self.process_chunk(client, chunk_ms) {
+            let start_ms = self.current_pos_ms;
+            if self.is_chunk_processed(start_ms) {
+                self.current_pos_ms = self.current_pos_ms.saturating_add(chunk_ms);
+                continue;
+            }
+
+            if self.process_chunk(client, chunk_ms, subtitle_path) {
                 self.current_pos_ms += chunk_ms;
 
                 if !self.subs_loaded {
-                    let main_srt = self.paths.tmp_sub.with_extension("srt");
+                    let main_srt = subtitle_path
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
                     let _ = client.command(&["sub-add", main_srt.to_str().unwrap()]);
                     self.subs_loaded = true;
                 }
@@ -397,7 +489,7 @@ impl PluginState {
         }
 
         // Check for seek
-        self.check_seek(client, Some(subtitle_path));
+        self.check_seek(client);
 
         // Check for completed translations from async queue
         self.process_translation_results(client, Some(subtitle_path));
@@ -478,6 +570,12 @@ impl PluginState {
                     debug!("Look-ahead: processing chunk {} at {}ms", i + 1, chunk_pos);
                 }
 
+                let start_ms = self.current_pos_ms;
+                if self.is_chunk_processed(start_ms) {
+                    self.current_pos_ms = self.current_pos_ms.saturating_add(self.chunk_dur);
+                    continue;
+                }
+
                 if self.process_chunk_local(client, media_path, subtitle_path) {
                     self.current_pos_ms += self.chunk_dur;
 
@@ -512,7 +610,7 @@ impl PluginState {
         }
     }
 
-    fn check_seek(&mut self, client: &mut Handle, subtitle_path: Option<&Path>) {
+    fn check_seek(&mut self, client: &mut Handle) {
         let playback_pos: Option<f64> = client.get_property("time-pos").ok();
         if let Some(pos) = playback_pos {
             let playback_pos_ms = (pos * 1000.0) as u64;
@@ -567,35 +665,18 @@ impl PluginState {
                     "3000",
                 ]);
 
-                // Remove subtitles after the new position
-                let new_pos_u32 = match u32::try_from(new_pos) {
-                    Ok(v) => v,
-                    Err(_) => {
-                        warn!(
-                            "Seek position {}ms exceeds subtitle timestamp range",
-                            new_pos
-                        );
-                        u32::MAX
-                    }
-                };
-
-                self.subtitle_manager.remove_after(new_pos_u32);
                 self.current_pos_ms = new_pos;
-
-                // Save updated subtitles - use subtitle_path for local files, tmp for network
-                let srt_path = subtitle_path
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
-                let _ = self.subtitle_manager.save_to_file(&srt_path);
-                if self.subs_loaded {
-                    let _ = client.command(&["sub-reload"]);
-                }
             }
         }
     }
 
     /// Process one chunk from network cache
-    fn process_chunk(&mut self, client: &mut Handle, chunk_ms: u64) -> bool {
+    fn process_chunk(
+        &mut self,
+        client: &mut Handle,
+        chunk_ms: u64,
+        subtitle_path: Option<&Path>,
+    ) -> bool {
         // Dump cache
         let start_sec = self.current_pos_ms as f64 / 1000.0;
         let end_sec = (self.current_pos_ms + chunk_ms) as f64 / 1000.0;
@@ -619,7 +700,7 @@ impl PluginState {
             return false;
         }
 
-        self.transcribe_and_update(client, None, chunk_ms)
+        self.transcribe_and_update(client, subtitle_path, chunk_ms)
     }
 
     /// Process one chunk from local file
@@ -681,27 +762,53 @@ impl PluginState {
             Err(_) => return false,
         };
         self.subtitle_manager.add_from_srt(&srt_file);
+        self.mark_chunk_processed(self.current_pos_ms);
+
+        let mut pending_tasks = Vec::new();
+        let mut cached_hits = 0usize;
+
+        for entry in &srt_file.entries {
+            let original = entry.text.trim();
+            if original.is_empty() {
+                continue;
+            }
+            let start_ms = Self::timestamp_to_millis(entry.start_time);
+            if let Some((cached_original, cached_translated)) =
+                self.translation_cache.get(&start_ms)
+            {
+                if cached_original.trim() == original && !cached_translated.trim().is_empty() {
+                    self.subtitle_manager
+                        .update_translation(start_ms, cached_translated);
+                    cached_hits += 1;
+                    continue;
+                }
+            }
+
+            pending_tasks.push(TranslationTask {
+                start_ms,
+                text: entry.text.clone(),
+            });
+        }
+
         if !self.save_subs(client, &main_srt) {
             return false;
         }
 
         // Translate using async translation queue (always enabled)
-        if let Some(ref queue) = self.async_translation_queue {
-            trace!("Submitting subtitles to async translation queue");
-            for entry in &srt_file.entries {
-                if entry.text.trim().is_empty() {
-                    continue;
+        if !pending_tasks.is_empty() {
+            if let Some(ref queue) = self.async_translation_queue {
+                trace!("Submitting subtitles to async translation queue");
+                for task in pending_tasks {
+                    queue.submit(task);
                 }
-                let start_ms = Self::timestamp_to_millis(entry.start_time);
-                queue.submit(TranslationTask {
-                    start_ms,
-                    text: entry.text.clone(),
-                });
+                debug!(
+                    "Submitted {} entries to async translation (cached: {})",
+                    srt_file.entries.len(),
+                    cached_hits
+                );
             }
-            debug!(
-                "Submitted {} entries to async translation",
-                srt_file.entries.len()
-            );
+        } else if cached_hits > 0 {
+            debug!("All {} entries served from translation cache", cached_hits);
         }
 
         // Keep only the main subtitle file on disk during playback to reduce clutter.
@@ -751,6 +858,10 @@ impl PluginState {
 
                 // Update subtitles with translations
                 for result in results {
+                    self.translation_cache.insert(
+                        result.start_ms,
+                        (result.original.clone(), result.translated.clone()),
+                    );
                     self.subtitle_manager
                         .update_translation(result.start_ms, &result.translated);
                 }
@@ -777,6 +888,7 @@ impl PluginState {
         if self.subs_loaded {
             let _ = client.command(&["sub-reload"]);
         }
+        self.save_cache_manifest_if_needed();
         true
     }
 
@@ -810,6 +922,9 @@ impl PluginState {
 
         self.paths.cleanup();
         self.subtitle_manager.clear();
+        self.translation_cache.clear();
+        self.processed_chunks.clear();
+        self.network_cache = None;
         self.subs_loaded = false;
         self.current_pos_ms = 0;
         self.last_playback_pos_ms = None;
@@ -826,6 +941,146 @@ impl PluginState {
         let millis = ms % 1000;
 
         format!("{:02}:{:02}:{:02}.{:03}", hours, minutes, seconds, millis)
+    }
+
+    fn is_chunk_processed(&self, start_ms: u64) -> bool {
+        self.processed_chunks.contains(&start_ms)
+    }
+
+    fn mark_chunk_processed(&mut self, start_ms: u64) {
+        self.processed_chunks.insert(start_ms);
+    }
+
+    fn media_id_for_cache(client: &Handle) -> Option<String> {
+        if let Ok(id) = client.get_property::<String>("stream-open-filename") {
+            if !id.trim().is_empty() {
+                return Some(id);
+            }
+        }
+        if let Ok(id) = client.get_property::<String>("path") {
+            if !id.trim().is_empty() {
+                return Some(id);
+            }
+        }
+        None
+    }
+
+    fn cache_root_dir() -> Option<PathBuf> {
+        let base = directories::BaseDirs::new()?;
+        Some(base.config_dir().join("mpv").join("whispersubs_cache"))
+    }
+
+    fn cache_paths_for_media(&self, media_id: &str) -> Option<CachePaths> {
+        let dir = Self::cache_root_dir()?;
+        let hash = Self::fnv1a_hash64(media_id);
+        let stem = format!("{:016x}", hash);
+        Some(CachePaths {
+            subtitle_path: dir.join(format!("{stem}.srt")),
+            manifest_path: dir.join(format!("{stem}.json")),
+        })
+    }
+
+    fn fnv1a_hash64(input: &str) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut hash = FNV_OFFSET;
+        for byte in input.as_bytes() {
+            hash ^= *byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash
+    }
+
+    fn load_cached_subs(&mut self, srt_path: &Path, manifest_path: Option<&Path>) -> bool {
+        if !srt_path.exists() {
+            return false;
+        }
+
+        let srt_file = match SrtFile::parse(srt_path) {
+            Ok(srt) => srt,
+            Err(err) => {
+                warn!("Failed to parse cached subtitles {}: {}", srt_path.display(), err);
+                return false;
+            }
+        };
+
+        self.subtitle_manager.clear();
+        self.translation_cache.clear();
+        self.processed_chunks.clear();
+        self.subtitle_manager.add_from_srt(&srt_file);
+
+        let chunk_size = self.config.chunk_size_ms.max(1);
+        for entry in &srt_file.entries {
+            let start_ms = Self::timestamp_to_millis(entry.start_time) as u64;
+            let chunk_start = start_ms - (start_ms % chunk_size);
+            self.processed_chunks.insert(chunk_start);
+        }
+
+        if let Some(path) = manifest_path {
+            if let Some(manifest) = self.load_cache_manifest(path) {
+                if manifest.chunk_size_ms == self.config.chunk_size_ms {
+                    for chunk in manifest.processed_chunks {
+                        self.processed_chunks.insert(chunk);
+                    }
+                }
+                for entry in manifest.translations {
+                    if !entry.translated.trim().is_empty() {
+                        self.translation_cache.insert(
+                            entry.start_ms,
+                            (entry.original, entry.translated),
+                        );
+                    }
+                }
+            }
+        }
+
+        true
+    }
+
+    fn load_cache_manifest(&self, path: &Path) -> Option<CacheManifest> {
+        let content = fs::read_to_string(path).ok()?;
+        serde_json::from_str(&content).ok()
+    }
+
+    fn save_cache_manifest_if_needed(&self) {
+        let Some(cache) = &self.network_cache else {
+            return;
+        };
+
+        let mut processed_chunks: Vec<u64> = self.processed_chunks.iter().copied().collect();
+        processed_chunks.sort_unstable();
+
+        let translations = self
+            .translation_cache
+            .iter()
+            .map(|(start_ms, (original, translated))| TranslationCacheEntry {
+                start_ms: *start_ms,
+                original: original.clone(),
+                translated: translated.clone(),
+            })
+            .collect();
+
+        let manifest = CacheManifest {
+            chunk_size_ms: self.config.chunk_size_ms,
+            processed_chunks,
+            translations,
+        };
+
+        let content = match serde_json::to_string(&manifest) {
+            Ok(data) => data,
+            Err(err) => {
+                warn!("Failed to serialize cache manifest: {}", err);
+                return;
+            }
+        };
+
+        if let Err(err) = fs::write(&cache.manifest_path, content) {
+            warn!(
+                "Failed to write cache manifest {}: {}",
+                cache.manifest_path.display(),
+                err
+            );
+        }
     }
 
     /// Detect if current media is a network stream

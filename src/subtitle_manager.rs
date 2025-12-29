@@ -74,6 +74,7 @@ impl SubtitleManager {
         }
     }
 
+
     /// Clear all entries
     pub fn clear(&mut self) {
         self.entries.clear();

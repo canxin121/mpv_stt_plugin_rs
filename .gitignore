@@ -3,3 +3,4 @@ dist/
 toolchains/vulkan-headers/
 toolchains/opencl-headers/
 toolchains/opencl-android/
+log

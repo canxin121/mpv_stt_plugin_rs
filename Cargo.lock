@@ -1983,6 +1983,7 @@ dependencies = [
  "mpv-client",
  "parking_lot",
  "serde",
+ "serde_json",
  "srtlib",
  "tempfile",
  "thiserror",
