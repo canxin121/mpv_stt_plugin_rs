@@ -1990,6 +1990,7 @@ dependencies = [
  "translators",
  "wait-timeout",
  "whisper-rs",
+ "whisper-rs-sys",
 ]
 
 [[package]]

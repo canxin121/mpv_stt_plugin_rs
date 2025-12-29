@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use std::ffi::CString;
 
 use crate::audio::AudioExtractor;
-use crate::config::Config;
+use crate::config::{Config, InferenceDevice};
 use crate::srt::{self, SrtFile};
 use crate::subtitle_manager::SubtitleManager;
 use crate::translate::{AsyncTranslationQueue, TranslationTask, TranslatorConfig};
@@ -168,13 +168,6 @@ impl PluginState {
 
             self.mode = Some(ProcessingMode::Network);
 
-            // Create initial subtitles
-            if self.process_chunk(client) {
-                let main_srt = self.paths.tmp_sub.with_extension("srt");
-                let _ = client.command(&["sub-add", main_srt.to_str().unwrap()]);
-                self.subs_loaded = true;
-            }
-
             info!(
                 "Network stream mode active, current_pos: {}ms",
                 self.current_pos_ms
@@ -269,6 +262,17 @@ impl PluginState {
             return; // Cache not ready yet
         }
         let cache_end_ms = (cache_end_sec.unwrap() * 1000.0) as u64;
+        let available_ms = cache_end_ms.saturating_sub(self.current_pos_ms);
+        let min_chunk_ms = std::cmp::min(3_000, self.config.chunk_size_ms);
+
+        if available_ms < min_chunk_ms {
+            trace!(
+                "Waiting for more cache: need {}ms, have {}ms",
+                self.current_pos_ms + min_chunk_ms,
+                cache_end_ms
+            );
+            return;
+        }
 
         // Catch-up mode: check if we're too far behind playback (always enabled)
         if let Some(playback_pos_ms) = self.last_playback_pos_ms {
@@ -313,11 +317,18 @@ impl PluginState {
             }
         }
 
-        // Try to process multiple chunks ahead if they're cached
-        let chunks_to_process = self.config.lookahead_chunks.max(1);
+        let max_chunk_ms = self.config.chunk_size_ms;
+        let first_chunk_ms = available_ms.min(max_chunk_ms);
+        // Only use look-ahead when we have a full chunk cached.
+        let chunks_to_process = if first_chunk_ms == max_chunk_ms {
+            self.config.lookahead_chunks.max(1)
+        } else {
+            1
+        };
         for i in 0..chunks_to_process {
-            let chunk_start_ms = self.current_pos_ms + (i as u64 * self.chunk_dur);
-            let chunk_end_ms = chunk_start_ms + self.chunk_dur;
+            let chunk_start_ms = self.current_pos_ms + (i as u64 * max_chunk_ms);
+            let chunk_ms = if i == 0 { first_chunk_ms } else { max_chunk_ms };
+            let chunk_end_ms = chunk_start_ms + chunk_ms;
 
             // Check if this chunk is fully cached
             if chunk_end_ms > cache_end_ms {
@@ -350,8 +361,14 @@ impl PluginState {
                 );
             }
 
-            if self.process_chunk(client) {
-                self.current_pos_ms += self.chunk_dur;
+            if self.process_chunk(client, chunk_ms) {
+                self.current_pos_ms += chunk_ms;
+
+                if !self.subs_loaded {
+                    let main_srt = self.paths.tmp_sub.with_extension("srt");
+                    let _ = client.command(&["sub-add", main_srt.to_str().unwrap()]);
+                    self.subs_loaded = true;
+                }
 
                 if self.config.show_progress && i == 0 {
                     let _ = client.command(&[
@@ -578,10 +595,10 @@ impl PluginState {
     }
 
     /// Process one chunk from network cache
-    fn process_chunk(&mut self, client: &mut Handle) -> bool {
+    fn process_chunk(&mut self, client: &mut Handle, chunk_ms: u64) -> bool {
         // Dump cache
         let start_sec = self.current_pos_ms as f64 / 1000.0;
-        let end_sec = (self.current_pos_ms + self.chunk_dur) as f64 / 1000.0;
+        let end_sec = (self.current_pos_ms + chunk_ms) as f64 / 1000.0;
         trace!("Dumping cache from {}s to {}s", start_sec, end_sec);
 
         let dump_result = client.command(&[
@@ -597,11 +614,12 @@ impl PluginState {
         }
 
         // Extract audio from cache
-        if !self.create_wav(self.paths.tmp_cache.to_str().unwrap(), 0) {
+        let wav_ms = std::cmp::min(self.config.wav_chunk_size_ms, chunk_ms);
+        if !self.create_wav(self.paths.tmp_cache.to_str().unwrap(), 0, wav_ms) {
             return false;
         }
 
-        self.transcribe_and_update(client, None)
+        self.transcribe_and_update(client, None, chunk_ms)
     }
 
     /// Process one chunk from local file
@@ -612,15 +630,24 @@ impl PluginState {
         subtitle_path: &Path,
     ) -> bool {
         // Extract audio directly from local file
-        if !self.create_wav(media_path, self.current_pos_ms) {
+        if !self.create_wav(
+            media_path,
+            self.current_pos_ms,
+            self.config.wav_chunk_size_ms,
+        ) {
             return false;
         }
 
-        self.transcribe_and_update(client, Some(subtitle_path))
+        self.transcribe_and_update(client, Some(subtitle_path), self.chunk_dur)
     }
 
     /// Common transcription and subtitle update logic
-    fn transcribe_and_update(&mut self, client: &mut Handle, subtitle_path: Option<&Path>) -> bool {
+    fn transcribe_and_update(
+        &mut self,
+        client: &mut Handle,
+        subtitle_path: Option<&Path>,
+        chunk_ms: u64,
+    ) -> bool {
         let tmp_sub_prefix = self.paths.tmp_sub.to_string_lossy().to_string();
         let append_path = format!("{}_append", &tmp_sub_prefix);
         let main_srt = subtitle_path
@@ -632,7 +659,7 @@ impl PluginState {
         if let Err(e) = self.whisper_runner.transcribe(
             self.paths.tmp_wav.to_str().unwrap(),
             append_path.as_str(),
-            self.chunk_dur,
+            chunk_ms,
         ) {
             error!("Whisper transcription failed: {}", e);
             return false;
@@ -695,7 +722,13 @@ impl PluginState {
         };
 
         let mut msg = format!("Whisper device: {}", notice.effective);
-        if notice.effective.is_gpu() {
+        if notice.effective == InferenceDevice::OPENCL {
+            if let Some(info) = &notice.backend_info {
+                msg.push_str(&format!(" (device: {}, gpu_device: {})", info, notice.gpu_device));
+            } else {
+                msg.push_str(&format!(" (device: unknown, gpu_device: {})", notice.gpu_device));
+            }
+        } else if notice.effective.is_gpu() {
             msg.push_str(&format!(" (gpu_device: {})", notice.gpu_device));
         }
         if notice.effective != notice.requested {
@@ -747,12 +780,12 @@ impl PluginState {
         true
     }
 
-    fn create_wav(&self, media_path: &str, start_ms: u64) -> bool {
+    fn create_wav(&self, media_path: &str, start_ms: u64, duration_ms: u64) -> bool {
         let result = self.audio_extractor.extract_audio_segment(
             media_path,
             self.paths.tmp_wav.to_str().unwrap(),
             start_ms,
-            self.config.wav_chunk_size_ms,
+            duration_ms,
         );
 
         match result {
