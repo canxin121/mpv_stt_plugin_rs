@@ -22,7 +22,6 @@ mpv-client = "1.1.0"
 translators = { version = "0.1.5", features = ["google", "tokio-async"] }
 tokio = { version = "1.48.0", features = ["rt", "time"] }
 whisper-rs = { version = "0.15.1" }
-whisper-rs-sys = { version = "0.14.1", optional = true }
 hound = "3.5.1"
 libc = "0.2.178"
 futures = "0.3.31"
@@ -41,14 +40,9 @@ ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg" }
 [features]
 default = []
 whisper-cuda = ["whisper-rs/cuda"]
-whisper-opencl = ["whisper-rs/opencl", "whisper-rs-sys"]
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
 strip = true
-
-[patch.crates-io]
-whisper-rs = { path = "/mnt/disk1/shared/git/whisper-rs" }
-whisper-rs-sys = { path = "/mnt/disk1/shared/git/whisper-rs/sys" }

@@ -103,6 +103,14 @@ impl SubtitleManager {
         self.entries.len()
     }
 
+    /// Get entries within [start_ms, end_ms)
+    pub fn entries_in_range(&self, start_ms: u32, end_ms: u32) -> Vec<(u32, SubtitleEntry)> {
+        self.entries
+            .range(start_ms..end_ms)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect()
+    }
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

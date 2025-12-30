@@ -4,7 +4,10 @@ use futures::stream::StreamExt;
 use log::{debug, trace, warn};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc,
+};
 use std::thread;
 use std::time::Duration;
 
@@ -151,22 +154,31 @@ pub struct TranslationResult {
     pub translated: String,
 }
 
+#[derive(Debug, Clone)]
+struct QueuedTask {
+    generation: u64,
+    task: TranslationTask,
+}
+
 /// Async translation queue that processes translations in background
 pub struct AsyncTranslationQueue {
-    task_sender: Sender<Option<TranslationTask>>,
+    task_sender: Sender<Option<QueuedTask>>,
     result_receiver: Receiver<TranslationResult>,
     worker_handle: Option<thread::JoinHandle<()>>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+    generation: Arc<AtomicU64>,
 }
 
 impl AsyncTranslationQueue {
     pub fn new(config: TranslatorConfig) -> Self {
-        let (task_sender, task_receiver) = channel::<Option<TranslationTask>>();
+        let (task_sender, task_receiver) = channel::<Option<QueuedTask>>();
         let (result_sender, result_receiver) = channel::<TranslationResult>();
 
         let config = Arc::new(config);
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let generation = Arc::new(AtomicU64::new(0));
         let shutdown_flag_clone = shutdown_flag.clone();
+        let generation_clone = generation.clone();
         let worker_handle = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -178,6 +190,7 @@ impl AsyncTranslationQueue {
                 result_sender,
                 config,
                 shutdown_flag_clone,
+                generation_clone,
                 &runtime,
             );
         });
@@ -187,12 +200,14 @@ impl AsyncTranslationQueue {
             result_receiver,
             worker_handle: Some(worker_handle),
             shutdown_flag,
+            generation,
         }
     }
 
     /// Submit a translation task to the queue
     pub fn submit(&self, task: TranslationTask) {
-        let _ = self.task_sender.send(Some(task));
+        let generation = self.generation.load(Ordering::Relaxed);
+        let _ = self.task_sender.send(Some(QueuedTask { generation, task }));
     }
 
     /// Try to get completed translation results (non-blocking)
@@ -204,12 +219,18 @@ impl AsyncTranslationQueue {
         results
     }
 
+    /// Cancel any in-flight translation tasks without tearing down the worker.
+    pub fn cancel_inflight(&self) {
+        self.generation.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Worker thread that processes translation tasks in batches
     fn worker_thread(
-        task_receiver: Receiver<Option<TranslationTask>>,
+        task_receiver: Receiver<Option<QueuedTask>>,
         result_sender: Sender<TranslationResult>,
         config: Arc<TranslatorConfig>,
         shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+        generation: Arc<AtomicU64>,
         runtime: &tokio::runtime::Runtime,
     ) {
 
@@ -237,10 +258,21 @@ impl AsyncTranslationQueue {
                 }
             };
 
+            let current_generation = generation.load(Ordering::Relaxed);
+
             // Collect all pending tasks from queue (non-blocking)
-            let mut tasks = vec![first_task];
+            let mut tasks = Vec::new();
+            if first_task.generation == current_generation {
+                tasks.push(first_task.task);
+            }
             while let Ok(Some(task)) = task_receiver.try_recv() {
-                tasks.push(task);
+                if task.generation == current_generation {
+                    tasks.push(task.task);
+                }
+            }
+
+            if tasks.is_empty() {
+                continue;
             }
 
             let task_count = tasks.len();
@@ -252,6 +284,8 @@ impl AsyncTranslationQueue {
                 &result_sender,
                 &config,
                 &shutdown_flag,
+                &generation,
+                current_generation,
                 runtime,
             );
 
@@ -265,6 +299,8 @@ impl AsyncTranslationQueue {
         result_sender: &Sender<TranslationResult>,
         config: &Arc<TranslatorConfig>,
         shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
+        generation: &Arc<AtomicU64>,
+        task_generation: u64,
         runtime: &tokio::runtime::Runtime,
     ) {
         if tasks.is_empty() {
@@ -279,6 +315,7 @@ impl AsyncTranslationQueue {
         let active_tasks: Vec<TranslationTask> = tasks.to_vec();
         let config = Arc::clone(config);
         let shutdown_flag = Arc::clone(shutdown_flag);
+        let generation = Arc::clone(generation);
         let sender = result_sender.clone();
         let concurrency = config.concurrency.max(1);
 
@@ -286,13 +323,23 @@ impl AsyncTranslationQueue {
             let stream = futures::stream::iter(active_tasks).map(|task| {
                 let config_clone = Arc::clone(&config);
                 let shutdown_clone = Arc::clone(&shutdown_flag);
-                Self::translate_single_task_async(task, config_clone, shutdown_clone)
+                let generation_clone = Arc::clone(&generation);
+                Self::translate_single_task_async(
+                    task,
+                    config_clone,
+                    shutdown_clone,
+                    generation_clone,
+                    task_generation,
+                )
             });
 
             let mut futures = stream.buffer_unordered(concurrency);
 
             while let Some(result) = futures.next().await {
                 if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                if generation.load(Ordering::Relaxed) != task_generation {
                     break;
                 }
                 if let Some(result) = result {
@@ -310,6 +357,8 @@ impl AsyncTranslationQueue {
         task: TranslationTask,
         config: Arc<TranslatorConfig>,
         shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
+        generation: Arc<AtomicU64>,
+        task_generation: u64,
     ) -> Option<TranslationResult> {
         let translator = build_google_translator(&config);
         let from_lang = normalize_lang_code(&config.from_lang, true);
@@ -323,9 +372,15 @@ impl AsyncTranslationQueue {
             if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
+            if generation.load(Ordering::Relaxed) != task_generation {
+                return None;
+            }
 
             match translator.translate_async(&task.text, &from_lang, &to_lang).await {
                 Ok(translated) if !translated.trim().is_empty() => {
+                    if generation.load(Ordering::Relaxed) != task_generation {
+                        return None;
+                    }
                     return Some(TranslationResult {
                         start_ms: task.start_ms,
                         original: task.text.clone(),

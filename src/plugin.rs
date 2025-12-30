@@ -4,13 +4,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tempfile::TempDir;
 
 #[cfg(target_os = "android")]
 use std::ffi::CString;
 
 use crate::audio::AudioExtractor;
-use crate::config::{Config, InferenceDevice};
+use crate::config::Config;
+use crate::error::WhisperSubsError;
 use crate::srt::{self, SrtFile};
 use crate::subtitle_manager::SubtitleManager;
 use crate::translate::{AsyncTranslationQueue, TranslationTask, TranslatorConfig};
@@ -99,6 +101,7 @@ struct PluginState {
     subs_loaded: bool,
     current_pos_ms: u64,
     last_playback_pos_ms: Option<u64>,
+    last_playback_instant: Option<Instant>,
     chunk_dur: u64,
     mode: Option<ProcessingMode>,
     pending_auto_start: bool, // Delayed auto-start after file loads
@@ -107,7 +110,7 @@ struct PluginState {
 
 impl PluginState {
     fn new(config: Config) -> Self {
-        let chunk_dur = config.chunk_size_ms;
+        let chunk_dur = config.local_chunk_size_ms;
         let audio_extractor = AudioExtractor::default()
             .with_ffmpeg_timeout(config.ffmpeg_timeout_ms)
             .with_ffprobe_timeout(config.ffprobe_timeout_ms);
@@ -123,14 +126,9 @@ impl PluginState {
 
         let whisper_runner = WhisperRunner::new(whisper_config);
 
-        // Initialize Translator (builtin Google Translate)
-        let translator_config =
-            TranslatorConfig::new(config.from_lang.clone(), config.to_lang.clone())
-                .with_timeout_ms(config.translate_timeout_ms)
-                .with_concurrency(config.translate_concurrency);
-
         // Initialize async translation queue (always enabled)
-        let async_translation_queue = Some(AsyncTranslationQueue::new(translator_config));
+        let async_translation_queue =
+            Some(AsyncTranslationQueue::new(Self::build_translator_config(&config)));
 
         Self {
             chunk_dur,
@@ -148,9 +146,94 @@ impl PluginState {
             subs_loaded: false,
             current_pos_ms: 0,
             last_playback_pos_ms: None,
+            last_playback_instant: None,
             mode: None,
             pending_auto_start: false,
             file_loaded: false,
+        }
+    }
+
+    fn build_translator_config(config: &Config) -> TranslatorConfig {
+        TranslatorConfig::new(config.from_lang.clone(), config.to_lang.clone())
+            .with_timeout_ms(config.translate_timeout_ms)
+            .with_concurrency(config.translate_concurrency)
+    }
+
+    fn local_chunk_size(&self) -> u64 {
+        self.config.local_chunk_size_ms.max(1)
+    }
+
+    fn network_chunk_size(&self) -> u64 {
+        self.config.network_chunk_size_ms.max(1)
+    }
+
+    fn active_chunk_size(&self) -> u64 {
+        match self.mode {
+            Some(ProcessingMode::Network) => self.network_chunk_size(),
+            Some(ProcessingMode::Local { .. }) => self.local_chunk_size(),
+            None => self.local_chunk_size(),
+        }
+    }
+
+    fn cancel_translation_inflight(&mut self) {
+        if let Some(queue) = self.async_translation_queue.as_ref() {
+            queue.cancel_inflight();
+        }
+    }
+
+    fn enqueue_missing_translations_for_chunk(&mut self, chunk_start_ms: u64) {
+        let Some(queue) = self.async_translation_queue.as_ref() else {
+            return;
+        };
+
+        let chunk_end = chunk_start_ms.saturating_add(self.active_chunk_size());
+        let entries = self.subtitle_manager.entries_in_range(
+            chunk_start_ms as u32,
+            chunk_end.min(u64::from(u32::MAX)) as u32,
+        );
+
+        if entries.is_empty() {
+            return;
+        }
+
+        let mut pending_tasks = Vec::new();
+        let mut already_translated = 0usize;
+
+        for (start_ms, entry) in entries {
+            let original = entry.text.trim();
+            if original.is_empty() {
+                continue;
+            }
+
+            if let Some((_, translated)) = self.translation_cache.get(&start_ms) {
+                if !translated.trim().is_empty() {
+                    self.subtitle_manager
+                        .update_translation(start_ms, translated);
+                    already_translated += 1;
+                    continue;
+                }
+            }
+
+            if SubtitleManager::text_has_translation(&entry.text) {
+                already_translated += 1;
+                continue;
+            }
+
+            pending_tasks.push(TranslationTask {
+                start_ms,
+                text: entry.text.clone(),
+            });
+        }
+
+        if !pending_tasks.is_empty() {
+            trace!(
+                "Re-queueing {} missing translations (already translated: {})",
+                pending_tasks.len(),
+                already_translated
+            );
+            for task in pending_tasks {
+                queue.submit(task);
+            }
         }
     }
 
@@ -198,6 +281,8 @@ impl PluginState {
 
             self.mode = Some(ProcessingMode::Network);
             self.network_cache = None;
+            let chunk_size = self.network_chunk_size();
+            self.current_pos_ms -= self.current_pos_ms % chunk_size;
 
             if self.config.save_srt {
                 if let Some(media_id) = Self::media_id_for_cache(client) {
@@ -215,6 +300,7 @@ impl PluginState {
                             if self.load_cached_subs(
                                 &cache_paths.subtitle_path,
                                 Some(&cache_paths.manifest_path),
+                                self.network_chunk_size(),
                             ) {
                                 let _ = client.command(&[
                                     "sub-add",
@@ -259,6 +345,8 @@ impl PluginState {
                 if self.config.start_at_zero {
                     self.current_pos_ms = 0;
                 }
+                let chunk_size = self.local_chunk_size();
+                self.current_pos_ms -= self.current_pos_ms % chunk_size;
 
                 self.mode = Some(ProcessingMode::Local {
                     media_path: path.clone(),
@@ -268,7 +356,7 @@ impl PluginState {
                 self.network_cache = None;
 
                 if self.config.save_srt && subtitle_path.exists() {
-                    if self.load_cached_subs(&subtitle_path, None) {
+                    if self.load_cached_subs(&subtitle_path, None, self.local_chunk_size()) {
                         let _ = client.command(&["sub-add", subtitle_path.to_str().unwrap()]);
                         self.subs_loaded = true;
                         info!(
@@ -324,14 +412,16 @@ impl PluginState {
         let subtitle_path = self
             .network_cache
             .as_ref()
-            .map(|cache| cache.subtitle_path.as_path());
+            .map(|cache| cache.subtitle_path.clone());
 
         // Check for seek first. If cache isn't ready yet after a seek, we still want to update
         // `current_pos_ms` so we don't keep generating subtitles for the old position.
-        self.check_seek(client);
+        if self.check_seek(client) {
+            return;
+        }
 
         // Check for completed translations from async queue
-        self.process_translation_results(client, subtitle_path);
+        self.process_translation_results(client, subtitle_path.as_deref());
 
         // Get cache end time
         let cache_end_sec: Option<f64> = client.get_property("demuxer-cache-time").ok();
@@ -341,13 +431,12 @@ impl PluginState {
         }
         let cache_end_ms = (cache_end_sec.unwrap() * 1000.0) as u64;
         let available_ms = cache_end_ms.saturating_sub(self.current_pos_ms);
-        let min_chunk_ms =
-            std::cmp::min(self.config.min_network_chunk_ms, self.config.chunk_size_ms);
+        let chunk_ms = self.network_chunk_size();
 
-        if available_ms < min_chunk_ms {
+        if available_ms < chunk_ms {
             trace!(
                 "Waiting for more cache: need {}ms, have {}ms",
-                self.current_pos_ms + min_chunk_ms,
+                self.current_pos_ms + chunk_ms,
                 cache_end_ms
             );
             return;
@@ -396,15 +485,13 @@ impl PluginState {
             }
         }
 
-        let max_chunk_ms = self.config.chunk_size_ms;
-        let first_chunk_ms = available_ms.min(max_chunk_ms);
-        // Only use look-ahead when we have a full chunk cached.
-        let chunks_to_process = if first_chunk_ms == max_chunk_ms {
-            self.config.lookahead_chunks.max(1)
-        } else {
-            1
-        };
+        let max_chunk_ms = chunk_ms;
+        let first_chunk_ms = max_chunk_ms;
+        let chunks_to_process = self.config.lookahead_chunks.max(1);
         for i in 0..chunks_to_process {
+            if self.check_seek(client) {
+                return;
+            }
             let chunk_start_ms = self.current_pos_ms + (i as u64 * max_chunk_ms);
             let chunk_ms = if i == 0 { first_chunk_ms } else { max_chunk_ms };
             let chunk_end_ms = chunk_start_ms + chunk_ms;
@@ -446,12 +533,12 @@ impl PluginState {
                 continue;
             }
 
-            if self.process_chunk(client, chunk_ms, subtitle_path) {
+            if self.process_chunk(client, chunk_ms, subtitle_path.as_deref()) {
                 self.current_pos_ms += chunk_ms;
 
                 if !self.subs_loaded {
                     let main_srt = subtitle_path
-                        .map(|p| p.to_path_buf())
+                        .clone()
                         .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
                     let _ = client.command(&["sub-add", main_srt.to_str().unwrap()]);
                     self.subs_loaded = true;
@@ -477,7 +564,9 @@ impl PluginState {
         subtitle_path: &Path,
     ) {
         // Check for seek
-        self.check_seek(client);
+        if self.check_seek(client) {
+            return;
+        }
 
         // Check for completed translations from async queue
         self.process_translation_results(client, Some(subtitle_path));
@@ -507,10 +596,11 @@ impl PluginState {
         };
 
         // Adjust chunk size for last chunk
-        if time_left > 0 && time_left < self.config.chunk_size_ms {
+        let local_chunk_size = self.local_chunk_size();
+        if time_left > 0 && time_left < local_chunk_size {
             self.chunk_dur = time_left;
         } else {
-            self.chunk_dur = self.config.chunk_size_ms;
+            self.chunk_dur = local_chunk_size;
         }
 
         if time_left > 0 {
@@ -518,6 +608,9 @@ impl PluginState {
             let chunks_to_process = self.config.lookahead_chunks.max(1);
 
             for i in 0..chunks_to_process {
+                if self.check_seek(client) {
+                    return;
+                }
                 let chunk_pos = self.current_pos_ms + (i as u64 * self.chunk_dur);
                 if chunk_pos >= file_length_ms {
                     break; // Don't process beyond file end
@@ -598,30 +691,52 @@ impl PluginState {
         }
     }
 
-    fn check_seek(&mut self, client: &mut Handle) {
+    fn check_seek(&mut self, client: &mut Handle) -> bool {
         let playback_pos: Option<f64> = client.get_property("time-pos").ok();
         if let Some(pos) = playback_pos {
             let playback_pos_ms = (pos * 1000.0) as u64;
+            let now = Instant::now();
 
             // Detect user seek by comparing against the last observed playback position.
             // IMPORTANT: `current_pos_ms` is the *processing cursor* (next chunk start), which can
             // legitimately run ahead of playback when the cache is full. Comparing playback to
             // `current_pos_ms` causes false "seek backward" detections and makes subtitles vanish.
             let Some(last_ms) = self.last_playback_pos_ms.replace(playback_pos_ms) else {
-                return;
+                self.last_playback_instant = Some(now);
+                return false;
             };
+            let last_instant = self.last_playback_instant.replace(now);
 
             // Avoid treating normal playback progression (or time spent inside Whisper/translate)
             // as a seek. Since we process in chunk units, only treat jumps of >= 1 chunk as seek.
-            let seek_threshold_ms = std::cmp::max(5_000, self.chunk_dur);
+            let chunk_size = self.active_chunk_size();
+            let seek_threshold_ms = std::cmp::max(5_000, chunk_size);
             let delta_ms = playback_pos_ms.abs_diff(last_ms);
             if delta_ms < seek_threshold_ms {
-                return;
+                return false;
+            }
+            if let Some(last_instant) = last_instant {
+                let elapsed_ms = now
+                    .duration_since(last_instant)
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX);
+                if delta_ms <= elapsed_ms.saturating_add(seek_threshold_ms) {
+                    return false;
+                }
+            }
+
+            let new_pos = playback_pos_ms - (playback_pos_ms % chunk_size);
+            if new_pos == self.current_pos_ms {
+                debug!(
+                    "Seek landed within current chunk ({}ms); keeping active tasks",
+                    new_pos
+                );
+                return false;
             }
 
             // Detect seek forward (user skipped ahead)
             if playback_pos_ms > last_ms {
-                let new_pos = playback_pos_ms - (playback_pos_ms % self.chunk_dur);
                 debug!(
                     "User seeked forward from {}ms to {}ms (delta: {}ms)",
                     last_ms, new_pos, delta_ms
@@ -634,10 +749,16 @@ impl PluginState {
 
                 // Keep existing subtitles, just update processing cursor.
                 self.current_pos_ms = new_pos;
+                self.cancel_translation_inflight();
+                self.whisper_runner.cancel_inflight();
+                self.audio_extractor.cancel_inflight();
+                if self.is_chunk_processed(new_pos) {
+                    self.enqueue_missing_translations_for_chunk(new_pos);
+                }
+                return true;
             }
             // Detect seek backward
             else {
-                let new_pos = playback_pos_ms - (playback_pos_ms % self.chunk_dur);
                 debug!(
                     "User seeked backward from {}ms to {}ms (delta: {}ms)",
                     last_ms, new_pos, delta_ms
@@ -649,8 +770,16 @@ impl PluginState {
                 ]);
 
                 self.current_pos_ms = new_pos;
+                self.cancel_translation_inflight();
+                self.whisper_runner.cancel_inflight();
+                self.audio_extractor.cancel_inflight();
+                if self.is_chunk_processed(new_pos) {
+                    self.enqueue_missing_translations_for_chunk(new_pos);
+                }
+                return true;
             }
         }
+        false
     }
 
     /// Process one chunk from network cache
@@ -712,6 +841,10 @@ impl PluginState {
         subtitle_path: Option<&Path>,
         chunk_ms: u64,
     ) -> bool {
+        if self.check_seek(client) {
+            return false;
+        }
+
         let tmp_sub_prefix = self.paths.tmp_sub.to_string_lossy().to_string();
         let append_path = format!("{}_append", &tmp_sub_prefix);
         let main_srt = subtitle_path
@@ -725,10 +858,19 @@ impl PluginState {
             append_path.as_str(),
             chunk_ms,
         ) {
-            error!("Whisper transcription failed: {}", e);
+            if matches!(e, WhisperSubsError::WhisperCancelled) {
+                debug!("Whisper transcription cancelled");
+            } else {
+                error!("Whisper transcription failed: {}", e);
+            }
             return false;
         }
         self.show_device_notice(client);
+        if self.check_seek(client) {
+            debug!("Seek detected during transcription; dropping interim results");
+            self.paths.cleanup_intermediate_subs();
+            return false;
+        }
 
         // Offset timestamps
         let append_srt = format!("{}.srt", append_path);
@@ -806,13 +948,7 @@ impl PluginState {
         };
 
         let mut msg = format!("Whisper device: {}", notice.effective);
-        if notice.effective == InferenceDevice::OPENCL {
-            if let Some(info) = &notice.backend_info {
-                msg.push_str(&format!(" (device: {}, gpu_device: {})", info, notice.gpu_device));
-            } else {
-                msg.push_str(&format!(" (device: unknown, gpu_device: {})", notice.gpu_device));
-            }
-        } else if notice.effective.is_gpu() {
+        if notice.effective.is_gpu() {
             msg.push_str(&format!(" (gpu_device: {})", notice.gpu_device));
         }
         if notice.effective != notice.requested {
@@ -878,6 +1014,10 @@ impl PluginState {
 
         match result {
             Ok(_) => true,
+            Err(WhisperSubsError::AudioExtractionCancelled) => {
+                debug!("Audio extraction cancelled");
+                false
+            }
             Err(e) => {
                 error!("Audio extraction failed: {}", e);
                 false
@@ -890,6 +1030,8 @@ impl PluginState {
 
         // Set shutting down flag to stop any ongoing processing
         self.shutting_down = true;
+        self.whisper_runner.cancel_inflight();
+        self.audio_extractor.cancel_inflight();
 
         // Shutdown async translation queue if it exists
         if let Some(ref mut queue) = self.async_translation_queue {
@@ -904,6 +1046,7 @@ impl PluginState {
         self.subs_loaded = false;
         self.current_pos_ms = 0;
         self.last_playback_pos_ms = None;
+        self.last_playback_instant = None;
         self.mode = None;
     }
 
@@ -927,7 +1070,7 @@ impl PluginState {
         self.processed_chunks.insert(start_ms);
     }
 
-    fn media_id_for_cache(client: &Handle) -> Option<String> {
+    fn media_id_for_cache(client: &mut Handle) -> Option<String> {
         if let Ok(id) = client.get_property::<String>("stream-open-filename") {
             if !id.trim().is_empty() {
                 return Some(id);
@@ -967,7 +1110,12 @@ impl PluginState {
         hash
     }
 
-    fn load_cached_subs(&mut self, srt_path: &Path, manifest_path: Option<&Path>) -> bool {
+    fn load_cached_subs(
+        &mut self,
+        srt_path: &Path,
+        manifest_path: Option<&Path>,
+        chunk_size_ms: u64,
+    ) -> bool {
         if !srt_path.exists() {
             return false;
         }
@@ -985,7 +1133,7 @@ impl PluginState {
         self.processed_chunks.clear();
         self.subtitle_manager.add_from_srt(&srt_file);
 
-        let chunk_size = self.config.chunk_size_ms.max(1);
+        let chunk_size = chunk_size_ms.max(1);
         for entry in &srt_file.entries {
             let start_ms = Self::timestamp_to_millis(entry.start_time) as u64;
             let chunk_start = start_ms - (start_ms % chunk_size);
@@ -994,7 +1142,7 @@ impl PluginState {
 
         if let Some(path) = manifest_path {
             if let Some(manifest) = self.load_cache_manifest(path) {
-                if manifest.chunk_size_ms == self.config.chunk_size_ms {
+                if manifest.chunk_size_ms == chunk_size {
                     for chunk in manifest.processed_chunks {
                         self.processed_chunks.insert(chunk);
                     }
@@ -1037,7 +1185,7 @@ impl PluginState {
             .collect();
 
         let manifest = CacheManifest {
-            chunk_size_ms: self.config.chunk_size_ms,
+            chunk_size_ms: self.network_chunk_size(),
             processed_chunks,
             translations,
         };

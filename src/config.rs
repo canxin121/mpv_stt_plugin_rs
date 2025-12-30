@@ -13,7 +13,6 @@ use std::path::PathBuf;
 pub enum InferenceDevice {
     CPU,
     CUDA,
-    OPENCL,
 }
 
 impl Default for InferenceDevice {
@@ -24,13 +23,12 @@ impl Default for InferenceDevice {
 
 impl InferenceDevice {
     pub fn is_gpu(self) -> bool {
-        matches!(self, InferenceDevice::CUDA | InferenceDevice::OPENCL)
+        matches!(self, InferenceDevice::CUDA)
     }
 
     pub fn from_i32(value: i32) -> Self {
         match value {
             1 => InferenceDevice::CUDA,
-            2 => InferenceDevice::OPENCL,
             _ => InferenceDevice::CPU,
         }
     }
@@ -41,7 +39,6 @@ impl fmt::Display for InferenceDevice {
         let label = match self {
             InferenceDevice::CPU => "cpu",
             InferenceDevice::CUDA => "cuda",
-            InferenceDevice::OPENCL => "opencl",
         };
         write!(f, "{label}")
     }
@@ -61,7 +58,8 @@ pub struct Config {
     pub from_lang: String,
     pub to_lang: String,
 
-    pub chunk_size_ms: u64,
+    pub local_chunk_size_ms: u64,
+    pub network_chunk_size_ms: u64,
     pub wav_chunk_size_ms: u64,
     pub show_progress: bool,
     pub start_at_zero: bool,
@@ -100,7 +98,8 @@ impl Default for Config {
             from_lang: "en".to_string(),
             to_lang: "zh".to_string(),
 
-            chunk_size_ms: 15_000,
+            local_chunk_size_ms: 15_000,
+            network_chunk_size_ms: 15_000,
             wav_chunk_size_ms: 16_000,
             show_progress: true,
             start_at_zero: true,

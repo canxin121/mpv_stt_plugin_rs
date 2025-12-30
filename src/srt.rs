@@ -23,6 +23,16 @@ impl SubtitleEntry {
             text: sub.text,
         }
     }
+
+    #[cfg(test)]
+    fn to_srtlib(&self) -> Subtitle {
+        Subtitle::new(
+            self.index as usize,
+            self.start_time,
+            self.end_time,
+            self.text.clone(),
+        )
+    }
 }
 
 impl fmt::Display for SubtitleEntry {
@@ -150,7 +160,7 @@ mod tests {
             text: "Test subtitle".to_string(),
         };
 
-        let srtlib_sub = entry.to_srtlib().unwrap();
+        let srtlib_sub = entry.to_srtlib();
         assert_eq!(srtlib_sub.num, 1);
         assert_eq!(srtlib_sub.text, "Test subtitle");
 

@@ -20,11 +20,17 @@ pub enum WhisperSubsError {
     #[error("Audio extraction failed: {0}")]
     AudioExtractionFailed(String),
 
+    #[error("Audio extraction cancelled")]
+    AudioExtractionCancelled,
+
     #[error("WAV error: {0}")]
     Wav(#[from] hound::Error),
 
     #[error("Whisper execution failed: {0}")]
     WhisperFailed(String),
+
+    #[error("Whisper execution cancelled")]
+    WhisperCancelled,
 
     #[error("Invalid path: {0}")]
     InvalidPath(String),

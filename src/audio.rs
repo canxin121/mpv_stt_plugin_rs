@@ -6,7 +6,10 @@ use ffmpeg::util::mathematics::rescale;
 use ffmpeg::util::mathematics::rescale::Rescale;
 use log::{debug, trace};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, OnceLock,
+};
 use std::time::{Duration, Instant};
 
 static FFMPEG_INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
@@ -50,6 +53,7 @@ pub struct AudioExtractor {
     output_channels: u8,
     ffmpeg_timeout: Duration,
     ffprobe_timeout: Duration,
+    cancel_generation: Arc<AtomicU64>,
 }
 
 impl Default for AudioExtractor {
@@ -59,6 +63,7 @@ impl Default for AudioExtractor {
             output_channels: 1,
             ffmpeg_timeout: Duration::from_secs(30),
             ffprobe_timeout: Duration::from_secs(10),
+            cancel_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -82,6 +87,17 @@ impl AudioExtractor {
         self
     }
 
+    pub fn cancel_inflight(&self) {
+        self.cancel_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn check_cancel(&self, generation: u64) -> Result<()> {
+        if self.cancel_generation.load(Ordering::Relaxed) != generation {
+            return Err(WhisperSubsError::AudioExtractionCancelled);
+        }
+        Ok(())
+    }
+
     /// Extract audio segment from media file using ffmpeg libraries
     pub fn extract_audio_segment<P: AsRef<Path>>(
         &self,
@@ -92,6 +108,7 @@ impl AudioExtractor {
     ) -> Result<()> {
         ensure_ffmpeg()?;
         let start_time = Instant::now();
+        let run_generation = self.cancel_generation.load(Ordering::Relaxed);
 
         let input_str = input_path
             .as_ref()
@@ -110,10 +127,18 @@ impl AudioExtractor {
             output_str
         );
 
-        let mut ictx =
-            ffmpeg::format::input(&input_path).map_err(|e| ffmpeg_err("open input failed", e))?;
+        let cancel_generation = Arc::clone(&self.cancel_generation);
+        let ffmpeg_timeout = self.ffmpeg_timeout;
+        let mut ictx = ffmpeg::format::input_with_interrupt(&input_path, move || {
+            if ffmpeg_timeout.as_millis() != 0 && start_time.elapsed() > ffmpeg_timeout {
+                return true;
+            }
+            cancel_generation.load(Ordering::Relaxed) != run_generation
+        })
+        .map_err(|e| ffmpeg_err("open input failed", e))?;
 
         check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
+        self.check_cancel(run_generation)?;
 
         let mut seeked = false;
         if start_ms > 0 {
@@ -184,12 +209,14 @@ impl AudioExtractor {
             }
 
             check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
+            self.check_cancel(run_generation)?;
             decoder
                 .send_packet(&packet)
                 .map_err(|e| ffmpeg_err("send packet failed", e))?;
 
             while decoder.receive_frame(&mut decoded).is_ok() {
                 check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
+                self.check_cancel(run_generation)?;
 
                 let mut resampled = ffmpeg::frame::Audio::empty();
                 let _ = resampler
@@ -244,6 +271,7 @@ impl AudioExtractor {
                 .map_err(|e| ffmpeg_err("send eof failed", e))?;
             while decoder.receive_frame(&mut decoded).is_ok() {
                 check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
+                self.check_cancel(run_generation)?;
                 let mut resampled = ffmpeg::frame::Audio::empty();
                 let _ = resampler
                     .run(&decoded, &mut resampled)
@@ -287,6 +315,7 @@ impl AudioExtractor {
             }
         }
 
+        self.check_cancel(run_generation)?;
         writer.finalize()?;
         if target_frames > 0 && written_frames == 0 {
             return Err(WhisperSubsError::AudioExtractionFailed(
