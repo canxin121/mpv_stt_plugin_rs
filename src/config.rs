@@ -79,6 +79,7 @@ pub struct Config {
 
     // Network cache settings
     pub demuxer_max_bytes: Option<i64>,
+    pub min_network_chunk_ms: u64,
 
     // Auto-start settings
     pub auto_start: bool,
@@ -116,6 +117,7 @@ impl Default for Config {
 
             // Network cache defaults
             demuxer_max_bytes: None,  // Use mpv's default (150MB) if not specified
+            min_network_chunk_ms: 5_000,
 
             // Auto-start defaults
             auto_start: false,  // Disabled by default, use Ctrl+. to toggle manually

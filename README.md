@@ -117,6 +117,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 
    # 网络流缓存（可选，单位字节）
    demuxer_max_bytes = 536870912
+   min_network_chunk_ms = 5000   # 网络流最短处理时长，不足则等待更多缓存
    ```
 
    CUDA 支持说明：

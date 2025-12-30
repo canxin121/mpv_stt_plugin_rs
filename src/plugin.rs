@@ -347,7 +347,8 @@ impl PluginState {
         }
         let cache_end_ms = (cache_end_sec.unwrap() * 1000.0) as u64;
         let available_ms = cache_end_ms.saturating_sub(self.current_pos_ms);
-        let min_chunk_ms = std::cmp::min(3_000, self.config.chunk_size_ms);
+        let min_chunk_ms =
+            std::cmp::min(self.config.min_network_chunk_ms, self.config.chunk_size_ms);
 
         if available_ms < min_chunk_ms {
             trace!(
