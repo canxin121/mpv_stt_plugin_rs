@@ -123,9 +123,28 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
    ```
 
    CUDA 支持说明：
-   - 编译时开启：`cargo build --release --features whisper-cuda`
+   - 编译时开启：`cargo build --release --features whisper_cpp_cuda`
    - 运行时配置：`inference_device = "cuda"`（或环境变量 `WHISPERSUBS_INFERENCE_DEVICE=cuda`）
    - 运行时确保系统能找到 CUDA 运行库（例如配置 `LD_LIBRARY_PATH` 或系统动态链接器路径）
+
+   Whisper 后端编译选项（Linux 可用，Android 仅支持 `whisper_cpp_cpu`）：
+   - `whisper_cpp_cpu`：Whisper.cpp CPU 后端
+   - `whisper_cpp_cuda`：Whisper.cpp CUDA 后端
+   - `fast_whisper_cpu`：Python faster-whisper (CTranslate2) CPU 后端
+   - `fast_whisper_cuda`：Python faster-whisper (CTranslate2) CUDA 后端（仅 Linux）
+
+   示例：
+   - `cargo build --release`（默认 `whisper_cpp_cpu`）
+   - `cargo build --release --no-default-features --features whisper_cpp_cuda`
+   - `cargo build --release --no-default-features --features fast_whisper_cpu`
+
+   fast_whisper 运行时说明：
+   - 需要系统安装 Python 3.9+ 与 `faster-whisper`（`pip install faster-whisper`）
+   - `model_path` 需为 **faster-whisper** 模型名（如 `large-v3`）或 **CTranslate2 模型目录**
+   - 可用环境变量：
+     - `WHISPERSUBS_PYTHON=/path/to/python`
+     - `WHISPERSUBS_FAST_WHISPER_COMPUTE_TYPE`（默认 `default`）
+     - `WHISPERSUBS_FAST_WHISPER_BEAM_SIZE`（默认 `5`）
 
 
 ## Android 构建
