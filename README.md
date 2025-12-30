@@ -74,19 +74,13 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 
    示例（TOML，带注释说明）：
    ```toml
-   # Whisper 模型路径（.bin/.gguf）
+   # whisper.cpp 配置
    model_path = "/path/to/ggml-base.bin"
-   # 解码线程数（CPU 线程数）
-   threads = 8
-   # 识别语言：固定语言用 "ja" / "en" 等，自动识别用 "auto"
+   threads = 8              # CPU 线程数
    language = "ja"
-
-   # 推理设备：cpu / cuda
-   inference_device = "cpu"
-   # GPU 设备编号（多 GPU 环境下选择）
-   gpu_device = 0
-   # flash attention（实验性）
-   flash_attn = false
+   gpu_device = 0           # 仅 cuda 版有效
+   flash_attn = false       # 仅 cuda 版有效
+   whisper_timeout_ms = 120000
 
    # 翻译设置（内置 Google 翻译）
    from_lang = "ja"       # 源语言
@@ -122,16 +116,13 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
    min_network_chunk_ms = 5000   # 网络流最短处理时长，不足则等待更多缓存
    ```
 
-   CUDA 支持说明：
+   CUDA 支持说明（纯编译期选择，无运行时回退）：
    - 编译时开启：`cargo build --release --features whisper_cpp_cuda`
-   - 运行时配置：`inference_device = "cuda"`（或环境变量 `WHISPERSUBS_INFERENCE_DEVICE=cuda`）
-   - 运行时确保系统能找到 CUDA 运行库（例如配置 `LD_LIBRARY_PATH` 或系统动态链接器路径）
+   - 运行时需确保系统能找到 CUDA 运行库（例如配置 `LD_LIBRARY_PATH` 或系统动态链接器路径）
 
    Whisper 后端编译选项（Linux 可用，Android 仅支持 `whisper_cpp_cpu`）：
    - `whisper_cpp_cpu`：Whisper.cpp CPU 后端
    - `whisper_cpp_cuda`：Whisper.cpp CUDA 后端
-   - `fast_whisper_cpu`：Python faster-whisper (CTranslate2) CPU 后端
-   - `fast_whisper_cuda`：Python faster-whisper (CTranslate2) CUDA 后端（仅 Linux）
 
    示例：
    - `cargo build --release`（默认 `whisper_cpp_cpu`）

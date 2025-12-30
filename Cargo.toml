@@ -41,11 +41,6 @@ ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg" }
 default = ["whisper_cpp_cpu"]
 whisper_cpp_cpu = ["dep:whisper-rs"]
 whisper_cpp_cuda = ["dep:whisper-rs", "whisper-rs/cuda"]
-fast_whisper_cpu = []
-fast_whisper_cuda = []
-
-# Backward-compatible alias.
-whisper-cuda = ["whisper_cpp_cuda"]
 
 [profile.release]
 opt-level = 3

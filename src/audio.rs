@@ -1,14 +1,14 @@
 use crate::error::{Result, WhisperSubsError};
-use ffmpeg_next as ffmpeg;
-use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::format::Sample;
+use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::util::mathematics::rescale;
 use ffmpeg::util::mathematics::rescale::Rescale;
+use ffmpeg_next as ffmpeg;
 use log::{debug, trace};
 use std::path::Path;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc, OnceLock,
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -158,10 +158,9 @@ impl AudioExtractor {
             })?;
         let stream_index = input_stream.index();
 
-        let context_decoder = ffmpeg::codec::context::Context::from_parameters(
-            input_stream.parameters(),
-        )
-        .map_err(|e| ffmpeg_err("decoder context failed", e))?;
+        let context_decoder =
+            ffmpeg::codec::context::Context::from_parameters(input_stream.parameters())
+                .map_err(|e| ffmpeg_err("decoder context failed", e))?;
         let mut decoder = context_decoder
             .decoder()
             .audio()
@@ -343,10 +342,7 @@ impl AudioExtractor {
         let ictx = ffmpeg::format::input(&path).map_err(|e| ffmpeg_err("open input failed", e))?;
         check_timeout(start_time, self.ffprobe_timeout, "ffprobe")?;
 
-        let has_audio = ictx
-            .streams()
-            .best(ffmpeg::media::Type::Audio)
-            .is_some();
+        let has_audio = ictx.streams().best(ffmpeg::media::Type::Audio).is_some();
         trace!("validate_audio({}): {}", path_str, has_audio);
         Ok(has_audio)
     }

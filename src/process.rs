@@ -13,7 +13,11 @@ pub fn run_capture_output(mut cmd: Command, label: &str, timeout: Duration) -> R
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| {
-        WhisperSubsError::ProcessFailed(format!("Failed to spawn {}: {}", format_cmd_for_error(label), e))
+        WhisperSubsError::ProcessFailed(format!(
+            "Failed to spawn {}: {}",
+            format_cmd_for_error(label),
+            e
+        ))
     })?;
 
     match child.wait_timeout(timeout).map_err(|e| {
@@ -50,7 +54,11 @@ pub fn run_capture_output_with_stdin(
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| {
-        WhisperSubsError::ProcessFailed(format!("Failed to spawn {}: {}", format_cmd_for_error(label), e))
+        WhisperSubsError::ProcessFailed(format!(
+            "Failed to spawn {}: {}",
+            format_cmd_for_error(label),
+            e
+        ))
     })?;
 
     if let Some(mut stdin) = child.stdin.take() {
@@ -80,4 +88,3 @@ pub fn run_capture_output_with_stdin(
         }
     }
 }
-

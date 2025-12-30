@@ -1,9 +1,9 @@
 use crate::error::Result;
 use crate::srt::{SrtFile, SubtitleEntry};
 use log::{debug, trace};
+use srtlib::Timestamp;
 use std::collections::BTreeMap;
 use std::path::Path;
-use srtlib::Timestamp;
 
 /// Manages subtitles in memory and syncs to disk
 pub struct SubtitleManager {
@@ -61,10 +61,7 @@ impl SubtitleManager {
         if let Some(entry) = self.entries.get_mut(&start_ms) {
             // Check if translation already exists (avoid duplicates)
             let normalized = translation.trim();
-            let already_present = entry
-                .text
-                .lines()
-                .any(|line| line.trim() == normalized);
+            let already_present = entry.text.lines().any(|line| line.trim() == normalized);
             if !already_present {
                 entry.text = format!("{}\n{}", entry.text, translation);
                 trace!("Updated translation for entry at {}ms", start_ms);
@@ -73,7 +70,6 @@ impl SubtitleManager {
             debug!("Entry not found for translation update at {}ms", start_ms);
         }
     }
-
 
     /// Clear all entries
     pub fn clear(&mut self) {

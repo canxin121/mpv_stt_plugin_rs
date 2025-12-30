@@ -1,27 +1,31 @@
+use crate::config::InferenceDevice;
 use crate::error::{Result, WhisperSubsError};
 use crate::srt::{SrtFile, SubtitleEntry};
 use hound::{SampleFormat, WavReader};
-use log::{debug, info, trace, warn};
+use log::{debug, info, trace};
 use srtlib::Timestamp;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperError,
 };
-use crate::config::InferenceDevice;
 
 const EXPECTED_SAMPLE_RATE: u32 = 16_000;
 const EXPECTED_CHANNELS: u16 = 1;
+
+#[cfg(feature = "whisper_cpp_cuda")]
+const FEATURE_DEVICE: InferenceDevice = InferenceDevice::CUDA;
+#[cfg(feature = "whisper_cpp_cpu")]
+const FEATURE_DEVICE: InferenceDevice = InferenceDevice::CPU;
 
 pub struct WhisperConfig {
     pub model_path: String,
     pub threads: u8,
     pub language: String,
-    pub inference_device: InferenceDevice,
     pub gpu_device: i32,
     pub flash_attn: bool,
     pub timeout_ms: u64,
@@ -41,7 +45,6 @@ impl Default for WhisperConfig {
             model_path: String::new(),
             threads: 8,
             language: "auto".to_string(),
-            inference_device: InferenceDevice::CPU,
             gpu_device: 0,
             flash_attn: false,
             timeout_ms: 120_000,
@@ -64,11 +67,6 @@ impl WhisperConfig {
 
     pub fn with_language(mut self, language: String) -> Self {
         self.language = language;
-        self
-    }
-
-    pub fn with_inference_device(mut self, device: InferenceDevice) -> Self {
-        self.inference_device = device;
         self
     }
 
@@ -115,38 +113,6 @@ impl WhisperRunner {
         self.cancel_generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn select_effective_device(&self) -> (InferenceDevice, String) {
-        let requested_device = self.config.inference_device;
-        let (effective_device, reason) = match requested_device {
-            InferenceDevice::CUDA => {
-                if cfg!(feature = "whisper_cpp_cuda") {
-                    (
-                        InferenceDevice::CUDA,
-                        "requested cuda and whisper_cpp_cuda feature enabled".to_string(),
-                    )
-                } else {
-                    warn!(
-                        "inference_device=CUDA but whisper_cpp_cuda feature is disabled; falling back to CPU"
-                    );
-                    (
-                        InferenceDevice::CPU,
-                        "whisper_cpp_cuda feature disabled".to_string(),
-                    )
-                }
-            }
-            InferenceDevice::CPU => (InferenceDevice::CPU, "requested cpu".to_string()),
-        };
-
-        if effective_device != requested_device {
-            warn!(
-                "Whisper inference device fallback: requested={}, effective={}, reason={}",
-                requested_device, effective_device, reason
-            );
-        }
-
-        (effective_device, reason)
-    }
-
     fn build_context_params_for_device(
         &self,
         effective_device: InferenceDevice,
@@ -168,11 +134,7 @@ impl WhisperRunner {
         params
     }
 
-    fn ensure_context_for_device(
-        &mut self,
-        device: InferenceDevice,
-        reason: &str,
-    ) -> Result<()> {
+    fn ensure_context_for_device(&mut self, device: InferenceDevice, reason: &str) -> Result<()> {
         if self.ctx.is_some() && self.active_device == Some(device) {
             return Ok(());
         }
@@ -184,7 +146,7 @@ impl WhisperRunner {
         self.ctx = Some(ctx);
         self.active_device = Some(device);
         self.pending_device_notice = Some(WhisperDeviceNotice {
-            requested: self.config.inference_device,
+            requested: FEATURE_DEVICE,
             effective: device,
             reason: reason.to_string(),
             gpu_device: self.config.gpu_device,
@@ -203,30 +165,14 @@ impl WhisperRunner {
             ));
         }
 
-        let (device, reason) = self.select_effective_device();
-        if let Err(err) = self.ensure_context_for_device(device, &reason) {
-            if device.is_gpu() {
-                warn!(
-                    "Whisper context init failed on {} ({}); falling back to CPU",
-                    device, err
-                );
-                self.ctx = None;
-                self.active_device = None;
-                return self.ensure_context_for_device(
-                    InferenceDevice::CPU,
-                    "fallback after gpu init failure",
-                );
-            }
-            return Err(err);
-        }
+        self.ensure_context_for_device(FEATURE_DEVICE, "feature-selected whisper_cpp")?;
 
         Ok(())
     }
 
     fn load_audio_samples<P: AsRef<Path>>(&self, audio_path: P) -> Result<Vec<f32>> {
-        let mut reader = WavReader::open(audio_path.as_ref()).map_err(|e| {
-            WhisperSubsError::WhisperFailed(format!("Failed to read WAV: {}", e))
-        })?;
+        let mut reader = WavReader::open(audio_path.as_ref())
+            .map_err(|e| WhisperSubsError::WhisperFailed(format!("Failed to read WAV: {}", e)))?;
         let spec = reader.spec();
 
         if spec.channels != EXPECTED_CHANNELS
@@ -309,9 +255,7 @@ impl WhisperRunner {
 
         trace!(
             "Running Whisper on {} (duration: {}ms, language: {})",
-            audio_str,
-            duration_ms,
-            self.config.language
+            audio_str, duration_ms, self.config.language
         );
 
         self.ensure_context()?;
@@ -339,30 +283,7 @@ impl WhisperRunner {
             );
         }
 
-        let segments = match self.run_inference(&audio, effective_duration_ms) {
-            Ok(segments) => Ok(segments),
-            Err(err) => {
-                if matches!(err, WhisperSubsError::WhisperCancelled) {
-                    return Err(err);
-                }
-                if self.active_device.map_or(false, |device| device.is_gpu()) {
-                    let failed_device = self.active_device.unwrap_or(InferenceDevice::CPU);
-                    warn!(
-                        "Whisper inference failed on {} ({}); retrying on CPU",
-                        failed_device, err
-                    );
-                    self.ctx = None;
-                    self.active_device = None;
-                    self.ensure_context_for_device(
-                        InferenceDevice::CPU,
-                        "fallback after gpu inference failure",
-                    )?;
-                    self.run_inference(&audio, effective_duration_ms)
-                } else {
-                    Err(err)
-                }
-            }
-        }?;
+        let segments = self.run_inference(&audio, effective_duration_ms)?;
         self.write_srt(output_prefix, &segments)?;
 
         debug!("Whisper transcription completed successfully");
@@ -482,21 +403,72 @@ fn whisper_error(context: &str, err: WhisperError) -> WhisperSubsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::Instant;
 
     #[test]
     fn test_whisper_config_builder() {
         let config = WhisperConfig::new("/path/to/model".to_string())
             .with_threads(4)
             .with_language("en".to_string())
-            .with_inference_device(InferenceDevice::CUDA)
             .with_gpu_device(1)
             .with_flash_attn(true);
 
         assert_eq!(config.model_path, "/path/to/model");
         assert_eq!(config.threads, 4);
         assert_eq!(config.language, "en");
-        assert_eq!(config.inference_device, InferenceDevice::CUDA);
         assert_eq!(config.gpu_device, 1);
         assert!(config.flash_attn);
+    }
+
+    /// Optional bench (CPU feature): set WHISPERSUBS_E2E_CPP_MODEL and WHISPERSUBS_E2E_AUDIO_FILE.
+    /// Model load is warmed once; printed time is second run (inference only).
+    #[test]
+    #[cfg(feature = "whisper_cpp_cpu")]
+    fn test_whisper_cpp_bench_optional() {
+        let model = match std::env::var("WHISPERSUBS_E2E_CPP_MODEL") {
+            Ok(v) => v,
+            Err(_) => {
+                eprintln!(
+                    "skip: set WHISPERSUBS_E2E_CPP_MODEL and WHISPERSUBS_E2E_AUDIO_FILE to run"
+                );
+                return;
+            }
+        };
+        let audio = match std::env::var("WHISPERSUBS_E2E_AUDIO_FILE") {
+            Ok(v) => PathBuf::from(v),
+            Err(_) => {
+                eprintln!(
+                    "skip: set WHISPERSUBS_E2E_CPP_MODEL and WHISPERSUBS_E2E_AUDIO_FILE to run"
+                );
+                return;
+            }
+        };
+
+        let mut runner = WhisperRunner::new(
+            WhisperConfig::new(model.clone())
+                .with_threads(4)
+                .with_language("ja".to_string())
+                .with_gpu_device(0)
+                .with_flash_attn(false)
+                .with_timeout_ms(120_000),
+        );
+        let out_prefix = PathBuf::from("/tmp/whisper_cpp_bench");
+
+        // Warm-up (loads model).
+        let _ = runner.transcribe(&audio, &out_prefix, 5_000);
+
+        // Timed run.
+        let t0 = Instant::now();
+        runner
+            .transcribe(&audio, &out_prefix, 5_000)
+            .expect("whisper_cpp transcribe");
+        let infer_ms = t0.elapsed().as_millis();
+        println!(
+            "whisper_cpp_cpu bench: model={} audio={} infer_ms={}",
+            model,
+            audio.display(),
+            infer_ms
+        );
     }
 }

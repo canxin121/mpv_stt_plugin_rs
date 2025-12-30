@@ -115,11 +115,10 @@ impl PluginState {
             .with_ffmpeg_timeout(config.ffmpeg_timeout_ms)
             .with_ffprobe_timeout(config.ffprobe_timeout_ms);
 
-        // Initialize Whisper
+        // Initialize Whisper (backend-specific config selected at compile time)
         let whisper_config = WhisperConfig::new(config.model_path.clone())
             .with_threads(config.threads)
             .with_language(config.language.clone())
-            .with_inference_device(config.inference_device)
             .with_gpu_device(config.gpu_device)
             .with_flash_attn(config.flash_attn)
             .with_timeout_ms(config.whisper_timeout_ms);
@@ -127,8 +126,9 @@ impl PluginState {
         let whisper_runner = WhisperRunner::new(whisper_config);
 
         // Initialize async translation queue (always enabled)
-        let async_translation_queue =
-            Some(AsyncTranslationQueue::new(Self::build_translator_config(&config)));
+        let async_translation_queue = Some(AsyncTranslationQueue::new(
+            Self::build_translator_config(&config),
+        ));
 
         Self {
             chunk_dur,
@@ -359,10 +359,7 @@ impl PluginState {
                     if self.load_cached_subs(&subtitle_path, None, self.local_chunk_size()) {
                         let _ = client.command(&["sub-add", subtitle_path.to_str().unwrap()]);
                         self.subs_loaded = true;
-                        info!(
-                            "Loaded cached subtitles from {}",
-                            subtitle_path.display()
-                        );
+                        info!("Loaded cached subtitles from {}", subtitle_path.display());
                     }
                 }
 
@@ -862,6 +859,11 @@ impl PluginState {
                 debug!("Whisper transcription cancelled");
             } else {
                 error!("Whisper transcription failed: {}", e);
+                let msg = format!("Whisper failed: {e}");
+                let _ = client.command(&["show-text", &msg, "4000"]);
+                // Hard stop: backend failed, keep plugin idle as requested.
+                self.running = false;
+                self.cleanup(client);
             }
             return false;
         }
@@ -927,7 +929,10 @@ impl PluginState {
                 );
             }
         } else if already_translated > 0 {
-            debug!("All {} entries already had translations", already_translated);
+            debug!(
+                "All {} entries already had translations",
+                already_translated
+            );
         }
 
         // Keep only the main subtitle file on disk during playback to reduce clutter.
@@ -1123,7 +1128,11 @@ impl PluginState {
         let srt_file = match SrtFile::parse(srt_path) {
             Ok(srt) => srt,
             Err(err) => {
-                warn!("Failed to parse cached subtitles {}: {}", srt_path.display(), err);
+                warn!(
+                    "Failed to parse cached subtitles {}: {}",
+                    srt_path.display(),
+                    err
+                );
                 return false;
             }
         };
@@ -1149,10 +1158,8 @@ impl PluginState {
                 }
                 for entry in manifest.translations {
                     if !entry.translated.trim().is_empty() {
-                        self.translation_cache.insert(
-                            entry.start_ms,
-                            (entry.original, entry.translated),
-                        );
+                        self.translation_cache
+                            .insert(entry.start_ms, (entry.original, entry.translated));
                     }
                 }
             }

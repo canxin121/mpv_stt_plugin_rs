@@ -2,17 +2,22 @@ use crate::config::InferenceDevice;
 use crate::error::{Result, WhisperSubsError};
 use crate::process::run_capture_output_with_stdin;
 use crate::srt::{SrtFile, SubtitleEntry};
-use log::{debug, info, trace, warn};
+use log::{debug, info, trace};
 use srtlib::Timestamp;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use std::time::Duration;
 
 const FAST_WHISPER_REPO: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../faster-whisper");
+
+#[cfg(feature = "fast_whisper_cuda")]
+const FEATURE_DEVICE: InferenceDevice = InferenceDevice::CUDA;
+#[cfg(feature = "fast_whisper_cpu")]
+const FEATURE_DEVICE: InferenceDevice = InferenceDevice::CPU;
 
 #[derive(serde::Deserialize)]
 struct PythonSegment {
@@ -30,7 +35,6 @@ pub struct WhisperConfig {
     pub model_path: String,
     pub threads: u8,
     pub language: String,
-    pub inference_device: InferenceDevice,
     pub gpu_device: i32,
     pub flash_attn: bool,
     pub timeout_ms: u64,
@@ -50,7 +54,6 @@ impl Default for WhisperConfig {
             model_path: String::new(),
             threads: 8,
             language: "auto".to_string(),
-            inference_device: InferenceDevice::CPU,
             gpu_device: 0,
             flash_attn: false,
             timeout_ms: 120_000,
@@ -73,11 +76,6 @@ impl WhisperConfig {
 
     pub fn with_language(mut self, language: String) -> Self {
         self.language = language;
-        self
-    }
-
-    pub fn with_inference_device(mut self, device: InferenceDevice) -> Self {
-        self.inference_device = device;
         self
     }
 
@@ -120,38 +118,6 @@ impl WhisperRunner {
 
     pub fn cancel_inflight(&self) {
         self.cancel_generation.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn select_effective_device(&self) -> (InferenceDevice, String) {
-        let requested_device = self.config.inference_device;
-        let (effective_device, reason) = match requested_device {
-            InferenceDevice::CUDA => {
-                if cfg!(feature = "fast_whisper_cuda") {
-                    (
-                        InferenceDevice::CUDA,
-                        "requested cuda and fast_whisper_cuda feature enabled".to_string(),
-                    )
-                } else {
-                    warn!(
-                        "inference_device=CUDA but fast_whisper_cuda feature is disabled; falling back to CPU"
-                    );
-                    (
-                        InferenceDevice::CPU,
-                        "fast_whisper_cuda feature disabled".to_string(),
-                    )
-                }
-            }
-            InferenceDevice::CPU => (InferenceDevice::CPU, "requested cpu".to_string()),
-        };
-
-        if effective_device != requested_device {
-            warn!(
-                "Whisper inference device fallback: requested={}, effective={}, reason={}",
-                requested_device, effective_device, reason
-            );
-        }
-
-        (effective_device, reason)
     }
 
     fn python_executable() -> String {
@@ -252,10 +218,22 @@ print(json.dumps(result, ensure_ascii=False))
             .env("WHISPER_DEVICE_INDEX", self.config.gpu_device.to_string())
             .env("WHISPER_LANGUAGE", language)
             .env("WHISPER_CPU_THREADS", self.config.threads.to_string())
-            .env("WHISPER_COMPUTE_TYPE", std::env::var("WHISPERSUBS_FAST_WHISPER_COMPUTE_TYPE").unwrap_or_else(|_| "default".to_string()))
-            .env("WHISPER_BEAM_SIZE", std::env::var("WHISPERSUBS_FAST_WHISPER_BEAM_SIZE").unwrap_or_else(|_| "5".to_string()));
+            .env(
+                "WHISPER_COMPUTE_TYPE",
+                std::env::var("WHISPERSUBS_FAST_WHISPER_COMPUTE_TYPE")
+                    .unwrap_or_else(|_| "default".to_string()),
+            )
+            .env(
+                "WHISPER_BEAM_SIZE",
+                std::env::var("WHISPERSUBS_FAST_WHISPER_BEAM_SIZE")
+                    .unwrap_or_else(|_| "5".to_string()),
+            );
 
-        let sep = if cfg!(target_os = "windows") { ";" } else { ":" };
+        let sep = if cfg!(target_os = "windows") {
+            ";"
+        } else {
+            ":"
+        };
         let python_path = match std::env::var("PYTHONPATH") {
             Ok(existing) if !existing.trim().is_empty() => {
                 format!("{}{}{}", existing, sep, FAST_WHISPER_REPO)
@@ -264,7 +242,8 @@ print(json.dumps(result, ensure_ascii=False))
         };
         cmd.env("PYTHONPATH", python_path);
 
-        let output = run_capture_output_with_stdin(cmd, "faster-whisper", script.as_bytes(), timeout)?;
+        let output =
+            run_capture_output_with_stdin(cmd, "faster-whisper", script.as_bytes(), timeout)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -310,40 +289,30 @@ print(json.dumps(result, ensure_ascii=False))
 
         trace!(
             "Running faster-whisper on {} (language: {})",
-            audio_str,
-            self.config.language
+            audio_str, self.config.language
         );
 
         let run_generation = self.cancel_generation.load(Ordering::Relaxed);
 
-        let (device, reason) = self.select_effective_device();
+        let device = FEATURE_DEVICE;
+        let reason = if device.is_gpu() {
+            "feature fast_whisper_cuda selected"
+        } else {
+            "feature fast_whisper_cpu selected"
+        };
         info!(
             "Whisper inference device: {} (reason: {}, gpu_device: {})",
             device, reason, self.config.gpu_device
         );
         self.active_device = Some(device);
         self.pending_device_notice = Some(WhisperDeviceNotice {
-            requested: self.config.inference_device,
+            requested: device,
             effective: device,
-            reason,
+            reason: reason.to_string(),
             gpu_device: self.config.gpu_device,
         });
 
-        let result = match self.run_python_transcribe(&audio_path, device) {
-            Ok(result) => Ok(result),
-            Err(err) => {
-                if device.is_gpu() {
-                    warn!(
-                        "Whisper inference failed on {} ({}); retrying on CPU",
-                        device, err
-                    );
-                    let result = self.run_python_transcribe(&audio_path, InferenceDevice::CPU)?;
-                    Ok(result)
-                } else {
-                    Err(err)
-                }
-            }
-        }?;
+        let result = self.run_python_transcribe(&audio_path, device)?;
 
         if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
             return Err(WhisperSubsError::WhisperCancelled);
@@ -401,21 +370,86 @@ fn seconds_to_millis(seconds: f64) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hound;
+    use std::time::Instant;
+    use tempfile::tempdir;
 
     #[test]
     fn test_whisper_config_builder() {
         let config = WhisperConfig::new("/path/to/model".to_string())
             .with_threads(4)
             .with_language("en".to_string())
-            .with_inference_device(InferenceDevice::CUDA)
             .with_gpu_device(1)
             .with_flash_attn(true);
 
         assert_eq!(config.model_path, "/path/to/model");
         assert_eq!(config.threads, 4);
         assert_eq!(config.language, "en");
-        assert_eq!(config.inference_device, InferenceDevice::CUDA);
         assert_eq!(config.gpu_device, 1);
         assert!(config.flash_attn);
+    }
+
+    /// Smoke test for faster-whisper backend (opt-in with env WHISPERSUBS_E2E_FAST_WHISPER=1).
+    /// Requires Python + faster-whisper installed.
+    #[test]
+    #[cfg(any(feature = "fast_whisper_cpu", feature = "fast_whisper_cuda"))]
+    fn test_fast_whisper_smoke_optional() {
+        if std::env::var("WHISPERSUBS_E2E_FAST_WHISPER").is_err() {
+            eprintln!(
+                "skipping fast_whisper smoke test (set WHISPERSUBS_E2E_FAST_WHISPER=1 to run)"
+            );
+            return;
+        }
+
+        // Prepare audio: use external file if provided, otherwise synthesize silence WAV.
+        let dir = tempdir().expect("tempdir");
+        let audio_path = if let Ok(path) = std::env::var("WHISPERSUBS_E2E_AUDIO_FILE") {
+            PathBuf::from(path)
+        } else {
+            let wav_path = dir.path().join("silence.wav");
+            let audio_ms: u32 = std::env::var("WHISPERSUBS_E2E_AUDIO_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3_000);
+            let samples = (audio_ms as usize * 16_000) / 1000;
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut writer = hound::WavWriter::create(&wav_path, spec).expect("create wav");
+            for _ in 0..samples {
+                writer.write_sample(0i16).unwrap();
+            }
+            writer.finalize().unwrap();
+            wav_path
+        };
+
+        let model = std::env::var("WHISPERSUBS_E2E_MODEL").unwrap_or_else(|_| "tiny".to_string());
+        let build_start = Instant::now();
+        let mut runner = WhisperRunner::new(
+            WhisperConfig::new(model)
+                .with_threads(2)
+                .with_language("en".to_string())
+                .with_gpu_device(0)
+                .with_flash_attn(false)
+                .with_timeout_ms(30_000),
+        );
+        let build_ms = build_start.elapsed().as_millis();
+
+        let out_prefix = dir.path().join("out");
+        let infer_start = Instant::now();
+        runner
+            .transcribe(&audio_path, &out_prefix, 5_000)
+            .expect("fast_whisper transcribe");
+        let infer_ms = infer_start.elapsed().as_millis();
+
+        println!(
+            "fast_whisper smoke: audio_path={} build_ms={} infer_ms={}",
+            audio_path.display(),
+            build_ms,
+            infer_ms
+        );
     }
 }

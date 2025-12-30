@@ -1,12 +1,11 @@
 use crate::audio::AudioExtractor;
 use crate::srt;
 use crate::translate::{Translator, TranslatorConfig};
-use crate::config::InferenceDevice;
 use crate::whisper::{WhisperConfig, WhisperRunner};
 use log::{debug, error};
+use parking_lot::Mutex;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use parking_lot::Mutex;
 use std::sync::OnceLock;
 
 // Global state for configuration
@@ -31,7 +30,10 @@ unsafe fn c_str_to_string(c_str: *const c_char) -> Option<String> {
     if c_str.is_null() {
         return None;
     }
-    unsafe { CStr::from_ptr(c_str) }.to_str().ok().map(|s| s.to_string())
+    unsafe { CStr::from_ptr(c_str) }
+        .to_str()
+        .ok()
+        .map(|s| s.to_string())
 }
 
 /// Helper to convert Rust String to C string (caller must free)
@@ -45,7 +47,7 @@ pub extern "C" fn whispersubs_whisper_init(
     model_path: *const c_char,
     threads: u8,
     language: *const c_char,
-    inference_device: i32,
+    _inference_device: i32,
     gpu_device: i32,
     flash_attn: bool,
 ) -> i32 {
@@ -56,12 +58,10 @@ pub extern "C" fn whispersubs_whisper_init(
         };
 
         let language = c_str_to_string(language).unwrap_or_else(|| "auto".to_string());
-        let inference_device = InferenceDevice::from_i32(inference_device);
 
         let config = WhisperConfig::new(model_path)
             .with_threads(threads)
             .with_language(language)
-            .with_inference_device(inference_device)
             .with_gpu_device(gpu_device)
             .with_flash_attn(flash_attn);
 
@@ -74,10 +74,7 @@ pub extern "C" fn whispersubs_whisper_init(
 
 /// Initialize Translator configuration (builtin Google Translate only)
 #[unsafe(no_mangle)]
-pub extern "C" fn translator_init(
-    from_lang: *const c_char,
-    to_lang: *const c_char,
-) -> i32 {
+pub extern "C" fn translator_init(from_lang: *const c_char, to_lang: *const c_char) -> i32 {
     unsafe {
         let from_lang = c_str_to_string(from_lang).unwrap_or_else(|| "auto".to_string());
         let to_lang = c_str_to_string(to_lang).unwrap_or_else(|| "en".to_string());

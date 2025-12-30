@@ -3,10 +3,10 @@ use crate::srt::SrtFile;
 use futures::stream::StreamExt;
 use log::{debug, trace, warn};
 use std::path::Path;
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use std::thread;
 use std::time::Duration;
@@ -100,11 +100,7 @@ impl Translator {
     }
 
     /// Translate an SRT file and create a bilingual version
-    pub fn translate_srt_file<P: AsRef<Path>>(
-        &self,
-        input_path: P,
-        output_path: P,
-    ) -> Result<()> {
+    pub fn translate_srt_file<P: AsRef<Path>>(&self, input_path: P, output_path: P) -> Result<()> {
         debug!("Translating SRT file with {} entries", {
             let temp_srt = SrtFile::parse(&input_path)?;
             temp_srt.entries.len()
@@ -233,7 +229,6 @@ impl AsyncTranslationQueue {
         generation: Arc<AtomicU64>,
         runtime: &tokio::runtime::Runtime,
     ) {
-
         loop {
             // Check shutdown flag
             if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
@@ -376,7 +371,10 @@ impl AsyncTranslationQueue {
                 return None;
             }
 
-            match translator.translate_async(&task.text, &from_lang, &to_lang).await {
+            match translator
+                .translate_async(&task.text, &from_lang, &to_lang)
+                .await
+            {
                 Ok(translated) if !translated.trim().is_empty() => {
                     if generation.load(Ordering::Relaxed) != task_generation {
                         return None;
@@ -435,7 +433,8 @@ impl AsyncTranslationQueue {
         debug!("Force shutting down async translation queue");
 
         // Set shutdown flag to kill any running crow processes
-        self.shutdown_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
         // Send shutdown signal
         let _ = self.task_sender.send(None);
@@ -443,9 +442,7 @@ impl AsyncTranslationQueue {
         // Wait briefly for worker thread to exit
         if let Some(handle) = self.worker_handle.take() {
             // Give it a short time to clean up
-            let _result = std::thread::spawn(move || {
-                handle.join()
-            });
+            let _result = std::thread::spawn(move || handle.join());
 
             // Wait max 500ms for graceful shutdown
             std::thread::sleep(Duration::from_millis(500));
@@ -488,8 +485,8 @@ mod tests {
 
     #[test]
     fn test_translator_config() {
-        let config = TranslatorConfig::new("ja".to_string(), "zh".to_string())
-            .with_timeout_ms(5000);
+        let config =
+            TranslatorConfig::new("ja".to_string(), "zh".to_string()).with_timeout_ms(5000);
 
         assert_eq!(config.from_lang, "ja");
         assert_eq!(config.to_lang, "zh");

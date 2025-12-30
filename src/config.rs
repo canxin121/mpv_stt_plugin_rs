@@ -1,7 +1,7 @@
 use directories::BaseDirs;
 use figment::{
-    providers::{Env, Format, Serialized, Toml},
     Figment,
+    providers::{Env, Format, Serialized, Toml},
 };
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -49,10 +49,10 @@ pub struct Config {
     pub model_path: String,
     pub threads: u8,
     pub language: String,
-    pub inference_device: InferenceDevice,
     pub gpu_device: i32,
     #[serde(alias = "cuda_flash_attn")]
     pub flash_attn: bool,
+    pub whisper_timeout_ms: u64,
 
     // Translation settings (builtin Google Translate)
     pub from_lang: String,
@@ -67,7 +67,6 @@ pub struct Config {
 
     pub ffmpeg_timeout_ms: u64,
     pub ffprobe_timeout_ms: u64,
-    pub whisper_timeout_ms: u64,
     pub translate_timeout_ms: u64,
     pub translate_concurrency: usize,
 
@@ -90,9 +89,9 @@ impl Default for Config {
             model_path: "ggml-base.bin".to_string(),
             threads: 8,
             language: "en".to_string(),
-            inference_device: InferenceDevice::CPU,
             gpu_device: 0,
             flash_attn: false,
+            whisper_timeout_ms: 120_000,
 
             // Translation defaults (builtin Google Translate)
             from_lang: "en".to_string(),
@@ -107,21 +106,20 @@ impl Default for Config {
 
             ffmpeg_timeout_ms: 30_000,
             ffprobe_timeout_ms: 10_000,
-            whisper_timeout_ms: 120_000,
             translate_timeout_ms: 30_000,
             translate_concurrency: 4,
 
             // Delay handling defaults (always enabled)
-            catchup_threshold_ms: 30_000,  // 30 seconds behind -> catch up
-            lookahead_chunks: 2,  // Pre-process 2 chunks ahead
-            lookahead_limit_ms: 60_000,  // Maximum 60 seconds ahead of playback
+            catchup_threshold_ms: 30_000, // 30 seconds behind -> catch up
+            lookahead_chunks: 2,          // Pre-process 2 chunks ahead
+            lookahead_limit_ms: 60_000,   // Maximum 60 seconds ahead of playback
 
             // Network cache defaults
-            demuxer_max_bytes: None,  // Use mpv's default (150MB) if not specified
+            demuxer_max_bytes: None, // Use mpv's default (150MB) if not specified
             min_network_chunk_ms: 5_000,
 
             // Auto-start defaults
-            auto_start: false,  // Disabled by default, use Ctrl+. to toggle manually
+            auto_start: false, // Disabled by default, use Ctrl+. to toggle manually
         }
     }
 }
