@@ -112,6 +112,12 @@ impl SubtitleManager {
         let (h, m, s, ms) = ts.get();
         Timestamp::convert_to_milliseconds(h, m, s, ms)
     }
+
+    /// Check if a subtitle text already contains a translation line.
+    pub fn text_has_translation(text: &str) -> bool {
+        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+        lines.next().is_some() && lines.next().is_some()
+    }
 }
 
 #[cfg(test)]

@@ -126,7 +126,8 @@ impl PluginState {
         // Initialize Translator (builtin Google Translate)
         let translator_config =
             TranslatorConfig::new(config.from_lang.clone(), config.to_lang.clone())
-                .with_timeout_ms(config.translate_timeout_ms);
+                .with_timeout_ms(config.translate_timeout_ms)
+                .with_concurrency(config.translate_concurrency);
 
         // Initialize async translation queue (always enabled)
         let async_translation_queue = Some(AsyncTranslationQueue::new(translator_config));
@@ -320,13 +321,6 @@ impl PluginState {
     }
 
     fn tick_network(&mut self, client: &mut Handle) {
-        // Update playback position in translation queue
-        if let Some(ref queue) = self.async_translation_queue {
-            if let Ok(time_pos) = client.get_property::<f64>("time-pos") {
-                queue.update_playback_position((time_pos * 1000.0) as u64);
-            }
-        }
-
         let subtitle_path = self
             .network_cache
             .as_ref()
@@ -482,13 +476,6 @@ impl PluginState {
         file_length_ms: u64,
         subtitle_path: &Path,
     ) {
-        // Update playback position in translation queue
-        if let Some(ref queue) = self.async_translation_queue {
-            if let Ok(time_pos) = client.get_property::<f64>("time-pos") {
-                queue.update_playback_position((time_pos * 1000.0) as u64);
-            }
-        }
-
         // Check for seek
         self.check_seek(client);
 
@@ -615,11 +602,6 @@ impl PluginState {
         let playback_pos: Option<f64> = client.get_property("time-pos").ok();
         if let Some(pos) = playback_pos {
             let playback_pos_ms = (pos * 1000.0) as u64;
-
-            // Update translation queue with current playback position
-            if let Some(ref queue) = self.async_translation_queue {
-                queue.update_playback_position(playback_pos_ms);
-            }
 
             // Detect user seek by comparing against the last observed playback position.
             // IMPORTANT: `current_pos_ms` is the *processing cursor* (next chunk start), which can
@@ -766,7 +748,7 @@ impl PluginState {
         self.mark_chunk_processed(self.current_pos_ms);
 
         let mut pending_tasks = Vec::new();
-        let mut cached_hits = 0usize;
+        let mut already_translated = 0usize;
 
         for entry in &srt_file.entries {
             let original = entry.text.trim();
@@ -774,15 +756,9 @@ impl PluginState {
                 continue;
             }
             let start_ms = Self::timestamp_to_millis(entry.start_time);
-            if let Some((cached_original, cached_translated)) =
-                self.translation_cache.get(&start_ms)
-            {
-                if cached_original.trim() == original && !cached_translated.trim().is_empty() {
-                    self.subtitle_manager
-                        .update_translation(start_ms, cached_translated);
-                    cached_hits += 1;
-                    continue;
-                }
+            if SubtitleManager::text_has_translation(&entry.text) {
+                already_translated += 1;
+                continue;
             }
 
             pending_tasks.push(TranslationTask {
@@ -803,13 +779,13 @@ impl PluginState {
                     queue.submit(task);
                 }
                 debug!(
-                    "Submitted {} entries to async translation (cached: {})",
+                    "Submitted {} entries to async translation (already translated: {})",
                     srt_file.entries.len(),
-                    cached_hits
+                    already_translated
                 );
             }
-        } else if cached_hits > 0 {
-            debug!("All {} entries served from translation cache", cached_hits);
+        } else if already_translated > 0 {
+            debug!("All {} entries already had translations", already_translated);
         }
 
         // Keep only the main subtitle file on disk during playback to reduce clutter.
@@ -857,7 +833,11 @@ impl PluginState {
             if !results.is_empty() {
                 debug!("Received {} translation results", results.len());
 
-                // Update subtitles with translations
+                let main_srt = subtitle_path
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
+
+                // Update subtitles as each translation completes.
                 for result in results {
                     self.translation_cache.insert(
                         result.start_ms,
@@ -865,13 +845,8 @@ impl PluginState {
                     );
                     self.subtitle_manager
                         .update_translation(result.start_ms, &result.translated);
+                    let _ = self.save_subs(client, &main_srt);
                 }
-
-                // Save updated subtitles
-                let main_srt = subtitle_path
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
-                let _ = self.save_subs(client, &main_srt);
             }
         }
     }

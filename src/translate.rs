@@ -1,6 +1,6 @@
 use crate::error::{Result, WhisperSubsError};
 use crate::srt::SrtFile;
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::StreamExt;
 use log::{debug, trace, warn};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -19,6 +19,7 @@ pub struct TranslatorConfig {
     pub from_lang: String,
     pub to_lang: String,
     pub timeout_ms: u64,
+    pub concurrency: usize,
 }
 
 impl Default for TranslatorConfig {
@@ -27,6 +28,7 @@ impl Default for TranslatorConfig {
             from_lang: "auto".to_string(),
             to_lang: "en".to_string(),
             timeout_ms: 30_000,
+            concurrency: 4,
         }
     }
 }
@@ -42,6 +44,11 @@ impl TranslatorConfig {
 
     pub fn with_timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.timeout_ms = timeout_ms;
+        self
+    }
+
+    pub fn with_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency = concurrency.max(1);
         self
     }
 }
@@ -150,7 +157,6 @@ pub struct AsyncTranslationQueue {
     result_receiver: Receiver<TranslationResult>,
     worker_handle: Option<thread::JoinHandle<()>>,
     shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
-    current_playback_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl AsyncTranslationQueue {
@@ -161,9 +167,6 @@ impl AsyncTranslationQueue {
         let config = Arc::new(config);
         let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_flag_clone = shutdown_flag.clone();
-        let current_playback_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let current_playback_ms_clone = current_playback_ms.clone();
-
         let worker_handle = thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -175,7 +178,6 @@ impl AsyncTranslationQueue {
                 result_sender,
                 config,
                 shutdown_flag_clone,
-                current_playback_ms_clone,
                 &runtime,
             );
         });
@@ -185,18 +187,12 @@ impl AsyncTranslationQueue {
             result_receiver,
             worker_handle: Some(worker_handle),
             shutdown_flag,
-            current_playback_ms,
         }
     }
 
     /// Submit a translation task to the queue
     pub fn submit(&self, task: TranslationTask) {
         let _ = self.task_sender.send(Some(task));
-    }
-
-    /// Update current playback position (for filtering expired tasks)
-    pub fn update_playback_position(&self, playback_ms: u64) {
-        self.current_playback_ms.store(playback_ms, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Try to get completed translation results (non-blocking)
@@ -214,7 +210,6 @@ impl AsyncTranslationQueue {
         result_sender: Sender<TranslationResult>,
         config: Arc<TranslatorConfig>,
         shutdown_flag: Arc<std::sync::atomic::AtomicBool>,
-        current_playback_ms: Arc<std::sync::atomic::AtomicU64>,
         runtime: &tokio::runtime::Runtime,
     ) {
 
@@ -257,7 +252,6 @@ impl AsyncTranslationQueue {
                 &result_sender,
                 &config,
                 &shutdown_flag,
-                &current_playback_ms,
                 runtime,
             );
 
@@ -271,56 +265,31 @@ impl AsyncTranslationQueue {
         result_sender: &Sender<TranslationResult>,
         config: &Arc<TranslatorConfig>,
         shutdown_flag: &Arc<std::sync::atomic::AtomicBool>,
-        current_playback_ms: &Arc<std::sync::atomic::AtomicU64>,
         runtime: &tokio::runtime::Runtime,
     ) {
-        // Filter out expired tasks (already played past)
-        // Keep tasks that are within 30 seconds behind playback or in the future
-        const EXPIRY_THRESHOLD_MS: u64 = 30_000;
-        let playback_ms = current_playback_ms.load(std::sync::atomic::Ordering::Relaxed);
-        let cutoff_ms = playback_ms.saturating_sub(EXPIRY_THRESHOLD_MS);
-
-        let active_tasks: Vec<_> = tasks.iter()
-            .filter(|task| task.start_ms as u64 >= cutoff_ms)
-            .collect();
-
-        let filtered_count = tasks.len() - active_tasks.len();
-        if filtered_count > 0 {
-            debug!("Filtered out {} expired translation tasks (playback at {}ms, cutoff {}ms)",
-                   filtered_count, playback_ms, cutoff_ms);
-        }
-
-        if active_tasks.is_empty() {
+        if tasks.is_empty() {
             return;
         }
 
         debug!(
             "Translating {} active tasks using single-thread tokio runtime",
-            active_tasks.len()
+            tasks.len()
         );
 
-        let active_tasks: Vec<TranslationTask> = active_tasks.into_iter().cloned().collect();
+        let active_tasks: Vec<TranslationTask> = tasks.to_vec();
         let config = Arc::clone(config);
         let shutdown_flag = Arc::clone(shutdown_flag);
         let sender = result_sender.clone();
+        let concurrency = config.concurrency.max(1);
 
         runtime.block_on(async move {
-            let mut futures = FuturesUnordered::new();
-
-            for task in active_tasks {
-                if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {
-                    debug!("Aborting builtin translation due to shutdown");
-                    break;
-                }
-
+            let stream = futures::stream::iter(active_tasks).map(|task| {
                 let config_clone = Arc::clone(&config);
                 let shutdown_clone = Arc::clone(&shutdown_flag);
-                futures.push(Self::translate_single_task_async(
-                    task,
-                    config_clone,
-                    shutdown_clone,
-                ));
-            }
+                Self::translate_single_task_async(task, config_clone, shutdown_clone)
+            });
+
+            let mut futures = stream.buffer_unordered(concurrency);
 
             while let Some(result) = futures.next().await {
                 if shutdown_flag.load(std::sync::atomic::Ordering::Relaxed) {

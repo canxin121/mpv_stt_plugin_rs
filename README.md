@@ -109,6 +109,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
    ffprobe_timeout_ms = 10000
    whisper_timeout_ms = 120000
    translate_timeout_ms = 30000
+   translate_concurrency = 4   # 翻译并发数
 
    # 延迟与预处理策略（以下功能强制启用，只能配置参数）
    catchup_threshold_ms = 30000   # 追赶模式阈值：落后超过此时间则跳转

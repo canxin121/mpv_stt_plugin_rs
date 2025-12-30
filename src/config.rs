@@ -71,6 +71,7 @@ pub struct Config {
     pub ffprobe_timeout_ms: u64,
     pub whisper_timeout_ms: u64,
     pub translate_timeout_ms: u64,
+    pub translate_concurrency: usize,
 
     // Delay handling features (always enabled)
     pub catchup_threshold_ms: u64,
@@ -109,6 +110,7 @@ impl Default for Config {
             ffprobe_timeout_ms: 10_000,
             whisper_timeout_ms: 120_000,
             translate_timeout_ms: 30_000,
+            translate_concurrency: 4,
 
             // Delay handling defaults (always enabled)
             catchup_threshold_ms: 30_000,  // 30 seconds behind -> catch up
