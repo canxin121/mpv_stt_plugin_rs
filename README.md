@@ -41,7 +41,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 [stt.local_whisper]
 model_path = "/path/to/ggml-base.bin"
 threads = 8              # CPU 线程数
-language = "ja"
+language = "en"
 gpu_device = 0           # 仅 cuda 版有效
 flash_attn = false       # 仅 cuda 版有效
 timeout_ms = 120000
@@ -55,7 +55,7 @@ encryption_key = ""
 auth_secret = ""
 
 [translate]
-from_lang = "ja"
+from_lang = "en"
 to_lang = "zh"
 concurrency = 4
 
