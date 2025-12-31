@@ -44,11 +44,12 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 1. **构建插件**
    ```bash
    cd ~/.config/mpv/scripts/whispersubs_rs
+   # 推荐：自动拉取 mpv 头文件并设置环境变量
+   ./scripts/cargo-with-mpv.sh build --release
 
-   # 设置 MPV 头文件路径（如果未安装 mpv-devel）
-   export BINDGEN_EXTRA_CLANG_ARGS="-I/mnt/disk1/shared/git/mpv/include"
-
-   cargo build --release
+   # 若脚本无法访问 GitHub，可手动设置：
+   # export MPV_INCLUDE_DIR="/path/to/mpv/include"  # 需包含 mpv/client.h
+   # cargo build --release
    ```
 
 2. **安装插件**
@@ -73,7 +74,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
    - 也可以用环境变量指定：`WHISPERSUBS_CONFIG=/path/to/whispersubs.toml`
 
    示例（TOML，带注释说明）：
-   ```toml
+```toml
 [stt.local_whisper]
 model_path = "/path/to/ggml-base.bin"
 threads = 8              # CPU 线程数
@@ -82,48 +83,42 @@ gpu_device = 0           # 仅 cuda 版有效
 flash_attn = false       # 仅 cuda 版有效
 timeout_ms = 120000
 
-   [stt.remote_udp]
-   server_addr = "127.0.0.1:9000"
-   timeout_ms = 120000
-   max_retry = 3
-   enable_encryption = false
-   encryption_key = ""
-   auth_secret = ""
-   enable_compression = false
+[stt.remote_udp]
+server_addr = "127.0.0.1:9000"
+timeout_ms = 120000
+max_retry = 3
+enable_encryption = false
+encryption_key = ""
+auth_secret = ""
 
-   # 翻译设置（内置 Google 翻译）
-   from_lang = "ja"       # 源语言
-   to_lang = "zh"         # 目标语言
-   # crow_engine 仅在 external-translate 特性和外部翻译模式下使用
-   crow_engine = "google"
+[translate]
+from_lang = "ja"
+to_lang = "zh"
+concurrency = 4
 
-   # 分段设置（毫秒）
-   local_chunk_size_ms = 15000    # 本地文件模式：每次转写的媒体片段长度
-   network_chunk_size_ms = 15000  # 网络流模式：每次转写的媒体片段长度
-   wav_chunk_size_ms = 16000  # 提供给 Whisper 的 wav 片段长度
+[chunk]
+local_ms = 15000    # 本地文件模式：每次转写的媒体片段长度
+network_ms = 15000  # 网络流模式：每次转写的媒体片段长度
 
-   # 行为开关
-   show_progress = true   # 在 mpv OSD 显示进度
-   start_at_zero = true   # 从 0 开始转写（本地文件）
-   save_srt = true        # 保存 SRT 到文件
-   auto_start = false     # 自动启动（默认关闭）
+[timeout]
+ffmpeg_ms = 30000
+ffprobe_ms = 10000
+stt_ms = 120000
+translate_ms = 30000
 
-   # 超时设置（毫秒）
-   ffmpeg_timeout_ms = 30000
-   ffprobe_timeout_ms = 10000
-   stt_timeout_ms = 120000
-   translate_timeout_ms = 30000
-   translate_concurrency = 4   # 翻译并发数
+[playback]
+show_progress = true   # 在 mpv OSD 显示进度
+save_srt = true        # 保存 SRT 到文件
+auto_start = false     # 自动启动（默认关闭）
 
-   # 延迟与预处理策略（以下功能强制启用，只能配置参数）
-   catchup_threshold_ms = 30000   # 追赶模式阈值：落后超过此时间则跳转
-   lookahead_chunks = 2           # 预读块数：提前处理的片段数量
-   lookahead_limit_ms = 60000     # 预读限制：最多提前处理的时间
+[seek]
+lookahead_chunks = 2           # 预读块数：提前处理的片段数量
+lookahead_limit_ms = 60000     # 预读限制：最多提前处理的时间
 
-   # 网络流缓存（可选，单位字节）
-   demuxer_max_bytes = 536870912
-   min_network_chunk_ms = 5000   # 网络流最短处理时长，不足则等待更多缓存
-   ```
+[network]
+# 网络流缓存（可选，单位字节）
+demuxer_max_bytes = 536870912
+```
 
    CUDA 支持说明（纯编译期选择，无运行时回退）：
    - 编译时开启：`cargo build --release --features stt_local_cuda`
@@ -132,7 +127,7 @@ timeout_ms = 120000
    STT 后端编译选项（Linux 可用，Android 仅支持 `stt_local_cpu`）：
    - `stt_local_cpu`：本地 whisper.cpp CPU 后端
    - `stt_local_cuda`：本地 whisper.cpp CUDA 后端
-   - `stt_remote_udp`：远端 UDP STT 服务端（协议自定义）
+   - `stt_remote_udp`：远端 UDP STT 服务端
 
    示例：
    - `cargo build --release`（默认 `stt_local_cpu`）
@@ -303,9 +298,14 @@ env BINDGEN_EXTRA_CLANG_ARGS="-I/path/to/mpv/include" cargo build --release
 ## 故障排除
 
 ### 编译失败：找不到 mpv/client.h
-安装 mpv-devel 或设置环境变量：
+优先用自动脚本：
 ```bash
-export BINDGEN_EXTRA_CLANG_ARGS="-I/path/to/mpv/include"
+./scripts/cargo-with-mpv.sh check   # 会自动 shallow clone mpv 并设置 MPV_INCLUDE_DIR
+```
+若无法访问 GitHub，请手动指定头文件路径或安装 mpv-devel：
+```bash
+export MPV_INCLUDE_DIR=/path/to/mpv/include  # 目录下需有 mpv/client.h
+# 然后再 cargo check / build
 ```
 
 ### 插件未加载

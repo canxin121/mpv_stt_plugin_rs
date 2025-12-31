@@ -5,7 +5,6 @@ use crate::srt::{SrtFile, SubtitleEntry};
 use hound::{SampleFormat, WavReader};
 use log::{debug, info, trace};
 use srtlib::Timestamp;
-use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -212,16 +211,16 @@ impl LocalWhisperBackend {
         Ok(float_samples)
     }
 
-    fn build_params(&self) -> Result<FullParams<'static>> {
+    fn build_params(&self) -> Result<FullParams<'static, 'static>> {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        params.set_language(&self.config.language);
+        // whisper-rs stores a borrowed &str; use None to avoid tying lifetime to self
+        params.set_language(None);
         params.set_n_threads(self.config.threads.into());
         params.set_suppress_blank(true);
         params.set_max_len(0);
         params.set_translate(false);
         params.set_no_context(true);
         params.set_single_segment(true);
-        params.set_duration_ms(self.config.timeout_ms as i32);
         Ok(params)
     }
 
@@ -245,33 +244,26 @@ impl LocalWhisperBackend {
 
         let samples = self.load_audio_samples(audio_path)?;
 
-        let params = self.build_params()?;
+        let mut params = self.build_params()?;
         let ctx = self.ctx.as_ref().ok_or_else(|| {
             WhisperSubsError::SttFailed("STT context not initialized".to_string())
         })?;
 
-        // Abort handling: stash current generation.
         let run_generation = self.cancel_generation.load(Ordering::Relaxed);
-        let abort_ctx = AbortCtx {
-            gen_ptr: &self.cancel_generation,
-            expected: run_generation,
-        };
-        let abort_ptr = &abort_ctx as *const _ as *mut c_void;
+        let cancel_flag = Arc::clone(&self.cancel_generation);
         let timeout_ms = self.config.timeout_ms;
-
-        params.set_abort_callback(Some(stt_abort_callback));
-        params.set_abort_callback_user_data(abort_ptr);
         params.set_duration_ms(timeout_ms as i32);
         params.set_translate(false);
+        params
+            .set_abort_callback_safe(move || cancel_flag.load(Ordering::Relaxed) != run_generation);
 
         let mut state = ctx
             .create_state()
             .map_err(|e| stt_error("Failed to create state", e))?;
 
-        state.full(params, &samples).map_err(|err| match err {
-            WhisperError::Abort => WhisperSubsError::SttCancelled,
-            _ => stt_error("STT inference failed", err),
-        })?;
+        state
+            .full(params, &samples)
+            .map_err(|err| stt_error("STT inference failed", err))?;
 
         if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
             return Err(WhisperSubsError::SttCancelled);
@@ -282,8 +274,12 @@ impl LocalWhisperBackend {
         for (idx, seg) in segments.into_iter().enumerate() {
             srt_file.append_entry(SubtitleEntry {
                 index: idx as u32 + 1,
-                start_time: Timestamp::from_milliseconds(seg.start_ms as i64),
-                end_time: Timestamp::from_milliseconds(seg.end_ms as i64),
+                start_time: Timestamp::from_milliseconds(
+                    (seg.start_ms as u32).try_into().unwrap_or(u32::MAX),
+                ),
+                end_time: Timestamp::from_milliseconds(
+                    (seg.end_ms as u32).try_into().unwrap_or(u32::MAX),
+                ),
                 text: seg.text,
             });
         }
@@ -303,34 +299,15 @@ struct SegmentData {
     text: String,
 }
 
-#[repr(C)]
-struct AbortCtx {
-    gen_ptr: *const AtomicU64,
-    expected: u64,
-}
-
-unsafe extern "C" fn stt_abort_callback(user_data: *mut c_void) -> bool {
-    if user_data.is_null() {
-        return false;
-    }
-    let ctx = &*(user_data as *const AbortCtx);
-    let gen_ptr = ctx.gen_ptr;
-    if gen_ptr.is_null() {
-        return false;
-    }
-    let current = (*gen_ptr).load(Ordering::Relaxed);
-    current != ctx.expected
-}
-
 fn collect_segments(state: &whisper_rs::WhisperState) -> Result<Vec<SegmentData>> {
-    let num_segments = state.full_n_segments().unwrap_or(0);
-    let mut segments = Vec::with_capacity(num_segments as usize);
+    let num_segments = state.full_n_segments();
+    let mut segments = Vec::with_capacity(num_segments.max(0) as usize);
 
-    for i in 0..num_segments {
-        let start = state.full_get_segment_t0(i).unwrap_or(0) as f64;
-        let end = state.full_get_segment_t1(i).unwrap_or(0) as f64;
-        let text = state
-            .full_get_segment_text(i)
+    for seg in state.as_iter() {
+        let start = seg.start_timestamp() as f64 * 10.0;
+        let end = seg.end_timestamp() as f64 * 10.0;
+        let text = seg
+            .to_str()
             .map_err(|e| stt_error("Failed to read segment text", e))?
             .trim()
             .to_string();

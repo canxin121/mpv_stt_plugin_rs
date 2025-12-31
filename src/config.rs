@@ -47,68 +47,24 @@ impl fmt::Display for InferenceDevice {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub stt: SttConfig,
-
-    // Translation settings (builtin Google Translate)
-    pub from_lang: String,
-    pub to_lang: String,
-
-    pub local_chunk_size_ms: u64,
-    pub network_chunk_size_ms: u64,
-    pub wav_chunk_size_ms: u64,
-    pub show_progress: bool,
-    pub start_at_zero: bool,
-    pub save_srt: bool,
-
-    pub ffmpeg_timeout_ms: u64,
-    pub ffprobe_timeout_ms: u64,
-    pub translate_timeout_ms: u64,
-    pub translate_concurrency: usize,
-
-    // Delay handling features (always enabled)
-    pub catchup_threshold_ms: u64,
-    pub lookahead_chunks: usize,
-    pub lookahead_limit_ms: u64,
-
-    // Network cache settings
-    pub demuxer_max_bytes: Option<i64>,
-    pub min_network_chunk_ms: u64,
-
-    // Auto-start settings
-    pub auto_start: bool,
+    pub translate: TranslateConfig,
+    pub chunk: ChunkConfig,
+    pub timeout: TimeoutConfig,
+    pub playback: PlaybackConfig,
+    pub seek: SeekConfig,
+    pub network: NetworkConfig,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             stt: SttConfig::default(),
-
-            // Translation defaults (builtin Google Translate)
-            from_lang: "en".to_string(),
-            to_lang: "zh".to_string(),
-
-            local_chunk_size_ms: 15_000,
-            network_chunk_size_ms: 15_000,
-            wav_chunk_size_ms: 16_000,
-            show_progress: true,
-            start_at_zero: true,
-            save_srt: true,
-
-            ffmpeg_timeout_ms: 30_000,
-            ffprobe_timeout_ms: 10_000,
-            translate_timeout_ms: 30_000,
-            translate_concurrency: 4,
-
-            // Delay handling defaults (always enabled)
-            catchup_threshold_ms: 30_000, // 30 seconds behind -> catch up
-            lookahead_chunks: 2,          // Pre-process 2 chunks ahead
-            lookahead_limit_ms: 60_000,   // Maximum 60 seconds ahead of playback
-
-            // Network cache defaults
-            demuxer_max_bytes: None, // Use mpv's default (150MB) if not specified
-            min_network_chunk_ms: 5_000,
-
-            // Auto-start defaults
-            auto_start: false, // Disabled by default, use Ctrl+. to toggle manually
+            translate: TranslateConfig::default(),
+            chunk: ChunkConfig::default(),
+            timeout: TimeoutConfig::default(),
+            playback: PlaybackConfig::default(),
+            seek: SeekConfig::default(),
+            network: NetworkConfig::default(),
         }
     }
 }
@@ -159,7 +115,6 @@ pub struct SttRemoteUdpConfig {
     pub enable_encryption: bool,
     pub encryption_key: String,
     pub auth_secret: String,
-    pub enable_compression: bool,
 }
 
 impl Default for SttRemoteUdpConfig {
@@ -171,7 +126,102 @@ impl Default for SttRemoteUdpConfig {
             enable_encryption: false,
             encryption_key: String::new(),
             auth_secret: String::new(),
-            enable_compression: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslateConfig {
+    pub from_lang: String,
+    pub to_lang: String,
+    pub concurrency: usize,
+}
+
+impl Default for TranslateConfig {
+    fn default() -> Self {
+        Self {
+            from_lang: "en".to_string(),
+            to_lang: "zh".to_string(),
+            concurrency: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChunkConfig {
+    pub local_ms: u64,
+    pub network_ms: u64,
+}
+
+impl Default for ChunkConfig {
+    fn default() -> Self {
+        Self {
+            local_ms: 15_000,
+            network_ms: 15_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimeoutConfig {
+    pub ffmpeg_ms: u64,
+    pub ffprobe_ms: u64,
+    pub stt_ms: u64,
+    pub translate_ms: u64,
+}
+
+impl Default for TimeoutConfig {
+    fn default() -> Self {
+        Self {
+            ffmpeg_ms: 30_000,
+            ffprobe_ms: 10_000,
+            stt_ms: 120_000,
+            translate_ms: 30_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlaybackConfig {
+    pub show_progress: bool,
+    pub save_srt: bool,
+    pub auto_start: bool,
+}
+
+impl Default for PlaybackConfig {
+    fn default() -> Self {
+        Self {
+            show_progress: true,
+            save_srt: true,
+            auto_start: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeekConfig {
+    pub lookahead_chunks: usize,
+    pub lookahead_limit_ms: u64,
+}
+
+impl Default for SeekConfig {
+    fn default() -> Self {
+        Self {
+            lookahead_chunks: 2,
+            lookahead_limit_ms: 60_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkConfig {
+    pub demuxer_max_bytes: Option<i64>,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        Self {
+            demuxer_max_bytes: None,
         }
     }
 }
@@ -206,13 +256,5 @@ impl Config {
                 Config::default()
             }
         }
-    }
-}
-
-fn parse_env_bool(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
     }
 }

@@ -17,7 +17,6 @@ use std::time::{Duration, Instant, SystemTime};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CompressionFormat {
-    None,
     Opus,
 }
 
@@ -79,7 +78,7 @@ pub struct RemoteSttConfig {
     pub enable_encryption: bool,
     pub encryption_key: String,
     pub auth_secret: String,
-    pub enable_compression: bool,
+    // Compression is always enabled; config is kept for future tuning
 }
 
 impl Default for RemoteSttConfig {
@@ -91,7 +90,6 @@ impl Default for RemoteSttConfig {
             enable_encryption: false,
             encryption_key: String::new(),
             auth_secret: String::new(),
-            enable_compression: false,
         }
     }
 }
@@ -154,19 +152,13 @@ impl RemoteUdpBackend {
             .ok_or_else(|| WhisperSubsError::InvalidPath("Invalid audio path".to_string()))?;
 
         trace!(
-            "Remote UDP STT: {} (duration: {}ms, compression: {})",
-            audio_str, duration_ms, self.config.enable_compression
+            "Remote UDP STT: {} (duration: {}ms, compression: Opus)",
+            audio_str, duration_ms
         );
 
         let run_generation = self.cancel_generation.load(Ordering::Relaxed);
 
-        let audio_data = if self.config.enable_compression {
-            self.compress_audio(&audio_path)?
-        } else {
-            let mut data = Vec::new();
-            File::open(audio_path)?.read_to_end(&mut data)?;
-            data
-        };
+        let audio_data = self.compress_audio(&audio_path)?;
 
         if audio_data.is_empty() {
             return Err(WhisperSubsError::SttFailed(
@@ -299,11 +291,7 @@ impl RemoteUdpBackend {
         let chunks: Vec<Vec<u8>> = audio.chunks(MAX_PAYLOAD).map(|c| c.to_vec()).collect();
         let total_chunks = chunks.len() as u32;
 
-        let compression = if self.config.enable_compression {
-            CompressionFormat::Opus
-        } else {
-            CompressionFormat::None
-        };
+        let compression = CompressionFormat::Opus;
 
         for (index, chunk_data) in chunks.into_iter().enumerate() {
             let message = Message::AudioChunk {

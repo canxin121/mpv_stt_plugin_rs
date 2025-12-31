@@ -1,8 +1,5 @@
 use crate::error::{Result, WhisperSubsError};
-use aes_gcm::{
-    Aes256Gcm, KeyInit, Nonce,
-    aead::{Aead, OsRng},
-};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use sha2::{Digest, Sha256};
 
 const NONCE_SIZE: usize = 12;

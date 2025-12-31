@@ -2,7 +2,7 @@ use crate::audio::AudioExtractor;
 use crate::srt;
 #[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
 use crate::stt::LocalModelConfig;
-use crate::stt::SttRunner;
+use crate::stt::{SttBackend, SttRunner};
 use crate::translate::{Translator, TranslatorConfig};
 use log::{debug, error};
 use parking_lot::Mutex;

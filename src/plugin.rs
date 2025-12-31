@@ -18,7 +18,7 @@ use crate::srt::{self, SrtFile};
 use crate::stt::LocalModelConfig;
 #[cfg(feature = "stt_remote_udp")]
 use crate::stt::RemoteSttConfig;
-use crate::stt::SttRunner;
+use crate::stt::{SttBackend, SttRunner};
 use crate::subtitle_manager::SubtitleManager;
 use crate::translate::{AsyncTranslationQueue, TranslationTask, TranslatorConfig};
 
@@ -114,10 +114,10 @@ struct PluginState {
 
 impl PluginState {
     fn new(config: Config) -> Self {
-        let chunk_dur = config.local_chunk_size_ms;
+        let chunk_dur = config.chunk.local_ms;
         let audio_extractor = AudioExtractor::default()
-            .with_ffmpeg_timeout(config.ffmpeg_timeout_ms)
-            .with_ffprobe_timeout(config.ffprobe_timeout_ms);
+            .with_ffmpeg_timeout(config.timeout.ffmpeg_ms)
+            .with_ffprobe_timeout(config.timeout.ffprobe_ms);
 
         // Initialize speech-to-text backend (selected at compile time)
         #[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
@@ -150,7 +150,6 @@ impl PluginState {
                 enable_encryption: cfg.enable_encryption,
                 encryption_key: cfg.encryption_key.clone(),
                 auth_secret: cfg.auth_secret.clone(),
-                enable_compression: cfg.enable_compression,
             };
             SttRunner::new(remote_config).expect("Failed to create remote STT client")
         };
@@ -184,17 +183,20 @@ impl PluginState {
     }
 
     fn build_translator_config(config: &Config) -> TranslatorConfig {
-        TranslatorConfig::new(config.from_lang.clone(), config.to_lang.clone())
-            .with_timeout_ms(config.translate_timeout_ms)
-            .with_concurrency(config.translate_concurrency)
+        TranslatorConfig::new(
+            config.translate.from_lang.clone(),
+            config.translate.to_lang.clone(),
+        )
+        .with_timeout_ms(config.timeout.translate_ms)
+        .with_concurrency(config.translate.concurrency)
     }
 
     fn local_chunk_size(&self) -> u64 {
-        self.config.local_chunk_size_ms.max(1)
+        self.config.chunk.local_ms.max(1)
     }
 
     fn network_chunk_size(&self) -> u64 {
-        self.config.network_chunk_size_ms.max(1)
+        self.config.chunk.network_ms.max(1)
     }
 
     fn active_chunk_size(&self) -> u64 {
@@ -301,7 +303,7 @@ impl PluginState {
             let _ = client.set_property("cache", true);
 
             // Set demuxer max bytes if configured (for better lookahead caching)
-            if let Some(max_bytes) = self.config.demuxer_max_bytes {
+            if let Some(max_bytes) = self.config.network.demuxer_max_bytes {
                 debug!("Setting demuxer-max-bytes to {} bytes", max_bytes);
                 let _ = client.set_property("demuxer-max-bytes", max_bytes);
             }
@@ -311,7 +313,7 @@ impl PluginState {
             let chunk_size = self.network_chunk_size();
             self.current_pos_ms -= self.current_pos_ms % chunk_size;
 
-            if self.config.save_srt {
+            if self.config.playback.save_srt {
                 if let Some(media_id) = Self::media_id_for_cache(client) {
                     if let Some(cache_paths) = self.cache_paths_for_media(&media_id) {
                         if let Some(parent) = cache_paths.subtitle_path.parent() {
@@ -368,9 +370,6 @@ impl PluginState {
                 let _ = client.command(&["show-text", "STT: Starting local file transcription..."]);
 
                 // Start from beginning if configured
-                if self.config.start_at_zero {
-                    self.current_pos_ms = 0;
-                }
                 let chunk_size = self.local_chunk_size();
                 self.current_pos_ms -= self.current_pos_ms % chunk_size;
 
@@ -381,7 +380,7 @@ impl PluginState {
                 });
                 self.network_cache = None;
 
-                if self.config.save_srt && subtitle_path.exists() {
+                if self.config.playback.save_srt && subtitle_path.exists() {
                     if self.load_cached_subs(&subtitle_path, None, self.local_chunk_size()) {
                         let _ = client.command(&["sub-add", subtitle_path.to_str().unwrap()]);
                         self.subs_loaded = true;
@@ -466,29 +465,6 @@ impl PluginState {
         }
 
         // Catch-up mode: check if we're too far behind playback (always enabled)
-        if let Some(playback_pos_ms) = self.last_playback_pos_ms {
-            let lag = if playback_pos_ms > self.current_pos_ms {
-                playback_pos_ms - self.current_pos_ms
-            } else {
-                0
-            };
-
-            if lag > self.config.catchup_threshold_ms {
-                // We're too far behind, skip to near current playback position
-                let new_pos = playback_pos_ms - (playback_pos_ms % self.chunk_dur);
-                info!(
-                    "Catch-up: skipping from {}ms to {}ms (lag: {}ms)",
-                    self.current_pos_ms, new_pos, lag
-                );
-                self.current_pos_ms = new_pos;
-                let _ = client.command(&[
-                    "show-text",
-                    &format!("STT: Catching up to {}", Self::format_progress(new_pos)),
-                    "3000",
-                ]);
-            }
-        }
-
         // Look-ahead processing for network streams (always enabled)
         // Check how far ahead playback is from processing
         if let Some(playback_pos_ms) = self.last_playback_pos_ms {
@@ -499,7 +475,7 @@ impl PluginState {
             };
 
             // Don't process too far ahead of playback
-            if ahead > self.config.lookahead_limit_ms {
+            if ahead > self.config.seek.lookahead_limit_ms {
                 trace!(
                     "Look-ahead limit reached: {}ms ahead, waiting for playback to catch up",
                     ahead
@@ -510,7 +486,7 @@ impl PluginState {
 
         let max_chunk_ms = chunk_ms;
         let first_chunk_ms = max_chunk_ms;
-        let chunks_to_process = self.config.lookahead_chunks.max(1);
+        let chunks_to_process = self.config.seek.lookahead_chunks.max(1);
         for i in 0..chunks_to_process {
             if self.check_seek(client) {
                 return;
@@ -567,7 +543,7 @@ impl PluginState {
                     self.subs_loaded = true;
                 }
 
-                if self.config.show_progress && i == 0 {
+                if self.config.playback.show_progress && i == 0 {
                     let _ = client.command(&[
                         "show-text",
                         &format!("STT: {}", Self::format_progress(self.current_pos_ms)),
@@ -602,7 +578,7 @@ impl PluginState {
                 0
             };
 
-            if ahead > self.config.lookahead_limit_ms {
+            if ahead > self.config.seek.lookahead_limit_ms {
                 trace!(
                     "Look-ahead limit reached: {}ms ahead, waiting for playback to catch up",
                     ahead
@@ -628,7 +604,7 @@ impl PluginState {
 
         if time_left > 0 {
             // Look-ahead processing: process multiple chunks ahead (always enabled)
-            let chunks_to_process = self.config.lookahead_chunks.max(1);
+            let chunks_to_process = self.config.seek.lookahead_chunks.max(1);
 
             for i in 0..chunks_to_process {
                 if self.check_seek(client) {
@@ -637,31 +613,6 @@ impl PluginState {
                 let chunk_pos = self.current_pos_ms + (i as u64 * self.chunk_dur);
                 if chunk_pos >= file_length_ms {
                     break; // Don't process beyond file end
-                }
-
-                // Catch-up mode: check if we're too far behind playback (always enabled)
-                if let Some(playback_pos_ms) = self.last_playback_pos_ms {
-                    let lag = if playback_pos_ms > self.current_pos_ms {
-                        playback_pos_ms - self.current_pos_ms
-                    } else {
-                        0
-                    };
-
-                    if lag > self.config.catchup_threshold_ms {
-                        // Skip to near current playback position
-                        let new_pos = playback_pos_ms - (playback_pos_ms % self.chunk_dur);
-                        info!(
-                            "Catch-up: skipping from {}ms to {}ms (lag: {}ms)",
-                            self.current_pos_ms, new_pos, lag
-                        );
-                        self.current_pos_ms = new_pos.min(file_length_ms);
-                        let _ = client.command(&[
-                            "show-text",
-                            &format!("STT: Catching up to {}", Self::format_progress(new_pos)),
-                            "3000",
-                        ]);
-                        break; // Don't process old chunks, restart loop with new position
-                    }
                 }
 
                 // Process current chunk
@@ -683,7 +634,7 @@ impl PluginState {
                 if self.process_chunk_local(client, media_path, subtitle_path) {
                     self.current_pos_ms += self.chunk_dur;
 
-                    if self.config.show_progress && i == 0 {
+                    if self.config.playback.show_progress && i == 0 {
                         let _ = client.command(&[
                             "show-text",
                             &format!("STT: {}", Self::format_progress(self.current_pos_ms)),
@@ -830,7 +781,7 @@ impl PluginState {
         }
 
         // Extract audio from cache
-        let wav_ms = std::cmp::min(self.config.wav_chunk_size_ms, chunk_ms);
+        let wav_ms = chunk_ms;
         if !self.create_wav(self.paths.tmp_cache.to_str().unwrap(), 0, wav_ms) {
             return false;
         }
@@ -846,11 +797,7 @@ impl PluginState {
         subtitle_path: &Path,
     ) -> bool {
         // Extract audio directly from local file
-        if !self.create_wav(
-            media_path,
-            self.current_pos_ms,
-            self.config.wav_chunk_size_ms,
-        ) {
+        if !self.create_wav(media_path, self.current_pos_ms, self.chunk_dur) {
             return false;
         }
 
@@ -1317,7 +1264,7 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
 
         // Initialize plugin state with configuration
         let config = Config::load();
-        let auto_start = config.auto_start;
+        let auto_start = config.playback.auto_start;
         let mut state = PluginState::new(config);
 
         // Get client name first
