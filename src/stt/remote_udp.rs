@@ -49,7 +49,7 @@ enum Message {
 
 impl Message {
     fn encode(&self, encryption_key: Option<&EncryptionKey>) -> Result<Vec<u8>> {
-        let serialized = bincode::serialize(self)
+        let serialized = postcard::to_allocvec(self)
             .map_err(|e| WhisperSubsError::SttFailed(format!("encode error: {}", e)))?;
 
         if let Some(key) = encryption_key {
@@ -66,7 +66,7 @@ impl Message {
             data.to_vec()
         };
 
-        bincode::deserialize(&decrypted)
+        postcard::from_bytes(&decrypted)
             .map_err(|e| WhisperSubsError::SttFailed(format!("decode error: {}", e)))
     }
 }
