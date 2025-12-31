@@ -86,7 +86,7 @@ demuxer_max_bytes = 536870912
    - 编译时开启：`cargo build --release --features stt_local_cuda`
    - 运行时需确保系统能找到 CUDA 运行库（例如配置 `LD_LIBRARY_PATH` 或系统动态链接器路径）
 
-   STT 后端编译选项（Linux 可用，Android 仅支持 `stt_local_cpu`）：
+   STT 后端编译选项（Linux 可用，Android 支持 `stt_local_cpu` / `stt_remote_udp`，不支持 CUDA）：
    - `stt_local_cpu`：本地 whisper.cpp CPU 后端
    - `stt_local_cuda`：本地 whisper.cpp CUDA 后端
    - `stt_remote_udp`：远端 UDP STT 服务端

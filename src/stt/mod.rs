@@ -63,9 +63,8 @@ compile_error!(
 ))]
 compile_error!("Cannot enable multiple STT backends simultaneously");
 
-#[cfg(target_os = "android")]
-#[cfg(any(feature = "stt_local_cuda", feature = "stt_remote_udp"))]
-compile_error!("Android supports only the stt_local_cpu backend");
+#[cfg(all(target_os = "android", feature = "stt_local_cuda"))]
+compile_error!("Android does not support the stt_local_cuda backend");
 
 // Backend modules
 #[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
