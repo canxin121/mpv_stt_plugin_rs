@@ -37,7 +37,7 @@
 
 ## 关键机制与特性
 - **取消机制（保证 seek 响应速度）**
-  - Whisper 使用 abort callback 直接中断推理。
+  - STT 后端使用 abort callback 直接中断推理。
   - FFmpeg 使用 interrupt callback 中断 I/O，并在解码循环中检查取消。
   - 翻译队列通过 generation 机制丢弃旧任务与结果。
 - **分场景 chunk 策略**
@@ -47,7 +47,7 @@
   - 追赶模式（落后阈值自动跳转）。
   - 预读处理（lookahead），控制提前量上限。
 - **可靠性与容错**
-  - 超时保护（ffmpeg / ffprobe / whisper / translate）。
+  - 超时保护（ffmpeg / ffprobe / stt / translate）。
   - 错误分级处理：取消不当作错误，避免误报。
   - 缓存与去重机制减少重复工作，提升稳定性。
 
@@ -56,7 +56,7 @@
 - **稳定性**：内存安全与显式错误处理，降低崩溃风险。
 - **可控性**：关键路径可取消、可限时、可配置。
 - **易部署**：单一动态库插件，集成到 MPV 即可使用。
-- **扩展性**：模块清晰（audio / whisper / translate / srt / plugin），便于新增功能。
+- **扩展性**：模块清晰（audio / stt / translate / srt / plugin），便于新增功能。
 
 ## 下一步可选方向
 - 本地文件模式体验完善（字幕保存路径策略等）。

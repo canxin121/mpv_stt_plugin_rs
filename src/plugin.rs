@@ -14,9 +14,13 @@ use crate::audio::AudioExtractor;
 use crate::config::Config;
 use crate::error::WhisperSubsError;
 use crate::srt::{self, SrtFile};
+#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
+use crate::stt::LocalModelConfig;
+#[cfg(feature = "stt_remote_udp")]
+use crate::stt::RemoteSttConfig;
+use crate::stt::SttRunner;
 use crate::subtitle_manager::SubtitleManager;
 use crate::translate::{AsyncTranslationQueue, TranslationTask, TranslatorConfig};
-use crate::whisper::{WhisperConfig, WhisperRunner};
 
 struct TempPaths {
     _dir: TempDir,
@@ -89,7 +93,7 @@ struct PluginState {
     config: Config,
     paths: TempPaths,
     audio_extractor: AudioExtractor,
-    whisper_runner: WhisperRunner,
+    stt_runner: SttRunner,
     async_translation_queue: Option<AsyncTranslationQueue>,
     subtitle_manager: SubtitleManager,
     translation_cache: HashMap<u32, (String, String)>,
@@ -115,15 +119,41 @@ impl PluginState {
             .with_ffmpeg_timeout(config.ffmpeg_timeout_ms)
             .with_ffprobe_timeout(config.ffprobe_timeout_ms);
 
-        // Initialize Whisper (backend-specific config selected at compile time)
-        let whisper_config = WhisperConfig::new(config.model_path.clone())
-            .with_threads(config.threads)
-            .with_language(config.language.clone())
-            .with_gpu_device(config.gpu_device)
-            .with_flash_attn(config.flash_attn)
-            .with_timeout_ms(config.whisper_timeout_ms);
+        // Initialize speech-to-text backend (selected at compile time)
+        #[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
+        let stt_runner = {
+            let stt_cfg = config
+                .stt
+                .local_whisper
+                .as_ref()
+                .expect("Missing [stt.local_whisper] config for local backend");
+            let stt_config = LocalModelConfig::new(stt_cfg.model_path.clone())
+                .with_threads(stt_cfg.threads)
+                .with_language(stt_cfg.language.clone())
+                .with_gpu_device(stt_cfg.gpu_device)
+                .with_flash_attn(stt_cfg.flash_attn)
+                .with_timeout_ms(stt_cfg.timeout_ms);
+            SttRunner::new(stt_config)
+        };
 
-        let whisper_runner = WhisperRunner::new(whisper_config);
+        #[cfg(feature = "stt_remote_udp")]
+        let stt_runner = {
+            let cfg = config
+                .stt
+                .remote_udp
+                .as_ref()
+                .expect("Missing [stt.remote_udp] config for remote backend");
+            let remote_config = RemoteSttConfig {
+                server_addr: cfg.server_addr.clone(),
+                timeout_ms: cfg.timeout_ms,
+                max_retry: cfg.max_retry,
+                enable_encryption: cfg.enable_encryption,
+                encryption_key: cfg.encryption_key.clone(),
+                auth_secret: cfg.auth_secret.clone(),
+                enable_compression: cfg.enable_compression,
+            };
+            SttRunner::new(remote_config).expect("Failed to create remote STT client")
+        };
 
         // Initialize async translation queue (always enabled)
         let async_translation_queue = Some(AsyncTranslationQueue::new(
@@ -135,7 +165,7 @@ impl PluginState {
             config,
             paths: TempPaths::new(),
             audio_extractor,
-            whisper_runner,
+            stt_runner,
             async_translation_queue,
             subtitle_manager: SubtitleManager::new(),
             translation_cache: HashMap::new(),
@@ -237,16 +267,16 @@ impl PluginState {
         }
     }
 
-    fn toggle_whisper(&mut self, client: &mut Handle) {
+    fn toggle_stt(&mut self, client: &mut Handle) {
         if self.running {
-            info!("Disabling Whisper transcription");
+            info!("Disabling STT");
             self.running = false;
-            let _ = client.command(&["show-text", "Whisper: Off"]);
+            let _ = client.command(&["show-text", "STT: Off"]);
             self.cleanup(client);
         } else {
-            info!("Enabling Whisper transcription");
+            info!("Enabling STT");
             self.running = true;
-            let _ = client.command(&["show-text", "Whisper: On"]);
+            let _ = client.command(&["show-text", "STT: On"]);
             self.start_transcription(client);
         }
     }
@@ -265,10 +295,7 @@ impl PluginState {
         if is_network {
             // Network stream mode
             debug!("Detected network stream, entering network mode");
-            let _ = client.command(&[
-                "show-text",
-                "Whisper: Starting network stream transcription...",
-            ]);
+            let _ = client.command(&["show-text", "STT: Starting network stream transcription..."]);
 
             // Enable caching
             let _ = client.set_property("cache", true);
@@ -338,8 +365,7 @@ impl PluginState {
                     .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
                 info!("Subtitle will be saved to: {}", subtitle_path.display());
 
-                let _ =
-                    client.command(&["show-text", "Whisper: Starting local file transcription..."]);
+                let _ = client.command(&["show-text", "STT: Starting local file transcription..."]);
 
                 // Start from beginning if configured
                 if self.config.start_at_zero {
@@ -378,7 +404,7 @@ impl PluginState {
                     path, file_length_ms, self.current_pos_ms
                 );
             } else {
-                let _ = client.command(&["show-text", "Whisper: Failed to get file info"]);
+                let _ = client.command(&["show-text", "STT: Failed to get file info"]);
             }
         }
     }
@@ -457,7 +483,7 @@ impl PluginState {
                 self.current_pos_ms = new_pos;
                 let _ = client.command(&[
                     "show-text",
-                    &format!("Whisper: Catching up to {}", Self::format_progress(new_pos)),
+                    &format!("STT: Catching up to {}", Self::format_progress(new_pos)),
                     "3000",
                 ]);
             }
@@ -544,7 +570,7 @@ impl PluginState {
                 if self.config.show_progress && i == 0 {
                     let _ = client.command(&[
                         "show-text",
-                        &format!("Whisper: {}", Self::format_progress(self.current_pos_ms)),
+                        &format!("STT: {}", Self::format_progress(self.current_pos_ms)),
                     ]);
                 }
             } else {
@@ -631,7 +657,7 @@ impl PluginState {
                         self.current_pos_ms = new_pos.min(file_length_ms);
                         let _ = client.command(&[
                             "show-text",
-                            &format!("Whisper: Catching up to {}", Self::format_progress(new_pos)),
+                            &format!("STT: Catching up to {}", Self::format_progress(new_pos)),
                             "3000",
                         ]);
                         break; // Don't process old chunks, restart loop with new position
@@ -660,7 +686,7 @@ impl PluginState {
                     if self.config.show_progress && i == 0 {
                         let _ = client.command(&[
                             "show-text",
-                            &format!("Whisper: {}", Self::format_progress(self.current_pos_ms)),
+                            &format!("STT: {}", Self::format_progress(self.current_pos_ms)),
                         ]);
                     }
                 } else {
@@ -680,7 +706,7 @@ impl PluginState {
         } else {
             // Finished processing
             info!("Finished processing local file");
-            let msg = format!("Whisper: Saved subtitles to {}", subtitle_path.display());
+            let msg = format!("STT: Saved subtitles to {}", subtitle_path.display());
             let _ = client.command(&["show-text", &msg, "5000"]);
 
             self.running = false;
@@ -704,7 +730,7 @@ impl PluginState {
             };
             let last_instant = self.last_playback_instant.replace(now);
 
-            // Avoid treating normal playback progression (or time spent inside Whisper/translate)
+            // Avoid treating normal playback progression (or time spent inside STT/translate)
             // as a seek. Since we process in chunk units, only treat jumps of >= 1 chunk as seek.
             let chunk_size = self.active_chunk_size();
             let seek_threshold_ms = std::cmp::max(5_000, chunk_size);
@@ -740,14 +766,14 @@ impl PluginState {
                 );
                 let _ = client.command(&[
                     "show-text",
-                    &format!("Whisper: Jumped to {}", Self::format_progress(new_pos)),
+                    &format!("STT: Jumped to {}", Self::format_progress(new_pos)),
                     "3000",
                 ]);
 
                 // Keep existing subtitles, just update processing cursor.
                 self.current_pos_ms = new_pos;
                 self.cancel_translation_inflight();
-                self.whisper_runner.cancel_inflight();
+                self.stt_runner.cancel_inflight();
                 self.audio_extractor.cancel_inflight();
                 if self.is_chunk_processed(new_pos) {
                     self.enqueue_missing_translations_for_chunk(new_pos);
@@ -762,13 +788,13 @@ impl PluginState {
                 );
                 let _ = client.command(&[
                     "show-text",
-                    &format!("Whisper: Seeked back to {}", Self::format_progress(new_pos)),
+                    &format!("STT: Seeked back to {}", Self::format_progress(new_pos)),
                     "3000",
                 ]);
 
                 self.current_pos_ms = new_pos;
                 self.cancel_translation_inflight();
-                self.whisper_runner.cancel_inflight();
+                self.stt_runner.cancel_inflight();
                 self.audio_extractor.cancel_inflight();
                 if self.is_chunk_processed(new_pos) {
                     self.enqueue_missing_translations_for_chunk(new_pos);
@@ -848,18 +874,18 @@ impl PluginState {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
 
-        trace!("Starting Whisper transcription for current chunk");
-        // Run Whisper transcription
-        if let Err(e) = self.whisper_runner.transcribe(
+        trace!("Starting STT transcription for current chunk");
+        // Run STT transcription
+        if let Err(e) = self.stt_runner.transcribe(
             self.paths.tmp_wav.to_str().unwrap(),
             append_path.as_str(),
             chunk_ms,
         ) {
-            if matches!(e, WhisperSubsError::WhisperCancelled) {
-                debug!("Whisper transcription cancelled");
+            if matches!(e, WhisperSubsError::SttCancelled) {
+                debug!("STT transcription cancelled");
             } else {
-                error!("Whisper transcription failed: {}", e);
-                let msg = format!("Whisper failed: {e}");
+                error!("STT transcription failed: {}", e);
+                let msg = format!("STT failed: {e}");
                 let _ = client.command(&["show-text", &msg, "4000"]);
                 // Hard stop: backend failed, keep plugin idle as requested.
                 self.running = false;
@@ -948,11 +974,11 @@ impl PluginState {
     }
 
     fn show_device_notice(&mut self, client: &mut Handle) {
-        let Some(notice) = self.whisper_runner.take_device_notice() else {
+        let Some(notice) = self.stt_runner.take_device_notice() else {
             return;
         };
 
-        let mut msg = format!("Whisper device: {}", notice.effective);
+        let mut msg = format!("STT device: {}", notice.effective);
         if notice.effective.is_gpu() {
             msg.push_str(&format!(" (gpu_device: {})", notice.gpu_device));
         }
@@ -964,7 +990,7 @@ impl PluginState {
         }
 
         let _ = client.command(&["show-text", &msg, "3000"]);
-        info!("Whisper device notice: {}", msg);
+        info!("STT device notice: {}", msg);
     }
 
     /// Process completed translation results from async queue
@@ -1035,7 +1061,7 @@ impl PluginState {
 
         // Set shutting down flag to stop any ongoing processing
         self.shutting_down = true;
-        self.whisper_runner.cancel_inflight();
+        self.stt_runner.cancel_inflight();
         self.audio_extractor.cancel_inflight();
 
         // Shutdown async translation queue if it exists
@@ -1298,7 +1324,7 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
         let client_name = client.name().to_string();
 
         // Register key binding
-        let key_binding = format!("Ctrl+. script-message-to {} toggle-whisper", client_name);
+        let key_binding = format!("Ctrl+. script-message-to {} toggle-stt", client_name);
         let section_name = format!("{}-input", client_name);
 
         let _ = client.command(&["define-section", &section_name, &key_binding, "default"]);
@@ -1328,17 +1354,17 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                     }
                     let args = msg.args();
                     if !args.is_empty() {
-                        let command = if args[0] == "toggle-whisper" {
-                            Some("toggle-whisper")
-                        } else if args.len() > 1 && args[1] == "toggle-whisper" {
-                            Some("toggle-whisper")
+                        let command = if args[0] == "toggle-stt" {
+                            Some("toggle-stt")
+                        } else if args.len() > 1 && args[1] == "toggle-stt" {
+                            Some("toggle-stt")
                         } else {
                             None
                         };
 
                         if command.is_some() {
-                            debug!("Toggling whisper...");
-                            state.toggle_whisper(client);
+                            debug!("Toggling STT...");
+                            state.toggle_stt(client);
                         }
                     }
                 }
@@ -1351,7 +1377,7 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
 
                     // Trigger auto-start if pending
                     if state.pending_auto_start && !state.running {
-                        info!("Auto-starting Whisper transcription after file load");
+                        info!("Auto-starting STT after file load");
                         state.pending_auto_start = false;
                         state.running = true;
                         state.start_transcription(client);
@@ -1365,7 +1391,7 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
 
                     // Also trigger auto-start on playback restart (backup mechanism)
                     if state.pending_auto_start && !state.running && state.file_loaded {
-                        info!("Auto-starting Whisper transcription after playback restart");
+                        info!("Auto-starting STT after playback restart");
                         state.pending_auto_start = false;
                         state.running = true;
                         state.start_transcription(client);

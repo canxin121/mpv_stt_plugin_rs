@@ -1,7 +1,9 @@
 use crate::audio::AudioExtractor;
 use crate::srt;
+#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
+use crate::stt::LocalModelConfig;
+use crate::stt::SttRunner;
 use crate::translate::{Translator, TranslatorConfig};
-use crate::whisper::{WhisperConfig, WhisperRunner};
 use log::{debug, error};
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString};
@@ -10,14 +12,14 @@ use std::sync::OnceLock;
 
 // Global state for configuration
 static AUDIO_EXTRACTOR: OnceLock<Mutex<AudioExtractor>> = OnceLock::new();
-static WHISPER_RUNNER: OnceLock<Mutex<Option<WhisperRunner>>> = OnceLock::new();
+static WHISPER_RUNNER: OnceLock<Mutex<Option<SttRunner>>> = OnceLock::new();
 static TRANSLATOR: OnceLock<Mutex<Option<Translator>>> = OnceLock::new();
 
 fn audio_extractor() -> &'static Mutex<AudioExtractor> {
     AUDIO_EXTRACTOR.get_or_init(|| Mutex::new(AudioExtractor::default()))
 }
 
-fn whisper_runner() -> &'static Mutex<Option<WhisperRunner>> {
+fn whisper_runner() -> &'static Mutex<Option<SttRunner>> {
     WHISPER_RUNNER.get_or_init(|| Mutex::new(None))
 }
 
@@ -41,9 +43,10 @@ fn string_to_c_str(s: String) -> *mut c_char {
     CString::new(s).unwrap_or_default().into_raw()
 }
 
-/// Initialize Whisper configuration
+/// Initialize speech-to-text configuration (local model backends)
+#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn whispersubs_whisper_init(
+pub extern "C" fn whispersubs_stt_init(
     model_path: *const c_char,
     threads: u8,
     language: *const c_char,
@@ -59,15 +62,15 @@ pub extern "C" fn whispersubs_whisper_init(
 
         let language = c_str_to_string(language).unwrap_or_else(|| "auto".to_string());
 
-        let config = WhisperConfig::new(model_path)
+        let config = LocalModelConfig::new(model_path)
             .with_threads(threads)
             .with_language(language)
             .with_gpu_device(gpu_device)
             .with_flash_attn(flash_attn);
 
-        let runner = WhisperRunner::new(config);
+        let runner = SttRunner::new(config);
         *whisper_runner().lock() = Some(runner);
-        debug!("Whisper initialized via FFI");
+        debug!("STT (local) initialized via FFI");
         0
     }
 }
@@ -118,8 +121,9 @@ pub extern "C" fn extract_audio(
 }
 
 /// Run Whisper transcription
+#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn whisper_transcribe(
+pub extern "C" fn stt_transcribe(
     audio_path: *const c_char,
     output_prefix: *const c_char,
     duration_ms: u64,
@@ -147,7 +151,7 @@ pub extern "C" fn whisper_transcribe(
         match runner.transcribe(&audio, &output, duration_ms) {
             Ok(_) => 0,
             Err(e) => {
-                error!("Whisper transcription error: {}", e);
+                error!("STT transcription error: {}", e);
                 -1
             }
         }

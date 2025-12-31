@@ -26,11 +26,11 @@ pub enum WhisperSubsError {
     #[error("WAV error: {0}")]
     Wav(#[from] hound::Error),
 
-    #[error("Whisper execution failed: {0}")]
-    WhisperFailed(String),
+    #[error("STT execution failed: {0}")]
+    SttFailed(String),
 
-    #[error("Whisper execution cancelled")]
-    WhisperCancelled,
+    #[error("STT execution cancelled")]
+    SttCancelled,
 
     #[error("Invalid path: {0}")]
     InvalidPath(String),

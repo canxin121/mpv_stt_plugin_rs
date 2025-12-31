@@ -46,13 +46,7 @@ impl fmt::Display for InferenceDevice {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    pub model_path: String,
-    pub threads: u8,
-    pub language: String,
-    pub gpu_device: i32,
-    #[serde(alias = "cuda_flash_attn")]
-    pub flash_attn: bool,
-    pub whisper_timeout_ms: u64,
+    pub stt: SttConfig,
 
     // Translation settings (builtin Google Translate)
     pub from_lang: String,
@@ -86,12 +80,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model_path: "ggml-base.bin".to_string(),
-            threads: 8,
-            language: "en".to_string(),
-            gpu_device: 0,
-            flash_attn: false,
-            whisper_timeout_ms: 120_000,
+            stt: SttConfig::default(),
 
             // Translation defaults (builtin Google Translate)
             from_lang: "en".to_string(),
@@ -124,6 +113,69 @@ impl Default for Config {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SttConfig {
+    pub local_whisper: Option<SttLocalWhisperConfig>,
+    pub remote_udp: Option<SttRemoteUdpConfig>,
+}
+
+impl Default for SttConfig {
+    fn default() -> Self {
+        Self {
+            local_whisper: Some(SttLocalWhisperConfig::default()),
+            remote_udp: Some(SttRemoteUdpConfig::default()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SttLocalWhisperConfig {
+    pub model_path: String,
+    pub threads: u8,
+    pub language: String,
+    pub gpu_device: i32,
+    pub flash_attn: bool,
+    pub timeout_ms: u64,
+}
+
+impl Default for SttLocalWhisperConfig {
+    fn default() -> Self {
+        Self {
+            model_path: "ggml-base.bin".to_string(),
+            threads: 8,
+            language: "en".to_string(),
+            gpu_device: 0,
+            flash_attn: false,
+            timeout_ms: 120_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SttRemoteUdpConfig {
+    pub server_addr: String,
+    pub timeout_ms: u64,
+    pub max_retry: usize,
+    pub enable_encryption: bool,
+    pub encryption_key: String,
+    pub auth_secret: String,
+    pub enable_compression: bool,
+}
+
+impl Default for SttRemoteUdpConfig {
+    fn default() -> Self {
+        Self {
+            server_addr: "127.0.0.1:9000".to_string(),
+            timeout_ms: 120_000,
+            max_retry: 3,
+            enable_encryption: false,
+            encryption_key: String::new(),
+            auth_secret: String::new(),
+            enable_compression: false,
+        }
+    }
+}
+
 impl Config {
     pub fn default_config_path() -> Option<PathBuf> {
         let base = BaseDirs::new()?;
@@ -147,17 +199,7 @@ impl Config {
         figment = figment.merge(Env::prefixed("WHISPERSUBS_"));
 
         match figment.extract::<Config>() {
-            Ok(mut cfg) => {
-                // Backward-compatible env var for old config name.
-                if !cfg.flash_attn {
-                    if let Ok(value) = std::env::var("WHISPERSUBS_CUDA_FLASH_ATTN") {
-                        if let Some(parsed) = parse_env_bool(&value) {
-                            cfg.flash_attn = parsed;
-                        }
-                    }
-                }
-                cfg
-            }
+            Ok(cfg) => cfg,
             Err(err) => {
                 // Logging might not be initialized yet; fall back silently.
                 warn!("Failed to load config, using defaults: {err}");

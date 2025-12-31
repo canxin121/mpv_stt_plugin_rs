@@ -194,7 +194,7 @@ print(json.dumps(result, ensure_ascii=False))
         device: InferenceDevice,
     ) -> Result<PythonResult> {
         if self.config.model_path.trim().is_empty() {
-            return Err(WhisperSubsError::WhisperFailed(
+            return Err(WhisperSubsError::SttFailed(
                 "Model path is empty".to_string(),
             ));
         }
@@ -247,7 +247,7 @@ print(json.dumps(result, ensure_ascii=False))
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(WhisperSubsError::WhisperFailed(format!(
+            return Err(WhisperSubsError::SttFailed(format!(
                 "faster-whisper failed: {}",
                 stderr.trim()
             )));
@@ -255,7 +255,7 @@ print(json.dumps(result, ensure_ascii=False))
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         serde_json::from_str(stdout.trim()).map_err(|e| {
-            WhisperSubsError::WhisperFailed(format!("Failed to parse faster-whisper output: {}", e))
+            WhisperSubsError::SttFailed(format!("Failed to parse faster-whisper output: {}", e))
         })
     }
 
@@ -315,7 +315,7 @@ print(json.dumps(result, ensure_ascii=False))
         let result = self.run_python_transcribe(&audio_path, device)?;
 
         if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
-            return Err(WhisperSubsError::WhisperCancelled);
+            return Err(WhisperSubsError::SttCancelled);
         }
 
         let segments = collect_segments(&result)?;

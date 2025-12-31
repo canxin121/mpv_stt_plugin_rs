@@ -7,7 +7,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 完全 Rust 实现：
 
 - **Rust MPV C 插件** - 使用 `mpv-client` 库直接集成到 MPV
-- **核心模块** - 音频处理、Whisper、SRT、翻译
+- **核心模块** - 音频处理、STT 后端、SRT、翻译
 - **零 Lua 依赖** - 纯 Rust 实现
 
 ## 功能特性
@@ -30,7 +30,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 - 说明：
   - **桌面版**：通过 Rust 绑定静态链接，无需外部 ffmpeg/ffprobe 可执行文件
   - **Android**：动态链接系统/打包内的 FFmpeg 动态库（见下方 Android 构建与依赖）
-- Whisper.cpp
+- Whisper.cpp（仅本地 `stt_local_*` 后端需要）
 - Crow Translate CLI（可选）
 
 ### 构建依赖
@@ -60,7 +60,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 
    添加以下内容到 `~/.config/mpv/input.conf`：
    ```
-   Ctrl+. script-message toggle-whisper
+   Ctrl+. script-message toggle-stt
    ```
 
    或使用其他按键，例如 `F8`。
@@ -74,13 +74,22 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 
    示例（TOML，带注释说明）：
    ```toml
-   # whisper.cpp 配置
-   model_path = "/path/to/ggml-base.bin"
-   threads = 8              # CPU 线程数
-   language = "ja"
-   gpu_device = 0           # 仅 cuda 版有效
-   flash_attn = false       # 仅 cuda 版有效
-   whisper_timeout_ms = 120000
+[stt.local_whisper]
+model_path = "/path/to/ggml-base.bin"
+threads = 8              # CPU 线程数
+language = "ja"
+gpu_device = 0           # 仅 cuda 版有效
+flash_attn = false       # 仅 cuda 版有效
+timeout_ms = 120000
+
+   [stt.remote_udp]
+   server_addr = "127.0.0.1:9000"
+   timeout_ms = 120000
+   max_retry = 3
+   enable_encryption = false
+   encryption_key = ""
+   auth_secret = ""
+   enable_compression = false
 
    # 翻译设置（内置 Google 翻译）
    from_lang = "ja"       # 源语言
@@ -102,7 +111,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
    # 超时设置（毫秒）
    ffmpeg_timeout_ms = 30000
    ffprobe_timeout_ms = 10000
-   whisper_timeout_ms = 120000
+   stt_timeout_ms = 120000
    translate_timeout_ms = 30000
    translate_concurrency = 4   # 翻译并发数
 
@@ -117,25 +126,18 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
    ```
 
    CUDA 支持说明（纯编译期选择，无运行时回退）：
-   - 编译时开启：`cargo build --release --features whisper_cpp_cuda`
+   - 编译时开启：`cargo build --release --features stt_local_cuda`
    - 运行时需确保系统能找到 CUDA 运行库（例如配置 `LD_LIBRARY_PATH` 或系统动态链接器路径）
 
-   Whisper 后端编译选项（Linux 可用，Android 仅支持 `whisper_cpp_cpu`）：
-   - `whisper_cpp_cpu`：Whisper.cpp CPU 后端
-   - `whisper_cpp_cuda`：Whisper.cpp CUDA 后端
+   STT 后端编译选项（Linux 可用，Android 仅支持 `stt_local_cpu`）：
+   - `stt_local_cpu`：本地 whisper.cpp CPU 后端
+   - `stt_local_cuda`：本地 whisper.cpp CUDA 后端
+   - `stt_remote_udp`：远端 UDP STT 服务端（协议自定义）
 
    示例：
-   - `cargo build --release`（默认 `whisper_cpp_cpu`）
-   - `cargo build --release --no-default-features --features whisper_cpp_cuda`
-   - `cargo build --release --no-default-features --features fast_whisper_cpu`
-
-   fast_whisper 运行时说明：
-   - 需要系统安装 Python 3.9+ 与 `faster-whisper`（`pip install faster-whisper`）
-   - `model_path` 需为 **faster-whisper** 模型名（如 `large-v3`）或 **CTranslate2 模型目录**
-   - 可用环境变量：
-     - `WHISPERSUBS_PYTHON=/path/to/python`
-     - `WHISPERSUBS_FAST_WHISPER_COMPUTE_TYPE`（默认 `default`）
-     - `WHISPERSUBS_FAST_WHISPER_BEAM_SIZE`（默认 `5`）
+   - `cargo build --release`（默认 `stt_local_cpu`）
+   - `cargo build --release --no-default-features --features stt_local_cuda`
+   - `cargo build --release --no-default-features --features stt_remote_udp`
 
 
 ## Android 构建
@@ -231,7 +233,7 @@ whispersubs_rs/
     ├── lib.rs           # 库入口
     ├── plugin.rs        # MPV 插件入口和事件循环
     ├── audio.rs         # 音频处理
-    ├── whisper.rs       # Whisper 集成
+    ├── stt/             # 语音转字幕后端集合（本地/远端）
     ├── srt.rs           # SRT 处理
     ├── translate.rs     # 翻译功能
     ├── error.rs         # 错误类型
@@ -248,11 +250,11 @@ MPV C 插件入口点，实现：
 - 插件状态管理
 
 ### 其他模块
-与原设计相同，提供核心功能：
+核心功能：
 - `audio.rs` - FFmpeg 音频提取
-- `whisper.rs` - Whisper.cpp 集成
+- `stt/` - 各 STT 后端（本地 whisper.cpp / 远端 UDP）
 - `srt.rs` - SRT 文件处理
-- `translate.rs` - 翻译功能
+- `translate.rs` - 翻译功能（内置）
 
 ## 优势
 
@@ -285,7 +287,7 @@ env BINDGEN_EXTRA_CLANG_ARGS="-I/path/to/mpv/include" cargo build --release
 
 ✅ 已完成：
 - 项目结构
-- 核心模块实现（audio, whisper, srt, translate）
+- 核心模块实现（audio, stt, srt, translate）
 - MPV 插件框架
 - 编译系统
 - **持续转录逻辑** (网络流)
