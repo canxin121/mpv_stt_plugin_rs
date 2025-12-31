@@ -1,4 +1,4 @@
-use crate::error::{Result, MpvSttPluginRsError};
+use crate::error::{MpvSttPluginRsError, Result};
 use crate::srt::SrtFile;
 use futures::stream::StreamExt;
 use log::{debug, trace, warn};

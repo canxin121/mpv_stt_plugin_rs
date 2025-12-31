@@ -14,7 +14,7 @@ pub mod translate;
 pub use audio::AudioExtractor;
 pub use config::{Config, InferenceDevice};
 pub use crypto::{AuthToken, EncryptionKey};
-pub use error::{Result, MpvSttPluginRsError};
+pub use error::{MpvSttPluginRsError, Result};
 pub use srt::{SrtFile, SubtitleEntry};
 #[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
 pub use stt::LocalModelConfig;

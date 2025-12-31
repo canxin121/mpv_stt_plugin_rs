@@ -480,6 +480,8 @@ impl PluginState {
         let max_chunk_ms = chunk_ms;
         let first_chunk_ms = max_chunk_ms;
         let chunks_to_process = self.config.prefetch.lookahead_chunks.max(1);
+        let lookahead_limit_ms = max_chunk_ms.saturating_mul(chunks_to_process as u64);
+        let playback_pos_ms = self.last_playback_pos_ms;
         for i in 0..chunks_to_process {
             if self.check_seek(client) {
                 return;
@@ -487,6 +489,18 @@ impl PluginState {
             let chunk_start_ms = self.current_pos_ms + (i as u64 * max_chunk_ms);
             let chunk_ms = if i == 0 { first_chunk_ms } else { max_chunk_ms };
             let chunk_end_ms = chunk_start_ms + chunk_ms;
+
+            if let Some(playback_pos_ms) = playback_pos_ms {
+                let ahead_end_ms = chunk_end_ms.saturating_sub(playback_pos_ms);
+                if ahead_end_ms > lookahead_limit_ms {
+                    trace!(
+                        "Look-ahead limit reached: chunk end {}ms ahead (limit {}ms); waiting",
+                        ahead_end_ms,
+                        lookahead_limit_ms
+                    );
+                    break;
+                }
+            }
 
             // Check if this chunk is fully cached
             if chunk_end_ms > cache_end_ms {
@@ -581,12 +595,26 @@ impl PluginState {
         if time_left > 0 {
             // Look-ahead processing: process multiple chunks ahead (always enabled)
             let chunks_to_process = self.config.prefetch.lookahead_chunks.max(1);
+            let lookahead_limit_ms = local_chunk_size.saturating_mul(chunks_to_process as u64);
+            let playback_pos_ms = self.last_playback_pos_ms;
 
             for i in 0..chunks_to_process {
                 if self.check_seek(client) {
                     return;
                 }
                 let chunk_pos = self.current_pos_ms + (i as u64 * self.chunk_dur);
+                let chunk_end_ms = chunk_pos.saturating_add(self.chunk_dur);
+                if let Some(playback_pos_ms) = playback_pos_ms {
+                    let ahead_end_ms = chunk_end_ms.saturating_sub(playback_pos_ms);
+                    if ahead_end_ms > lookahead_limit_ms {
+                        trace!(
+                            "Look-ahead limit reached: chunk end {}ms ahead (limit {}ms); waiting",
+                            ahead_end_ms,
+                            lookahead_limit_ms
+                        );
+                        break;
+                    }
+                }
                 if chunk_pos >= file_length_ms {
                     break; // Don't process beyond file end
                 }
@@ -1040,7 +1068,11 @@ impl PluginState {
 
     fn cache_root_dir() -> Option<PathBuf> {
         let base = directories::BaseDirs::new()?;
-        Some(base.config_dir().join("mpv").join("mpv_stt_plugin_rs_cache"))
+        Some(
+            base.config_dir()
+                .join("mpv")
+                .join("mpv_stt_plugin_rs_cache"),
+        )
     }
 
     fn cache_paths_for_media(&self, media_id: &str) -> Option<CachePaths> {
@@ -1259,6 +1291,18 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
             state.pending_auto_start = true;
         }
 
+        // If a file is already loaded when the plugin is attached (e.g., script reload),
+        // try to start immediately instead of waiting for the next FileLoaded event.
+        if auto_start && !state.running {
+            if client.get_property::<f64>("duration").is_ok() {
+                debug!("Auto-start: media already loaded, starting immediately");
+                state.file_loaded = true;
+                state.pending_auto_start = false;
+                state.running = true;
+                state.start_transcription(client);
+            }
+        }
+
         // Main event loop with short timeout for continuous processing
         loop {
             // Use 0.1 second timeout to allow continuous processing
@@ -1290,6 +1334,14 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                             state.toggle_stt(client);
                         }
                     }
+                }
+                Event::StartFile(_) => {
+                    if state.shutting_down {
+                        continue;
+                    }
+                    debug!("StartFile event received");
+                    state.file_loaded = false;
+                    state.pending_auto_start = state.config.playback.auto_start;
                 }
                 Event::FileLoaded => {
                     if state.shutting_down {

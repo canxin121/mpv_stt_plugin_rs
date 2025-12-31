@@ -1,4 +1,4 @@
-use crate::error::{Result, MpvSttPluginRsError};
+use crate::error::{MpvSttPluginRsError, Result};
 use ffmpeg::format::Sample;
 use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::util::mathematics::rescale;

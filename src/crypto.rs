@@ -1,4 +1,4 @@
-use crate::error::{Result, MpvSttPluginRsError};
+use crate::error::{MpvSttPluginRsError, Result};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use sha2::{Digest, Sha256};
 

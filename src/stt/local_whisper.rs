@@ -1,10 +1,11 @@
 use super::{BackendKind, SttBackend, SttDeviceNotice};
 use crate::config::InferenceDevice;
-use crate::error::{Result, MpvSttPluginRsError};
+use crate::error::{MpvSttPluginRsError, Result};
 use crate::srt::{SrtFile, SubtitleEntry};
 use hound::{SampleFormat, WavReader};
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 use srtlib::Timestamp;
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -22,6 +23,7 @@ const FEATURE_DEVICE: InferenceDevice = InferenceDevice::CUDA;
 #[cfg(feature = "stt_local_cpu")]
 const FEATURE_DEVICE: InferenceDevice = InferenceDevice::CPU;
 
+#[derive(Clone)]
 pub struct LocalModelConfig {
     pub model_path: String,
     pub threads: u8,
@@ -176,7 +178,21 @@ impl LocalWhisperBackend {
             ));
         }
 
-        self.ensure_context_for_device(FEATURE_DEVICE, "feature-selected local_model")?;
+        if let Err(err) = self.ensure_context_for_device(FEATURE_DEVICE, "feature-selected local_model") {
+            if FEATURE_DEVICE.is_gpu() {
+                warn!(
+                    "STT context init failed on {} ({}); falling back to CPU",
+                    FEATURE_DEVICE, err
+                );
+                self.ctx = None;
+                self.active_device = None;
+                return self.ensure_context_for_device(
+                    InferenceDevice::CPU,
+                    "fallback after gpu init failure",
+                );
+            }
+            return Err(err);
+        }
 
         Ok(())
     }
@@ -211,17 +227,44 @@ impl LocalWhisperBackend {
         Ok(float_samples)
     }
 
-    fn build_params(&self) -> Result<FullParams<'static, 'static>> {
-        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-        // whisper-rs stores a borrowed &str; use None to avoid tying lifetime to self
-        params.set_language(None);
-        params.set_n_threads(self.config.threads.into());
-        params.set_suppress_blank(true);
-        params.set_max_len(0);
+    fn build_params<'a>(&'a self, duration_ms: u64) -> FullParams<'a, 'a> {
+        let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 5 });
+        params.set_n_threads(self.config.threads as i32);
+        params.set_print_progress(false);
+        params.set_print_realtime(false);
+        params.set_print_timestamps(false);
+        params.set_print_special(false);
+        params.set_no_timestamps(false);
         params.set_translate(false);
-        params.set_no_context(true);
-        params.set_single_segment(true);
-        Ok(params)
+
+        if self.config.language.trim().eq_ignore_ascii_case("auto") {
+            params.set_detect_language(true);
+            params.set_language(None);
+        } else {
+            params.set_detect_language(false);
+            params.set_language(Some(self.config.language.as_str()));
+        }
+
+        let dur_i32 = i32::try_from(duration_ms).unwrap_or(i32::MAX);
+        params.set_offset_ms(0);
+        params.set_duration_ms(dur_i32);
+        params
+    }
+
+    fn write_srt<P: AsRef<Path>>(&self, output_prefix: P, segments: &[SegmentData]) -> Result<()> {
+        let mut srt_file = SrtFile::new();
+        for (idx, segment) in segments.iter().enumerate() {
+            srt_file.append_entry(SubtitleEntry {
+                index: (idx + 1) as u32,
+                start_time: Timestamp::from_milliseconds(segment.start_ms),
+                end_time: Timestamp::from_milliseconds(segment.end_ms),
+                text: segment.text.clone(),
+            });
+        }
+
+        let output_path = PathBuf::from(output_prefix.as_ref()).with_extension("srt");
+        srt_file.save(&output_path)?;
+        Ok(())
     }
 
     fn transcribe_impl<P: AsRef<Path>>(
@@ -242,84 +285,163 @@ impl LocalWhisperBackend {
             audio_str, duration_ms, self.config.language
         );
 
-        let samples = self.load_audio_samples(audio_path)?;
-
-        let mut params = self.build_params()?;
-        let ctx = self.ctx.as_ref().ok_or_else(|| {
-            MpvSttPluginRsError::SttFailed("STT context not initialized".to_string())
-        })?;
-
-        let run_generation = self.cancel_generation.load(Ordering::Relaxed);
-        let cancel_flag = Arc::clone(&self.cancel_generation);
-        let timeout_ms = self.config.timeout_ms;
-        params.set_duration_ms(timeout_ms as i32);
-        params.set_translate(false);
-        params
-            .set_abort_callback_safe(move || cancel_flag.load(Ordering::Relaxed) != run_generation);
-
-        let mut state = ctx
-            .create_state()
-            .map_err(|e| stt_error("Failed to create state", e))?;
-
-        state
-            .full(params, &samples)
-            .map_err(|err| stt_error("STT inference failed", err))?;
-
-        if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
-            return Err(MpvSttPluginRsError::SttCancelled);
+        let audio = self.load_audio_samples(&audio_path)?;
+        if audio.is_empty() {
+            return Err(MpvSttPluginRsError::SttFailed(
+                "Audio buffer is empty".to_string(),
+            ));
         }
 
-        let segments = collect_segments(&state)?;
-        let mut srt_file = SrtFile::new();
-        for (idx, seg) in segments.into_iter().enumerate() {
-            srt_file.append_entry(SubtitleEntry {
-                index: idx as u32 + 1,
-                start_time: Timestamp::from_milliseconds(
-                    (seg.start_ms as u32).try_into().unwrap_or(u32::MAX),
-                ),
-                end_time: Timestamp::from_milliseconds(
-                    (seg.end_ms as u32).try_into().unwrap_or(u32::MAX),
-                ),
-                text: seg.text,
-            });
+        let audio_duration_ms = (audio.len() as u64)
+            .saturating_mul(1000)
+            .saturating_div(EXPECTED_SAMPLE_RATE as u64);
+        if audio_duration_ms == 0 {
+            return Err(MpvSttPluginRsError::SttFailed(
+                "Audio duration is zero".to_string(),
+            ));
+        }
+        let effective_duration_ms = audio_duration_ms.min(duration_ms);
+        if effective_duration_ms != duration_ms {
+            debug!(
+                "STT duration clamp: requested={}ms, actual={}ms",
+                duration_ms, audio_duration_ms
+            );
         }
 
-        let output_path = PathBuf::from(output_prefix.as_ref()).with_extension("srt");
-        srt_file.save(&output_path)?;
+        let segments = match self.run_inference(&audio, effective_duration_ms) {
+            Ok(segments) => Ok(segments),
+            Err(err) => {
+                if matches!(err, MpvSttPluginRsError::SttCancelled) {
+                    return Err(err);
+                }
+                if self.active_device.map_or(false, |device| device.is_gpu()) {
+                    let failed_device = self.active_device.unwrap_or(InferenceDevice::CPU);
+                    warn!(
+                        "STT inference failed on {} ({}); retrying on CPU",
+                        failed_device, err
+                    );
+                    self.ctx = None;
+                    self.active_device = None;
+                    self.ensure_context_for_device(
+                        InferenceDevice::CPU,
+                        "fallback after gpu inference failure",
+                    )?;
+                    self.run_inference(&audio, effective_duration_ms)
+                } else {
+                    Err(err)
+                }
+            }
+        }?;
+        self.write_srt(output_prefix, &segments)?;
 
         debug!("Local model STT completed successfully");
         Ok(())
     }
 }
 
-#[derive(Debug)]
+impl LocalWhisperBackend {
+    fn run_inference(&self, audio: &[f32], duration_ms: u64) -> Result<Vec<SegmentData>> {
+        let run_generation = self.cancel_generation.load(Ordering::Relaxed);
+        let mut params = self.build_params(duration_ms);
+
+        let ctx = self.ctx.as_ref().ok_or_else(|| {
+            MpvSttPluginRsError::SttFailed("STT context not initialized".to_string())
+        })?;
+        let mut state = ctx
+            .create_state()
+            .map_err(|e| stt_error("Failed to create state", e))?;
+
+        let abort_ctx = Box::new(AbortContext {
+            generation: Arc::clone(&self.cancel_generation),
+            run_generation,
+        });
+        let abort_ptr = Box::into_raw(abort_ctx);
+        let _abort_guard = AbortGuard(abort_ptr);
+        unsafe {
+            params.set_abort_callback(Some(whisper_abort_callback));
+            params.set_abort_callback_user_data(abort_ptr as *mut c_void);
+        }
+
+        if let Err(err) = state.full(params, audio) {
+            if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
+                return Err(MpvSttPluginRsError::SttCancelled);
+            }
+            return Err(stt_error("STT inference failed", err));
+        }
+
+        if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
+            return Err(MpvSttPluginRsError::SttCancelled);
+        }
+
+        collect_segments(&state)
+    }
+}
+
+struct AbortContext {
+    generation: Arc<AtomicU64>,
+    run_generation: u64,
+}
+
+struct AbortGuard(*mut AbortContext);
+
+impl Drop for AbortGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                drop(Box::from_raw(self.0));
+            }
+        }
+    }
+}
+
+unsafe extern "C" fn whisper_abort_callback(user_data: *mut c_void) -> bool {
+    if user_data.is_null() {
+        return false;
+    }
+    let ctx = unsafe { &*(user_data as *const AbortContext) };
+    ctx.generation.load(Ordering::Relaxed) != ctx.run_generation
+}
+
 struct SegmentData {
-    start_ms: f64,
-    end_ms: f64,
+    start_ms: u32,
+    end_ms: u32,
     text: String,
 }
 
 fn collect_segments(state: &whisper_rs::WhisperState) -> Result<Vec<SegmentData>> {
-    let num_segments = state.full_n_segments();
-    let mut segments = Vec::with_capacity(num_segments.max(0) as usize);
-
-    for seg in state.as_iter() {
-        let start = seg.start_timestamp() as f64 * 10.0;
-        let end = seg.end_timestamp() as f64 * 10.0;
-        let text = seg
-            .to_str()
+    let mut segments = Vec::new();
+    for segment in state.as_iter() {
+        let start_ms = timestamp_to_millis(segment.start_timestamp());
+        let end_ms = timestamp_to_millis(segment.end_timestamp());
+        if end_ms <= start_ms {
+            continue;
+        }
+        let text = segment
+            .to_str_lossy()
             .map_err(|e| stt_error("Failed to read segment text", e))?
             .trim()
             .to_string();
-
+        if text.is_empty() {
+            continue;
+        }
         segments.push(SegmentData {
-            start_ms: start,
-            end_ms: end,
+            start_ms,
+            end_ms,
             text,
         });
     }
-
     Ok(segments)
+}
+
+fn timestamp_to_millis(timestamp_cs: i64) -> u32 {
+    let millis = timestamp_cs.saturating_mul(10);
+    if millis < 0 {
+        0
+    } else if millis > u32::MAX as i64 {
+        u32::MAX
+    } else {
+        millis as u32
+    }
 }
 
 fn stt_error(context: &str, err: WhisperError) -> MpvSttPluginRsError {

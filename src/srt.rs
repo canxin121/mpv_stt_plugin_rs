@@ -1,4 +1,4 @@
-use crate::error::{Result, MpvSttPluginRsError};
+use crate::error::{MpvSttPluginRsError, Result};
 use log::{debug, trace};
 use srtlib::{Subtitle, Subtitles, Timestamp};
 use std::fmt;

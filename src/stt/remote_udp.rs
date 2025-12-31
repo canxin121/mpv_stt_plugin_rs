@@ -1,25 +1,25 @@
 use super::{BackendKind, SttBackend, SttDeviceNotice};
 use crate::crypto::{AuthToken, EncryptionKey};
-use crate::error::{Result, MpvSttPluginRsError};
+use crate::error::{MpvSttPluginRsError, Result};
 use crate::srt::SrtFile;
+#[cfg(feature = "stt_remote_udp")]
+use libopusenc_static_sys as opusenc;
 use log::{debug, info, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+#[cfg(feature = "stt_remote_udp")]
+use std::ffi::CStr;
 use std::net::{SocketAddr, UdpSocket};
+#[cfg(feature = "stt_remote_udp")]
+use std::os::raw::{c_int, c_void};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "stt_remote_udp")]
+use std::ptr::NonNull;
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
-#[cfg(feature = "stt_remote_udp")]
-use libopusenc_static_sys as opusenc;
-#[cfg(feature = "stt_remote_udp")]
-use std::ffi::CStr;
-#[cfg(feature = "stt_remote_udp")]
-use std::os::raw::{c_int, c_void};
-#[cfg(feature = "stt_remote_udp")]
-use std::ptr::NonNull;
 
 #[cfg(feature = "stt_remote_udp")]
 const OPUS_SET_APPLICATION_REQUEST: c_int = 4000;
@@ -299,10 +299,9 @@ pub struct RemoteUdpBackend {
 impl RemoteUdpBackend {
     pub fn new(config: RemoteSttConfig) -> Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0")?;
-        let server_addr = config
-            .server_addr
-            .parse()
-            .map_err(|e| MpvSttPluginRsError::SttFailed(format!("invalid server address: {}", e)))?;
+        let server_addr = config.server_addr.parse().map_err(|e| {
+            MpvSttPluginRsError::SttFailed(format!("invalid server address: {}", e))
+        })?;
 
         socket.set_read_timeout(Some(Duration::from_millis(5000)))?;
 
@@ -428,8 +427,9 @@ impl RemoteUdpBackend {
         {
             use hound::WavReader;
 
-            let reader = WavReader::open(audio_path)
-                .map_err(|e| MpvSttPluginRsError::SttFailed(format!("Failed to read WAV: {}", e)))?;
+            let reader = WavReader::open(audio_path).map_err(|e| {
+                MpvSttPluginRsError::SttFailed(format!("Failed to read WAV: {}", e))
+            })?;
 
             let spec = reader.spec();
             if spec.channels != 1 || spec.sample_rate != 16000 {

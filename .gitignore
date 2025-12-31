@@ -2,3 +2,5 @@
 dist/
 toolchains/vulkan-headers/
 log
+temp/
+AGENTS.md
