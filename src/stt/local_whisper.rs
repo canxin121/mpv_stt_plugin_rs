@@ -1,6 +1,6 @@
 use super::{BackendKind, SttBackend, SttDeviceNotice};
 use crate::config::InferenceDevice;
-use crate::error::{Result, WhisperSubsError};
+use crate::error::{Result, MpvSttPluginRsError};
 use crate::srt::{SrtFile, SubtitleEntry};
 use hound::{SampleFormat, WavReader};
 use log::{debug, info, trace};
@@ -171,7 +171,7 @@ impl LocalWhisperBackend {
         }
 
         if self.config.model_path.trim().is_empty() {
-            return Err(WhisperSubsError::SttFailed(
+            return Err(MpvSttPluginRsError::SttFailed(
                 "Model path is empty".to_string(),
             ));
         }
@@ -183,7 +183,7 @@ impl LocalWhisperBackend {
 
     fn load_audio_samples<P: AsRef<Path>>(&self, audio_path: P) -> Result<Vec<f32>> {
         let mut reader = WavReader::open(audio_path.as_ref())
-            .map_err(|e| WhisperSubsError::SttFailed(format!("Failed to read WAV: {}", e)))?;
+            .map_err(|e| MpvSttPluginRsError::SttFailed(format!("Failed to read WAV: {}", e)))?;
         let spec = reader.spec();
 
         if spec.channels != EXPECTED_CHANNELS
@@ -191,7 +191,7 @@ impl LocalWhisperBackend {
             || spec.bits_per_sample != 16
             || spec.sample_format != SampleFormat::Int
         {
-            return Err(WhisperSubsError::SttFailed(format!(
+            return Err(MpvSttPluginRsError::SttFailed(format!(
                 "Unexpected WAV format: channels={}, sample_rate={}, bits_per_sample={}, format={:?}",
                 spec.channels, spec.sample_rate, spec.bits_per_sample, spec.sample_format
             )));
@@ -201,7 +201,7 @@ impl LocalWhisperBackend {
             .samples::<i16>()
             .collect::<std::result::Result<Vec<i16>, _>>()
             .map_err(|e| {
-                WhisperSubsError::SttFailed(format!("Failed to read WAV samples: {}", e))
+                MpvSttPluginRsError::SttFailed(format!("Failed to read WAV samples: {}", e))
             })?;
 
         let mut float_samples = vec![0f32; samples.len()];
@@ -235,7 +235,7 @@ impl LocalWhisperBackend {
         let audio_str = audio_path
             .as_ref()
             .to_str()
-            .ok_or_else(|| WhisperSubsError::InvalidPath("Invalid audio path".to_string()))?;
+            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid audio path".to_string()))?;
 
         trace!(
             "Running local model STT on {} (duration: {}ms, language: {})",
@@ -246,7 +246,7 @@ impl LocalWhisperBackend {
 
         let mut params = self.build_params()?;
         let ctx = self.ctx.as_ref().ok_or_else(|| {
-            WhisperSubsError::SttFailed("STT context not initialized".to_string())
+            MpvSttPluginRsError::SttFailed("STT context not initialized".to_string())
         })?;
 
         let run_generation = self.cancel_generation.load(Ordering::Relaxed);
@@ -266,7 +266,7 @@ impl LocalWhisperBackend {
             .map_err(|err| stt_error("STT inference failed", err))?;
 
         if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
-            return Err(WhisperSubsError::SttCancelled);
+            return Err(MpvSttPluginRsError::SttCancelled);
         }
 
         let segments = collect_segments(&state)?;
@@ -322,8 +322,8 @@ fn collect_segments(state: &whisper_rs::WhisperState) -> Result<Vec<SegmentData>
     Ok(segments)
 }
 
-fn stt_error(context: &str, err: WhisperError) -> WhisperSubsError {
-    WhisperSubsError::SttFailed(format!("{}: {}", context, err))
+fn stt_error(context: &str, err: WhisperError) -> MpvSttPluginRsError {
+    MpvSttPluginRsError::SttFailed(format!("{}: {}", context, err))
 }
 
 #[cfg(test)]

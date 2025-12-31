@@ -1,4 +1,4 @@
-use crate::error::{Result, WhisperSubsError};
+use crate::error::{Result, MpvSttPluginRsError};
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use sha2::{Digest, Sha256};
 
@@ -26,7 +26,7 @@ impl EncryptionKey {
         let ciphertext = self
             .cipher
             .encrypt(nonce, plaintext)
-            .map_err(|e| WhisperSubsError::SttFailed(format!("Encryption failed: {}", e)))?;
+            .map_err(|e| MpvSttPluginRsError::SttFailed(format!("Encryption failed: {}", e)))?;
 
         let mut result = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
         result.extend_from_slice(&nonce_bytes);
@@ -37,7 +37,7 @@ impl EncryptionKey {
 
     pub fn decrypt(&self, encrypted: &[u8]) -> Result<Vec<u8>> {
         if encrypted.len() < NONCE_SIZE {
-            return Err(WhisperSubsError::SttFailed(
+            return Err(MpvSttPluginRsError::SttFailed(
                 "Encrypted data too short".to_string(),
             ));
         }
@@ -48,7 +48,7 @@ impl EncryptionKey {
         let plaintext = self
             .cipher
             .decrypt(nonce, ciphertext)
-            .map_err(|e| WhisperSubsError::SttFailed(format!("Decryption failed: {}", e)))?;
+            .map_err(|e| MpvSttPluginRsError::SttFailed(format!("Decryption failed: {}", e)))?;
 
         Ok(plaintext)
     }

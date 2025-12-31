@@ -1,12 +1,10 @@
 use super::{BackendKind, SttBackend, SttDeviceNotice};
 use crate::crypto::{AuthToken, EncryptionKey};
-use crate::error::{Result, WhisperSubsError};
+use crate::error::{Result, MpvSttPluginRsError};
 use crate::srt::SrtFile;
 use log::{debug, info, trace};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::Read;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -14,6 +12,201 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
+#[cfg(feature = "stt_remote_udp")]
+use libopusenc_static_sys as opusenc;
+#[cfg(feature = "stt_remote_udp")]
+use std::ffi::CStr;
+#[cfg(feature = "stt_remote_udp")]
+use std::os::raw::{c_int, c_void};
+#[cfg(feature = "stt_remote_udp")]
+use std::ptr::NonNull;
+
+#[cfg(feature = "stt_remote_udp")]
+const OPUS_SET_APPLICATION_REQUEST: c_int = 4000;
+#[cfg(feature = "stt_remote_udp")]
+const OPUS_APPLICATION_VOIP: c_int = 2048;
+
+#[cfg(feature = "stt_remote_udp")]
+fn ope_error_message(code: c_int) -> String {
+    unsafe {
+        let ptr = opusenc::ope_strerror(code);
+        if ptr.is_null() {
+            format!("OpusEnc error {code}")
+        } else {
+            CStr::from_ptr(ptr).to_string_lossy().into_owned()
+        }
+    }
+}
+
+#[cfg(feature = "stt_remote_udp")]
+struct PacketSink {
+    packets: Vec<Vec<u8>>,
+    seen_packets: usize,
+}
+
+#[cfg(feature = "stt_remote_udp")]
+impl PacketSink {
+    fn new() -> Self {
+        Self {
+            packets: Vec::new(),
+            seen_packets: 0,
+        }
+    }
+}
+
+#[cfg(feature = "stt_remote_udp")]
+unsafe extern "C" fn opusenc_write_cb(
+    _user_data: *mut c_void,
+    _ptr: *const ::core::ffi::c_uchar,
+    _len: opusenc::opus_int32,
+) -> c_int {
+    0
+}
+
+#[cfg(feature = "stt_remote_udp")]
+unsafe extern "C" fn opusenc_close_cb(_user_data: *mut c_void) -> c_int {
+    0
+}
+
+#[cfg(feature = "stt_remote_udp")]
+unsafe extern "C" fn opusenc_packet_cb(
+    user_data: *mut c_void,
+    packet_ptr: *const ::core::ffi::c_uchar,
+    packet_len: opusenc::opus_int32,
+    _flags: opusenc::opus_uint32,
+) {
+    if user_data.is_null() || packet_ptr.is_null() || packet_len <= 0 {
+        return;
+    }
+    let sink = unsafe { &mut *(user_data as *mut PacketSink) };
+    sink.seen_packets += 1;
+    if sink.seen_packets <= 2 {
+        return;
+    }
+    let data = unsafe { std::slice::from_raw_parts(packet_ptr, packet_len as usize) };
+    sink.packets.push(data.to_vec());
+}
+
+#[cfg(feature = "stt_remote_udp")]
+struct OpusEncHandle {
+    ptr: NonNull<opusenc::OggOpusEnc>,
+}
+
+#[cfg(feature = "stt_remote_udp")]
+impl OpusEncHandle {
+    fn new(sample_rate: i32, channels: i32) -> Result<Self> {
+        let comments = unsafe { opusenc::ope_comments_create() };
+        if comments.is_null() {
+            return Err(MpvSttPluginRsError::SttFailed(
+                "OpusEnc comments init failed".to_string(),
+            ));
+        }
+        let callbacks = opusenc::OpusEncCallbacks {
+            write: Some(opusenc_write_cb),
+            close: Some(opusenc_close_cb),
+        };
+        let mut error: c_int = 0;
+        let ptr = unsafe {
+            opusenc::ope_encoder_create_callbacks(
+                &callbacks,
+                std::ptr::null_mut(),
+                comments,
+                sample_rate as opusenc::opus_int32,
+                channels,
+                0,
+                &mut error,
+            )
+        };
+        unsafe {
+            opusenc::ope_comments_destroy(comments);
+        }
+        let ptr = NonNull::new(ptr).ok_or_else(|| {
+            MpvSttPluginRsError::SttFailed(format!(
+                "OpusEnc encoder init failed: {}",
+                ope_error_message(error)
+            ))
+        })?;
+        if error != 0 {
+            return Err(MpvSttPluginRsError::SttFailed(format!(
+                "OpusEnc encoder init failed: {}",
+                ope_error_message(error)
+            )));
+        }
+        Ok(Self { ptr })
+    }
+
+    fn set_packet_callback(&mut self, sink: *mut PacketSink) -> Result<()> {
+        let ret = unsafe {
+            opusenc::ope_encoder_ctl(
+                self.ptr.as_ptr(),
+                opusenc::OPE_SET_PACKET_CALLBACK_REQUEST as c_int,
+                Some(opusenc_packet_cb),
+                sink as *mut c_void,
+            )
+        };
+        if ret != 0 {
+            return Err(MpvSttPluginRsError::SttFailed(format!(
+                "OpusEnc packet callback setup failed: {}",
+                ope_error_message(ret)
+            )));
+        }
+        Ok(())
+    }
+
+    fn set_application(&mut self, application: c_int) -> Result<()> {
+        let ret = unsafe {
+            opusenc::ope_encoder_ctl(
+                self.ptr.as_ptr(),
+                OPUS_SET_APPLICATION_REQUEST,
+                application as opusenc::opus_int32,
+            )
+        };
+        if ret != 0 {
+            return Err(MpvSttPluginRsError::SttFailed(format!(
+                "OpusEnc set application failed: {}",
+                ope_error_message(ret)
+            )));
+        }
+        Ok(())
+    }
+
+    fn write_samples(&mut self, samples: &[i16]) -> Result<()> {
+        let ret = unsafe {
+            opusenc::ope_encoder_write(
+                self.ptr.as_ptr(),
+                samples.as_ptr() as *const opusenc::opus_int16,
+                samples.len() as c_int,
+            )
+        };
+        if ret != 0 {
+            return Err(MpvSttPluginRsError::SttFailed(format!(
+                "OpusEnc write failed: {}",
+                ope_error_message(ret)
+            )));
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        let ret = unsafe { opusenc::ope_encoder_drain(self.ptr.as_ptr()) };
+        if ret != 0 {
+            return Err(MpvSttPluginRsError::SttFailed(format!(
+                "OpusEnc drain failed: {}",
+                ope_error_message(ret)
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "stt_remote_udp")]
+impl Drop for OpusEncHandle {
+    fn drop(&mut self) {
+        unsafe {
+            opusenc::ope_encoder_destroy(self.ptr.as_ptr());
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CompressionFormat {
@@ -50,7 +243,7 @@ enum Message {
 impl Message {
     fn encode(&self, encryption_key: Option<&EncryptionKey>) -> Result<Vec<u8>> {
         let serialized = postcard::to_allocvec(self)
-            .map_err(|e| WhisperSubsError::SttFailed(format!("encode error: {}", e)))?;
+            .map_err(|e| MpvSttPluginRsError::SttFailed(format!("encode error: {}", e)))?;
 
         if let Some(key) = encryption_key {
             key.encrypt(&serialized)
@@ -67,7 +260,7 @@ impl Message {
         };
 
         postcard::from_bytes(&decrypted)
-            .map_err(|e| WhisperSubsError::SttFailed(format!("decode error: {}", e)))
+            .map_err(|e| MpvSttPluginRsError::SttFailed(format!("decode error: {}", e)))
     }
 }
 
@@ -109,13 +302,13 @@ impl RemoteUdpBackend {
         let server_addr = config
             .server_addr
             .parse()
-            .map_err(|e| WhisperSubsError::SttFailed(format!("invalid server address: {}", e)))?;
+            .map_err(|e| MpvSttPluginRsError::SttFailed(format!("invalid server address: {}", e)))?;
 
         socket.set_read_timeout(Some(Duration::from_millis(5000)))?;
 
         let encryption_key = if config.enable_encryption {
             if config.encryption_key.is_empty() {
-                return Err(WhisperSubsError::SttFailed(
+                return Err(MpvSttPluginRsError::SttFailed(
                     "Encryption enabled but encryption_key is empty".to_string(),
                 ));
             }
@@ -149,7 +342,7 @@ impl RemoteUdpBackend {
         let audio_str = audio_path
             .as_ref()
             .to_str()
-            .ok_or_else(|| WhisperSubsError::InvalidPath("Invalid audio path".to_string()))?;
+            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid audio path".to_string()))?;
 
         trace!(
             "Remote UDP STT: {} (duration: {}ms, compression: Opus)",
@@ -161,7 +354,7 @@ impl RemoteUdpBackend {
         let audio_data = self.compress_audio(&audio_path)?;
 
         if audio_data.is_empty() {
-            return Err(WhisperSubsError::SttFailed(
+            return Err(MpvSttPluginRsError::SttFailed(
                 "Audio data is empty".to_string(),
             ));
         }
@@ -171,7 +364,7 @@ impl RemoteUdpBackend {
             self.send_request_with_retry(request_id, &audio_data, duration_ms, run_generation)?;
 
         if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
-            return Err(WhisperSubsError::SttCancelled);
+            return Err(MpvSttPluginRsError::SttCancelled);
         }
 
         let srt_file = SrtFile::parse_content(&String::from_utf8_lossy(&srt_data))?;
@@ -201,7 +394,7 @@ impl RemoteUdpBackend {
         for attempt in 0..self.config.max_retry {
             if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
                 self.send_cancel(request_id)?;
-                return Err(WhisperSubsError::SttCancelled);
+                return Err(MpvSttPluginRsError::SttCancelled);
             }
 
             match self.send_request(request_id, audio, duration_ms, run_generation) {
@@ -236,11 +429,11 @@ impl RemoteUdpBackend {
             use hound::WavReader;
 
             let reader = WavReader::open(audio_path)
-                .map_err(|e| WhisperSubsError::SttFailed(format!("Failed to read WAV: {}", e)))?;
+                .map_err(|e| MpvSttPluginRsError::SttFailed(format!("Failed to read WAV: {}", e)))?;
 
             let spec = reader.spec();
             if spec.channels != 1 || spec.sample_rate != 16000 {
-                return Err(WhisperSubsError::SttFailed(format!(
+                return Err(MpvSttPluginRsError::SttFailed(format!(
                     "Unsupported WAV format for compression: {}ch {}Hz",
                     spec.channels, spec.sample_rate
                 )));
@@ -250,24 +443,20 @@ impl RemoteUdpBackend {
                 .into_samples::<i16>()
                 .collect::<std::result::Result<Vec<i16>, _>>()
                 .map_err(|e| {
-                    WhisperSubsError::SttFailed(format!("Failed to read samples: {}", e))
+                    MpvSttPluginRsError::SttFailed(format!("Failed to read samples: {}", e))
                 })?;
 
-            let mut encoder =
-                opus::Encoder::new(16000, opus::Channels::Mono, opus::Application::Voip).map_err(
-                    |e| WhisperSubsError::SttFailed(format!("Opus encoder init failed: {:?}", e)),
-                )?;
+            let mut sink = PacketSink::new();
+            let mut encoder = OpusEncHandle::new(16000, 1)?;
+            encoder.set_packet_callback(&mut sink)?;
+            encoder.set_application(OPUS_APPLICATION_VOIP)?;
+            encoder.write_samples(&samples)?;
+            encoder.drain()?;
 
-            const FRAME_SIZE: usize = 960;
             let mut compressed = Vec::new();
-
-            for chunk in samples.chunks(FRAME_SIZE) {
-                let mut output = vec![0u8; 4000];
-                let len = encoder.encode(chunk, &mut output).map_err(|e| {
-                    WhisperSubsError::SttFailed(format!("Opus encode failed: {:?}", e))
-                })?;
-                compressed.extend_from_slice(&(len as u32).to_le_bytes());
-                compressed.extend_from_slice(&output[..len]);
+            for packet in sink.packets {
+                compressed.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+                compressed.extend_from_slice(&packet);
             }
 
             info!(
@@ -279,7 +468,7 @@ impl RemoteUdpBackend {
         }
         #[cfg(not(feature = "stt_remote_udp"))]
         {
-            Err(WhisperSubsError::SttFailed(
+            Err(MpvSttPluginRsError::SttFailed(
                 "Compression not available".to_string(),
             ))
         }
@@ -326,12 +515,12 @@ impl RemoteUdpBackend {
         loop {
             if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
                 self.send_cancel(request_id)?;
-                return Err(WhisperSubsError::SttCancelled);
+                return Err(MpvSttPluginRsError::SttCancelled);
             }
 
             if Instant::now() > deadline {
                 self.send_cancel(request_id)?;
-                return Err(WhisperSubsError::SttFailed(
+                return Err(MpvSttPluginRsError::SttFailed(
                     "UDP request timed out".to_string(),
                 ));
             }
@@ -355,7 +544,7 @@ impl RemoteUdpBackend {
                                     if let Some(chunk) = result_chunks.get(&i) {
                                         srt_data.extend_from_slice(chunk);
                                     } else {
-                                        return Err(WhisperSubsError::SttFailed(format!(
+                                        return Err(MpvSttPluginRsError::SttFailed(format!(
                                             "Missing result chunk {}",
                                             i
                                         )));
@@ -368,7 +557,7 @@ impl RemoteUdpBackend {
                             request_id: resp_id,
                             message: msg,
                         } if resp_id == request_id => {
-                            return Err(WhisperSubsError::SttFailed(format!(
+                            return Err(MpvSttPluginRsError::SttFailed(format!(
                                 "Server error: {}",
                                 msg
                             )));
@@ -381,7 +570,7 @@ impl RemoteUdpBackend {
                     continue;
                 }
                 Err(e) => {
-                    return Err(WhisperSubsError::SttFailed(format!(
+                    return Err(MpvSttPluginRsError::SttFailed(format!(
                         "UDP receive error: {}",
                         e
                     )));

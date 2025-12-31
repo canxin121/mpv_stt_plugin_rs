@@ -1,4 +1,4 @@
-use crate::error::{Result, WhisperSubsError};
+use crate::error::{Result, MpvSttPluginRsError};
 use crate::srt::SrtFile;
 use futures::stream::StreamExt;
 use log::{debug, trace, warn};
@@ -92,7 +92,7 @@ impl Translator {
         // Use sync version (we're already in async context via worker thread)
         match translator.translate_sync(text, &from_lang, &to_lang) {
             Ok(result) => Ok(result),
-            Err(e) => Err(WhisperSubsError::TranslationFailed(format!(
+            Err(e) => Err(MpvSttPluginRsError::TranslationFailed(format!(
                 "Builtin translation failed: {}",
                 e
             ))),

@@ -20,7 +20,7 @@ if [[ ! -d "$MPV_ANDROID" ]]; then
   exit 1
 fi
 
-BUILD_ABIS="${WHISPERSUBS_BUILD_ABIS:-arm64-v8a,armeabi-v7a}"
+BUILD_ABIS="${MPV_STT_PLUGIN_RS_BUILD_ABIS:-arm64-v8a,armeabi-v7a}"
 
 # Rust targets needed for Android ABIs.
 ensure_rust_target() {
@@ -99,8 +99,8 @@ for abi in "${abis[@]}"; do
 
   OUT_DIR="$ROOT_DIR/dist/android/$abi"
   mkdir -p "$OUT_DIR"
-  cp "$ROOT_DIR/target/$rust_target/release/libwhispersubs_rs.so" "$OUT_DIR/"
-  echo "Output: $OUT_DIR/libwhispersubs_rs.so"
+  cp "$ROOT_DIR/target/$rust_target/release/libmpv_stt_plugin_rs.so" "$OUT_DIR/"
+  echo "Output: $OUT_DIR/libmpv_stt_plugin_rs.so"
 
 done
 

@@ -2,6 +2,7 @@ use crate::audio::AudioExtractor;
 use crate::srt;
 #[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
 use crate::stt::LocalModelConfig;
+#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
 use crate::stt::{SttBackend, SttRunner};
 use crate::translate::{Translator, TranslatorConfig};
 use log::{debug, error};
@@ -12,6 +13,7 @@ use std::sync::OnceLock;
 
 // Global state for configuration
 static AUDIO_EXTRACTOR: OnceLock<Mutex<AudioExtractor>> = OnceLock::new();
+#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
 static WHISPER_RUNNER: OnceLock<Mutex<Option<SttRunner>>> = OnceLock::new();
 static TRANSLATOR: OnceLock<Mutex<Option<Translator>>> = OnceLock::new();
 
@@ -19,6 +21,7 @@ fn audio_extractor() -> &'static Mutex<AudioExtractor> {
     AUDIO_EXTRACTOR.get_or_init(|| Mutex::new(AudioExtractor::default()))
 }
 
+#[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
 fn whisper_runner() -> &'static Mutex<Option<SttRunner>> {
     WHISPER_RUNNER.get_or_init(|| Mutex::new(None))
 }
@@ -46,7 +49,7 @@ fn string_to_c_str(s: String) -> *mut c_char {
 /// Initialize speech-to-text configuration (local model backends)
 #[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
 #[unsafe(no_mangle)]
-pub extern "C" fn whispersubs_stt_init(
+pub extern "C" fn mpv_stt_plugin_rs_stt_init(
     model_path: *const c_char,
     threads: u8,
     language: *const c_char,

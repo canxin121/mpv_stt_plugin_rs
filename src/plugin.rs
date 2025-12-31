@@ -12,7 +12,7 @@ use std::ffi::CString;
 
 use crate::audio::AudioExtractor;
 use crate::config::Config;
-use crate::error::WhisperSubsError;
+use crate::error::MpvSttPluginRsError;
 use crate::srt::{self, SrtFile};
 #[cfg(any(feature = "stt_local_cpu", feature = "stt_local_cuda"))]
 use crate::stt::LocalModelConfig;
@@ -32,7 +32,7 @@ struct TempPaths {
 impl TempPaths {
     fn new() -> Self {
         let dir = tempfile::Builder::new()
-            .prefix("mpv_whispersubs_rs_")
+            .prefix("mpv_stt_plugin_rs_")
             .tempdir()
             .expect("failed to create temp dir");
 
@@ -804,7 +804,7 @@ impl PluginState {
             append_path.as_str(),
             chunk_ms,
         ) {
-            if matches!(e, WhisperSubsError::SttCancelled) {
+            if matches!(e, MpvSttPluginRsError::SttCancelled) {
                 debug!("STT transcription cancelled");
             } else {
                 error!("STT transcription failed: {}", e);
@@ -968,7 +968,7 @@ impl PluginState {
 
         match result {
             Ok(_) => true,
-            Err(WhisperSubsError::AudioExtractionCancelled) => {
+            Err(MpvSttPluginRsError::AudioExtractionCancelled) => {
                 debug!("Audio extraction cancelled");
                 false
             }
@@ -1040,7 +1040,7 @@ impl PluginState {
 
     fn cache_root_dir() -> Option<PathBuf> {
         let base = directories::BaseDirs::new()?;
-        Some(base.config_dir().join("mpv").join("whispersubs_cache"))
+        Some(base.config_dir().join("mpv").join("mpv_stt_plugin_rs_cache"))
     }
 
     fn cache_paths_for_media(&self, media_id: &str) -> Option<CachePaths> {
@@ -1232,10 +1232,10 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
 
         let client = Handle::from_ptr(handle);
 
-        info!("WhisperSubs Rust plugin initializing...");
+        info!("mpv_stt_plugin_rs Rust plugin initializing...");
 
         // Print welcome message
-        let _ = client.command(&["show-text", "WhisperSubs Rust plugin loaded!", "3000"]);
+        let _ = client.command(&["show-text", "mpv_stt_plugin_rs Rust plugin loaded!", "3000"]);
         info!("Plugin loaded, client name: {}", client.name());
 
         // Initialize plugin state with configuration
@@ -1368,7 +1368,7 @@ fn init_panic_logger() {
 #[cfg(target_os = "android")]
 fn log_android_error(message: &str) {
     const ANDROID_LOG_ERROR: libc::c_int = 6;
-    let tag = CString::new("whispersubs_rs").unwrap_or_default();
+    let tag = CString::new("mpv_stt_plugin_rs").unwrap_or_default();
     let msg = CString::new(message).unwrap_or_default();
     unsafe {
         __android_log_write(ANDROID_LOG_ERROR, tag.as_ptr(), msg.as_ptr());
@@ -1385,12 +1385,12 @@ unsafe extern "C" {
 }
 
 fn init_logger() {
-    // Set WHISPERSUBS_LOG environment variable to control log level (e.g., WHISPERSUBS_LOG=debug)
+    // Set MPV_STT_PLUGIN_RS_LOG environment variable to control log level (e.g., MPV_STT_PLUGIN_RS_LOG=debug)
     #[cfg(target_os = "android")]
     {
         use log::LevelFilter;
 
-        let level = std::env::var("WHISPERSUBS_LOG")
+        let level = std::env::var("MPV_STT_PLUGIN_RS_LOG")
             .ok()
             .and_then(|s| {
                 s.parse::<LevelFilter>()
@@ -1400,7 +1400,7 @@ fn init_logger() {
             .unwrap_or(LevelFilter::Info);
 
         let config = android_logger::Config::default()
-            .with_tag("whispersubs_rs")
+            .with_tag("mpv_stt_plugin_rs")
             .with_max_level(level);
         let _ = android_logger::init_once(config);
     }
@@ -1408,7 +1408,7 @@ fn init_logger() {
     #[cfg(not(target_os = "android"))]
     {
         let _ = env_logger::Builder::from_env(
-            env_logger::Env::new().filter_or("WHISPERSUBS_LOG", "info"),
+            env_logger::Env::new().filter_or("MPV_STT_PLUGIN_RS_LOG", "info"),
         )
         .format_timestamp_millis()
         .try_init();

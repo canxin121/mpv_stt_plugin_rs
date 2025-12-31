@@ -4,7 +4,6 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-env-changed=MPV_LIB_DIR");
     println!("cargo:rerun-if-env-changed=MPV_PREFIX");
-
     let target = env::var("TARGET").unwrap_or_default();
     if !target.contains("android") {
         return;

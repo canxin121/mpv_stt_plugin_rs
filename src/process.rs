@@ -1,4 +1,4 @@
-use crate::error::{Result, WhisperSubsError};
+use crate::error::{Result, MpvSttPluginRsError};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 use wait_timeout::ChildExt;
@@ -13,7 +13,7 @@ pub fn run_capture_output(mut cmd: Command, label: &str, timeout: Duration) -> R
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| {
-        WhisperSubsError::ProcessFailed(format!(
+        MpvSttPluginRsError::ProcessFailed(format!(
             "Failed to spawn {}: {}",
             format_cmd_for_error(label),
             e
@@ -21,7 +21,7 @@ pub fn run_capture_output(mut cmd: Command, label: &str, timeout: Duration) -> R
     })?;
 
     match child.wait_timeout(timeout).map_err(|e| {
-        WhisperSubsError::ProcessFailed(format!(
+        MpvSttPluginRsError::ProcessFailed(format!(
             "Failed waiting for {}: {}",
             format_cmd_for_error(label),
             e
@@ -34,7 +34,7 @@ pub fn run_capture_output(mut cmd: Command, label: &str, timeout: Duration) -> R
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            Err(WhisperSubsError::ProcessTimeout(format!(
+            Err(MpvSttPluginRsError::ProcessTimeout(format!(
                 "{} timed out after {}ms",
                 format_cmd_for_error(label),
                 timeout.as_millis()
@@ -54,7 +54,7 @@ pub fn run_capture_output_with_stdin(
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().map_err(|e| {
-        WhisperSubsError::ProcessFailed(format!(
+        MpvSttPluginRsError::ProcessFailed(format!(
             "Failed to spawn {}: {}",
             format_cmd_for_error(label),
             e
@@ -67,7 +67,7 @@ pub fn run_capture_output_with_stdin(
     }
 
     match child.wait_timeout(timeout).map_err(|e| {
-        WhisperSubsError::ProcessFailed(format!(
+        MpvSttPluginRsError::ProcessFailed(format!(
             "Failed waiting for {}: {}",
             format_cmd_for_error(label),
             e
@@ -80,7 +80,7 @@ pub fn run_capture_output_with_stdin(
         None => {
             let _ = child.kill();
             let _ = child.wait();
-            Err(WhisperSubsError::ProcessTimeout(format!(
+            Err(MpvSttPluginRsError::ProcessTimeout(format!(
                 "{} timed out after {}ms",
                 format_cmd_for_error(label),
                 timeout.as_millis()

@@ -227,11 +227,11 @@ impl Default for NetworkConfig {
 impl Config {
     pub fn default_config_path() -> Option<PathBuf> {
         let base = BaseDirs::new()?;
-        Some(base.config_dir().join("mpv").join("whispersubs.toml"))
+        Some(base.config_dir().join("mpv").join("mpv_stt_plugin_rs.toml"))
     }
 
     pub fn config_path_from_env() -> Option<PathBuf> {
-        std::env::var_os("WHISPERSUBS_CONFIG").map(PathBuf::from)
+        std::env::var_os("MPV_STT_PLUGIN_RS_CONFIG").map(PathBuf::from)
     }
 
     pub fn load() -> Self {
@@ -244,7 +244,7 @@ impl Config {
         }
 
         // Env should take precedence over file/defaults.
-        figment = figment.merge(Env::prefixed("WHISPERSUBS_"));
+        figment = figment.merge(Env::prefixed("MPV_STT_PLUGIN_RS_"));
 
         match figment.extract::<Config>() {
             Ok(cfg) => cfg,

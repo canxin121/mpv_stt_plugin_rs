@@ -1,4 +1,4 @@
-# WhisperSubs - Pure Rust MPV Plugin
+# mpv_stt_plugin_rs - Pure Rust MPV Plugin
 
 MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 
@@ -6,7 +6,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 
 1. **构建插件**
    ```bash
-   cd ~/.config/mpv/scripts/whispersubs_rs
+   cd ~/.config/mpv/scripts/mpv_stt_plugin_rs
    # 推荐：自动拉取 mpv 头文件并设置环境变量
    ./scripts/cargo-with-mpv.sh build --release
 
@@ -17,7 +17,7 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 
 2. **安装插件**
    ```bash
-   cp target/release/libwhispersubs_rs.so ~/.config/mpv/scripts/
+   cp target/release/libmpv_stt_plugin_rs.so ~/.config/mpv/scripts/
    ```
 
 3. **配置键绑定**
@@ -33,8 +33,8 @@ MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
 
    现在支持运行时配置文件（无需改代码/重新编译）：
 
-   - 默认配置文件路径：`~/.config/mpv/whispersubs.toml`
-   - 也可以用环境变量指定：`WHISPERSUBS_CONFIG=/path/to/whispersubs.toml`
+   - 默认配置文件路径：`~/.config/mpv/mpv_stt_plugin_rs.toml`
+   - 也可以用环境变量指定：`MPV_STT_PLUGIN_RS_CONFIG=/path/to/mpv_stt_plugin_rs.toml`
 
    示例（TOML，带注释说明）：
 ```toml
@@ -103,20 +103,20 @@ demuxer_max_bytes = 536870912
 脚本位置：`scripts/build-android-all.sh`
 
 ```bash
-cd ~/.config/mpv/scripts/whispersubs_rs
+cd ~/.config/mpv/scripts/mpv_stt_plugin_rs
 ./scripts/build-android-all.sh
 ```
 
 产物输出：
 ```
-dist/android/arm64-v8a/libwhispersubs_rs.so
-dist/android/armeabi-v7a/libwhispersubs_rs.so
-dist/android/x86/libwhispersubs_rs.so
-dist/android/x86_64/libwhispersubs_rs.so
+dist/android/arm64-v8a/libmpv_stt_plugin_rs.so
+dist/android/armeabi-v7a/libmpv_stt_plugin_rs.so
+dist/android/x86/libmpv_stt_plugin_rs.so
+dist/android/x86_64/libmpv_stt_plugin_rs.so
 ```
 
 ### 依赖说明（Android 动态链接）
-每个 ABI 的 `libwhispersubs_rs.so` 依赖以下动态库：
+每个 ABI 的 `libmpv_stt_plugin_rs.so` 依赖以下动态库：
 
 需要随包（放进 APK 的 `jniLibs/<abi>/` 或等效位置）：
 - `libmpv.so`

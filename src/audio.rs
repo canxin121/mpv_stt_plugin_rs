@@ -1,4 +1,4 @@
-use crate::error::{Result, WhisperSubsError};
+use crate::error::{Result, MpvSttPluginRsError};
 use ffmpeg::format::Sample;
 use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::util::mathematics::rescale;
@@ -17,14 +17,14 @@ static FFMPEG_INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 fn ensure_ffmpeg() -> Result<()> {
     match FFMPEG_INIT.get_or_init(|| ffmpeg::init().map_err(|e| e.to_string())) {
         Ok(()) => Ok(()),
-        Err(err) => Err(WhisperSubsError::AudioExtractionFailed(format!(
+        Err(err) => Err(MpvSttPluginRsError::AudioExtractionFailed(format!(
             "ffmpeg init failed: {err}"
         ))),
     }
 }
 
-fn ffmpeg_err(context: &str, err: impl std::fmt::Display) -> WhisperSubsError {
-    WhisperSubsError::AudioExtractionFailed(format!("{context}: {err}"))
+fn ffmpeg_err(context: &str, err: impl std::fmt::Display) -> MpvSttPluginRsError {
+    MpvSttPluginRsError::AudioExtractionFailed(format!("{context}: {err}"))
 }
 
 fn check_timeout(start: Instant, timeout: Duration, label: &str) -> Result<()> {
@@ -32,7 +32,7 @@ fn check_timeout(start: Instant, timeout: Duration, label: &str) -> Result<()> {
         return Ok(());
     }
     if start.elapsed() > timeout {
-        return Err(WhisperSubsError::ProcessTimeout(format!(
+        return Err(MpvSttPluginRsError::ProcessTimeout(format!(
             "{label} timed out after {}ms",
             timeout.as_millis()
         )));
@@ -93,7 +93,7 @@ impl AudioExtractor {
 
     fn check_cancel(&self, generation: u64) -> Result<()> {
         if self.cancel_generation.load(Ordering::Relaxed) != generation {
-            return Err(WhisperSubsError::AudioExtractionCancelled);
+            return Err(MpvSttPluginRsError::AudioExtractionCancelled);
         }
         Ok(())
     }
@@ -113,11 +113,11 @@ impl AudioExtractor {
         let input_str = input_path
             .as_ref()
             .to_str()
-            .ok_or_else(|| WhisperSubsError::InvalidPath("Invalid input path".to_string()))?;
+            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid input path".to_string()))?;
         let output_str = output_path
             .as_ref()
             .to_str()
-            .ok_or_else(|| WhisperSubsError::InvalidPath("Invalid output path".to_string()))?;
+            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid output path".to_string()))?;
 
         trace!(
             "Extracting audio: {}ms-{}ms from {} -> {}",
@@ -154,7 +154,7 @@ impl AudioExtractor {
             .streams()
             .best(ffmpeg::media::Type::Audio)
             .ok_or_else(|| {
-                WhisperSubsError::AudioExtractionFailed("No audio stream found".to_string())
+                MpvSttPluginRsError::AudioExtractionFailed("No audio stream found".to_string())
             })?;
         let stream_index = input_stream.index();
 
@@ -230,7 +230,7 @@ impl AudioExtractor {
                 let data = resampled.data(0);
                 let sample_count = data.len() / std::mem::size_of::<i16>();
                 if sample_count < frames * channels {
-                    return Err(WhisperSubsError::AudioExtractionFailed(
+                    return Err(MpvSttPluginRsError::AudioExtractionFailed(
                         "resampled frame shorter than expected".to_string(),
                     ));
                 }
@@ -284,7 +284,7 @@ impl AudioExtractor {
                 let data = resampled.data(0);
                 let sample_count = data.len() / std::mem::size_of::<i16>();
                 if sample_count < frames * channels {
-                    return Err(WhisperSubsError::AudioExtractionFailed(
+                    return Err(MpvSttPluginRsError::AudioExtractionFailed(
                         "resampled frame shorter than expected".to_string(),
                     ));
                 }
@@ -317,7 +317,7 @@ impl AudioExtractor {
         self.check_cancel(run_generation)?;
         writer.finalize()?;
         if target_frames > 0 && written_frames == 0 {
-            return Err(WhisperSubsError::AudioExtractionFailed(
+            return Err(MpvSttPluginRsError::AudioExtractionFailed(
                 "no audio samples decoded".to_string(),
             ));
         }
@@ -336,7 +336,7 @@ impl AudioExtractor {
         let path_str = path
             .as_ref()
             .to_str()
-            .ok_or_else(|| WhisperSubsError::InvalidPath("Invalid path".to_string()))?;
+            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid path".to_string()))?;
 
         let start_time = Instant::now();
         let ictx = ffmpeg::format::input(&path).map_err(|e| ffmpeg_err("open input failed", e))?;

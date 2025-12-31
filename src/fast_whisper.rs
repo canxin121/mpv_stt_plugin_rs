@@ -1,5 +1,5 @@
 use crate::config::InferenceDevice;
-use crate::error::{Result, WhisperSubsError};
+use crate::error::{Result, MpvSttPluginRsError};
 use crate::process::run_capture_output_with_stdin;
 use crate::srt::{SrtFile, SubtitleEntry};
 use log::{debug, info, trace};
@@ -121,7 +121,7 @@ impl WhisperRunner {
     }
 
     fn python_executable() -> String {
-        if let Ok(value) = std::env::var("WHISPERSUBS_PYTHON") {
+        if let Ok(value) = std::env::var("MPV_STT_PLUGIN_RS_PYTHON") {
             if !value.trim().is_empty() {
                 return value;
             }
@@ -194,7 +194,7 @@ print(json.dumps(result, ensure_ascii=False))
         device: InferenceDevice,
     ) -> Result<PythonResult> {
         if self.config.model_path.trim().is_empty() {
-            return Err(WhisperSubsError::SttFailed(
+            return Err(MpvSttPluginRsError::SttFailed(
                 "Model path is empty".to_string(),
             ));
         }
@@ -220,12 +220,12 @@ print(json.dumps(result, ensure_ascii=False))
             .env("WHISPER_CPU_THREADS", self.config.threads.to_string())
             .env(
                 "WHISPER_COMPUTE_TYPE",
-                std::env::var("WHISPERSUBS_FAST_WHISPER_COMPUTE_TYPE")
+                std::env::var("MPV_STT_PLUGIN_RS_FAST_WHISPER_COMPUTE_TYPE")
                     .unwrap_or_else(|_| "default".to_string()),
             )
             .env(
                 "WHISPER_BEAM_SIZE",
-                std::env::var("WHISPERSUBS_FAST_WHISPER_BEAM_SIZE")
+                std::env::var("MPV_STT_PLUGIN_RS_FAST_WHISPER_BEAM_SIZE")
                     .unwrap_or_else(|_| "5".to_string()),
             );
 
@@ -247,7 +247,7 @@ print(json.dumps(result, ensure_ascii=False))
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(WhisperSubsError::SttFailed(format!(
+            return Err(MpvSttPluginRsError::SttFailed(format!(
                 "faster-whisper failed: {}",
                 stderr.trim()
             )));
@@ -255,7 +255,7 @@ print(json.dumps(result, ensure_ascii=False))
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         serde_json::from_str(stdout.trim()).map_err(|e| {
-            WhisperSubsError::SttFailed(format!("Failed to parse faster-whisper output: {}", e))
+            MpvSttPluginRsError::SttFailed(format!("Failed to parse faster-whisper output: {}", e))
         })
     }
 
@@ -285,7 +285,7 @@ print(json.dumps(result, ensure_ascii=False))
         let audio_str = audio_path
             .as_ref()
             .to_str()
-            .ok_or_else(|| WhisperSubsError::InvalidPath("Invalid audio path".to_string()))?;
+            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid audio path".to_string()))?;
 
         trace!(
             "Running faster-whisper on {} (language: {})",
@@ -315,7 +315,7 @@ print(json.dumps(result, ensure_ascii=False))
         let result = self.run_python_transcribe(&audio_path, device)?;
 
         if self.cancel_generation.load(Ordering::Relaxed) != run_generation {
-            return Err(WhisperSubsError::SttCancelled);
+            return Err(MpvSttPluginRsError::SttCancelled);
         }
 
         let segments = collect_segments(&result)?;
@@ -389,25 +389,25 @@ mod tests {
         assert!(config.flash_attn);
     }
 
-    /// Smoke test for faster-whisper backend (opt-in with env WHISPERSUBS_E2E_FAST_WHISPER=1).
+    /// Smoke test for faster-whisper backend (opt-in with env MPV_STT_PLUGIN_RS_E2E_FAST_WHISPER=1).
     /// Requires Python + faster-whisper installed.
     #[test]
     #[cfg(any(feature = "fast_whisper_cpu", feature = "fast_whisper_cuda"))]
     fn test_fast_whisper_smoke_optional() {
-        if std::env::var("WHISPERSUBS_E2E_FAST_WHISPER").is_err() {
+        if std::env::var("MPV_STT_PLUGIN_RS_E2E_FAST_WHISPER").is_err() {
             eprintln!(
-                "skipping fast_whisper smoke test (set WHISPERSUBS_E2E_FAST_WHISPER=1 to run)"
+                "skipping fast_whisper smoke test (set MPV_STT_PLUGIN_RS_E2E_FAST_WHISPER=1 to run)"
             );
             return;
         }
 
         // Prepare audio: use external file if provided, otherwise synthesize silence WAV.
         let dir = tempdir().expect("tempdir");
-        let audio_path = if let Ok(path) = std::env::var("WHISPERSUBS_E2E_AUDIO_FILE") {
+        let audio_path = if let Ok(path) = std::env::var("MPV_STT_PLUGIN_RS_E2E_AUDIO_FILE") {
             PathBuf::from(path)
         } else {
             let wav_path = dir.path().join("silence.wav");
-            let audio_ms: u32 = std::env::var("WHISPERSUBS_E2E_AUDIO_MS")
+            let audio_ms: u32 = std::env::var("MPV_STT_PLUGIN_RS_E2E_AUDIO_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3_000);
@@ -426,7 +426,8 @@ mod tests {
             wav_path
         };
 
-        let model = std::env::var("WHISPERSUBS_E2E_MODEL").unwrap_or_else(|_| "tiny".to_string());
+        let model =
+            std::env::var("MPV_STT_PLUGIN_RS_E2E_MODEL").unwrap_or_else(|_| "tiny".to_string());
         let build_start = Instant::now();
         let mut runner = WhisperRunner::new(
             WhisperConfig::new(model)
