@@ -468,25 +468,18 @@ impl PluginState {
         // Look-ahead processing for network streams (always enabled)
         // Check how far ahead playback is from processing
         if let Some(playback_pos_ms) = self.last_playback_pos_ms {
-            let ahead = if self.current_pos_ms > playback_pos_ms {
+            let _ahead = if self.current_pos_ms > playback_pos_ms {
                 self.current_pos_ms - playback_pos_ms
             } else {
                 0
             };
 
-            // Don't process too far ahead of playback
-            if ahead > self.config.seek.lookahead_limit_ms {
-                trace!(
-                    "Look-ahead limit reached: {}ms ahead, waiting for playback to catch up",
-                    ahead
-                );
-                return;
-            }
+            // No lookahead limit; we rely on cache availability below
         }
 
         let max_chunk_ms = chunk_ms;
         let first_chunk_ms = max_chunk_ms;
-        let chunks_to_process = self.config.seek.lookahead_chunks.max(1);
+        let chunks_to_process = self.config.prefetch.lookahead_chunks.max(1);
         for i in 0..chunks_to_process {
             if self.check_seek(client) {
                 return;
@@ -570,23 +563,6 @@ impl PluginState {
         // Check for completed translations from async queue
         self.process_translation_results(client, Some(subtitle_path));
 
-        // Check if we're too far ahead of playback (look-ahead limit, always enabled)
-        if let Some(playback_pos_ms) = self.last_playback_pos_ms {
-            let ahead = if self.current_pos_ms > playback_pos_ms {
-                self.current_pos_ms - playback_pos_ms
-            } else {
-                0
-            };
-
-            if ahead > self.config.seek.lookahead_limit_ms {
-                trace!(
-                    "Look-ahead limit reached: {}ms ahead, waiting for playback to catch up",
-                    ahead
-                );
-                return; // Wait for playback to catch up
-            }
-        }
-
         // Calculate remaining time
         let time_left = if file_length_ms > self.current_pos_ms {
             file_length_ms - self.current_pos_ms
@@ -604,7 +580,7 @@ impl PluginState {
 
         if time_left > 0 {
             // Look-ahead processing: process multiple chunks ahead (always enabled)
-            let chunks_to_process = self.config.seek.lookahead_chunks.max(1);
+            let chunks_to_process = self.config.prefetch.lookahead_chunks.max(1);
 
             for i in 0..chunks_to_process {
                 if self.check_seek(client) {

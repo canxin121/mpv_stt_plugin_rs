@@ -51,7 +51,7 @@ pub struct Config {
     pub chunk: ChunkConfig,
     pub timeout: TimeoutConfig,
     pub playback: PlaybackConfig,
-    pub seek: SeekConfig,
+    pub prefetch: PrefetchConfig,
     pub network: NetworkConfig,
 }
 
@@ -63,7 +63,7 @@ impl Default for Config {
             chunk: ChunkConfig::default(),
             timeout: TimeoutConfig::default(),
             playback: PlaybackConfig::default(),
-            seek: SeekConfig::default(),
+            prefetch: PrefetchConfig::default(),
             network: NetworkConfig::default(),
         }
     }
@@ -199,16 +199,14 @@ impl Default for PlaybackConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SeekConfig {
+pub struct PrefetchConfig {
     pub lookahead_chunks: usize,
-    pub lookahead_limit_ms: u64,
 }
 
-impl Default for SeekConfig {
+impl Default for PrefetchConfig {
     fn default() -> Self {
         Self {
             lookahead_chunks: 2,
-            lookahead_limit_ms: 60_000,
         }
     }
 }

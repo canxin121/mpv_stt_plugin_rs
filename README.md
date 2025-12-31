@@ -111,9 +111,8 @@ show_progress = true   # 在 mpv OSD 显示进度
 save_srt = true        # 保存 SRT 到文件
 auto_start = false     # 自动启动（默认关闭）
 
-[seek]
+[prefetch]
 lookahead_chunks = 2           # 预读块数：提前处理的片段数量
-lookahead_limit_ms = 60000     # 预读限制：最多提前处理的时间
 
 [network]
 # 网络流缓存（可选，单位字节）
