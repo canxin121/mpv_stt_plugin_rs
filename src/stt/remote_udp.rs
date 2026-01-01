@@ -27,6 +27,15 @@ const OPUS_SET_APPLICATION_REQUEST: c_int = 4000;
 const OPUS_APPLICATION_VOIP: c_int = 2048;
 
 #[cfg(feature = "stt_remote_udp")]
+unsafe extern "C" {
+    fn mpv_stt_ope_set_packet_callback(
+        enc: *mut opusenc::OggOpusEnc,
+        cb: opusenc::ope_packet_func,
+        user_data: *mut c_void,
+    ) -> c_int;
+}
+
+#[cfg(feature = "stt_remote_udp")]
 fn ope_error_message(code: c_int) -> String {
     unsafe {
         let ptr = opusenc::ope_strerror(code);
@@ -137,9 +146,8 @@ impl OpusEncHandle {
 
     fn set_packet_callback(&mut self, sink: *mut PacketSink) -> Result<()> {
         let ret = unsafe {
-            opusenc::ope_encoder_ctl(
+            mpv_stt_ope_set_packet_callback(
                 self.ptr.as_ptr(),
-                opusenc::OPE_SET_PACKET_CALLBACK_REQUEST as c_int,
                 Some(opusenc_packet_cb),
                 sink as *mut c_void,
             )
@@ -446,15 +454,26 @@ impl RemoteUdpBackend {
                     MpvSttPluginRsError::SttFailed(format!("Failed to read samples: {}", e))
                 })?;
 
-            let mut sink = PacketSink::new();
+            if samples.len() > i32::MAX as usize {
+                return Err(MpvSttPluginRsError::SttFailed(format!(
+                    "Unsupported WAV length: {} samples (max {})",
+                    samples.len(),
+                    i32::MAX
+                )));
+            }
+
+            // Pin the sink on the heap so the callback sees a stable address.
+            let mut sink = Box::new(PacketSink::new());
+            let sink_ptr: *mut PacketSink = &mut *sink;
             let mut encoder = OpusEncHandle::new(16000, 1)?;
-            encoder.set_packet_callback(&mut sink)?;
+            encoder.set_packet_callback(sink_ptr)?;
             encoder.set_application(OPUS_APPLICATION_VOIP)?;
             encoder.write_samples(&samples)?;
             encoder.drain()?;
 
             let mut compressed = Vec::new();
-            for packet in sink.packets {
+            let packets = std::mem::take(&mut sink.packets);
+            for packet in packets {
                 compressed.extend_from_slice(&(packet.len() as u32).to_le_bytes());
                 compressed.extend_from_slice(&packet);
             }

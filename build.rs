@@ -4,6 +4,15 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-env-changed=MPV_LIB_DIR");
     println!("cargo:rerun-if-env-changed=MPV_PREFIX");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STT_REMOTE_UDP");
+
+    if env::var("CARGO_FEATURE_STT_REMOTE_UDP").is_ok() {
+        println!("cargo:rerun-if-changed=src/opusenc_shim.c");
+        cc::Build::new()
+            .file("src/opusenc_shim.c")
+            .compile("opusenc_shim");
+    }
+
     let target = env::var("TARGET").unwrap_or_default();
     if !target.contains("android") {
         return;
