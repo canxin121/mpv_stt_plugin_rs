@@ -4,13 +4,13 @@ use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::util::mathematics::rescale;
 use ffmpeg::util::mathematics::rescale::Rescale;
 use ffmpeg_next as ffmpeg;
-use tracing::{debug, trace};
 use std::path::Path;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
+use tracing::{debug, trace};
 
 static FFMPEG_INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
@@ -372,7 +372,10 @@ impl AudioExtractor {
         check_timeout(start_time, self.ffprobe_timeout, "ffprobe")?;
 
         let has_audio = ictx.streams().best(ffmpeg::media::Type::Audio).is_some();
-        trace!(path = path_str, has_audio, "checked whether the file carries audio");
+        trace!(
+            path = path_str,
+            has_audio, "checked whether the file carries audio"
+        );
         Ok(has_audio)
     }
 }

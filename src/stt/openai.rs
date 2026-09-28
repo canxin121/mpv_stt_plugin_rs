@@ -1,7 +1,6 @@
 use super::{BackendKind, SttBackend, SttDeviceNotice};
 use crate::common::{MpvSttError, Result};
 use crate::srt::{SrtFile, SubtitleEntry, Timestamp};
-use tracing::{debug, trace, warn};
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -11,6 +10,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
+use tracing::{debug, trace, warn};
 
 pub type SttOpenAiConfig = crate::config::SttOpenAiConfig;
 
@@ -85,12 +85,11 @@ impl OpenAiBackend {
 
         // The audio extractor always produces 16 kHz mono 16-bit PCM WAV; the
         // OpenAI endpoint accepts it as-is (the server resamples if needed).
-        let audio_data = std::fs::read(&audio_path).map_err(|e| {
-            MpvSttError::MalformedResponse {
+        let audio_data =
+            std::fs::read(&audio_path).map_err(|e| MpvSttError::MalformedResponse {
                 server: "local WAV".to_string(),
                 context: format!("cannot read {audio_str}: {e}"),
-            }
-        })?;
+            })?;
         if audio_data.is_empty() {
             return Err(MpvSttError::MalformedResponse {
                 server: "local WAV".to_string(),
@@ -249,12 +248,13 @@ impl OpenAiBackend {
         }
         let endpoint = format!("{}/v1/audio/transcriptions", self.server_url);
         let request_future = async {
-            let response = request.send().await.map_err(|e| {
-                MpvSttError::TranslationRequest {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| MpvSttError::TranslationRequest {
                     url: endpoint.clone(),
                     source: e,
-                }
-            })?;
+                })?;
             let status = response.status();
             if !status.is_success() {
                 let text = response
@@ -268,12 +268,14 @@ impl OpenAiBackend {
                 });
             }
 
-            response.bytes().await.map(|bytes| bytes.to_vec()).map_err(|e| {
-                MpvSttError::MalformedResponse {
+            response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| MpvSttError::MalformedResponse {
                     server: endpoint.clone(),
                     context: format!("cannot read the response body: {e}"),
-                }
-            })
+                })
         };
         let data = tokio::select! {
             result = request_future => result?,

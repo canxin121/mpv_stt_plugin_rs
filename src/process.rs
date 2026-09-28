@@ -1,8 +1,8 @@
 use crate::common::{MpvSttError, Result};
 use std::fmt::Write as _;
-use tracing::{debug, trace};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
+use tracing::{debug, trace};
 use wait_timeout::ChildExt;
 
 fn format_cmd_for_error(label: &str) -> String {

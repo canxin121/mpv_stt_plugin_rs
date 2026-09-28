@@ -1,8 +1,8 @@
-use tracing::{debug, trace};
 use crate::common::Result;
 use crate::srt::{SrtFile, SubtitleEntry, Timestamp};
 use std::collections::BTreeMap;
 use std::path::Path;
+use tracing::{debug, trace};
 
 /// Manages subtitles in memory and syncs to disk
 pub struct SubtitleManager {
@@ -26,7 +26,10 @@ impl SubtitleManager {
 
     /// Add multiple entries from an SRT file
     pub fn add_from_srt(&mut self, srt: &SrtFile) {
-        trace!(entries = srt.entries.len(), "merging an SRT file into the manager");
+        trace!(
+            entries = srt.entries.len(),
+            "merging an SRT file into the manager"
+        );
         for entry in &srt.entries {
             let start_ms = Self::timestamp_to_millis(entry.start_time);
             self.entries.insert(start_ms, entry.clone());

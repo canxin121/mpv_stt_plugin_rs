@@ -44,10 +44,7 @@ pub enum MpvSttError {
 
     /// A response body that was expected to be JSON (or a known shape) was not.
     #[error("Malformed response from {server}: {context}")]
-    MalformedResponse {
-        server: String,
-        context: String,
-    },
+    MalformedResponse { server: String, context: String },
 
     #[error("Audio extraction failed: {0}")]
     AudioExtractionFailed(String),

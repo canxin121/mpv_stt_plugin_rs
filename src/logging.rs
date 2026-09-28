@@ -33,10 +33,10 @@ use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Span, Subscriber};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+use tracing_subscriber::fmt as tsfmt;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::fmt as tsfmt;
 
 /// Where the file sink writes when the config says `file = "auto"`.
 pub const DEFAULT_LOG_FILE_NAME: &str = "mpv_stt_plugin_rs.log";
@@ -143,9 +143,13 @@ impl LogSettings {
         let env_filter = std::env::var(LOG_ENV).ok().filter(|s| !s.trim().is_empty());
 
         let level = config.level.trim();
-        let filter = env_filter
-            .clone()
-            .unwrap_or_else(|| if level.is_empty() { "info".into() } else { level.into() });
+        let filter = env_filter.clone().unwrap_or_else(|| {
+            if level.is_empty() {
+                "info".into()
+            } else {
+                level.into()
+            }
+        });
 
         // The file keeps more than the terminal on purpose: the terminal is for
         // watching, the file is for diagnosing after the fact.
@@ -373,11 +377,7 @@ fn scope(directives: &str) -> String {
 ///
 /// `W: for<'w> MakeWriter<'w>` rather than a concrete writer so the same
 /// function serves stderr and the rotating appender.
-fn event_layer<S, W>(
-    format: LogFormat,
-    writer: W,
-    ansi: bool,
-) -> Box<dyn Layer<S> + Send + Sync>
+fn event_layer<S, W>(format: LogFormat, writer: W, ansi: bool) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
     W: for<'w> tsfmt::MakeWriter<'w> + Send + Sync + 'static,
@@ -462,7 +462,9 @@ pub fn format_osd_notices(notices: &[OsdNotice]) -> Vec<String> {
     let mut out: Vec<(Level, String, usize)> = Vec::new();
     for notice in notices {
         match out.last_mut() {
-            Some((level, message, count)) if *level == notice.level && *message == notice.message => {
+            Some((level, message, count))
+                if *level == notice.level && *message == notice.message =>
+            {
                 *count += 1;
             }
             _ => out.push((notice.level, notice.message.clone(), 1)),
@@ -628,7 +630,13 @@ pub fn session_span(session: u64, media: &str, duration_ms: u64, mode: &str) -> 
 ///
 /// `gen` is the backend's cancellation generation, which is what tells a
 /// superseded chunk apart from a live one when both appear in the log.
-pub fn chunk_span(session: u64, seq: u64, start_ms: u64, duration_ms: u64, generation: u64) -> Span {
+pub fn chunk_span(
+    session: u64,
+    seq: u64,
+    start_ms: u64,
+    duration_ms: u64,
+    generation: u64,
+) -> Span {
     tracing::debug_span!(
         "chunk",
         session,
@@ -710,8 +718,7 @@ mod tests {
         let _guard = OSD_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // Drain anything a previous test left behind.
         let _ = take_osd_notices();
-        let subscriber =
-            tracing_subscriber::registry().with(OsdLayer::new(build_filter("info")));
+        let subscriber = tracing_subscriber::registry().with(OsdLayer::new(build_filter("info")));
         tracing::subscriber::with_default(subscriber, f);
         take_osd_notices()
     }
@@ -814,13 +821,17 @@ mod tests {
         let notices = with_osd_layer(|| {
             tracing::debug!(display = %osd_line("a debug line"), "debug with display");
         });
-        assert!(notices.is_empty(), "debug never reaches the screen: {notices:?}");
+        assert!(
+            notices.is_empty(),
+            "debug never reaches the screen: {notices:?}"
+        );
     }
 
     #[test]
     fn osd_notice_is_one_bounded_line() {
         let long = format!("上游返回了很长的错误 {}\n第二行", "x".repeat(400));
-        let notices = with_osd_layer(|| tracing::warn!(display = %osd_line(&long), "a long failure"));
+        let notices =
+            with_osd_layer(|| tracing::warn!(display = %osd_line(&long), "a long failure"));
         assert_eq!(notices.len(), 1);
         let message = &notices[0].message;
         assert!(
@@ -899,8 +910,14 @@ mod tests {
         });
         let written = buffer.contents();
         assert!(written.contains("merged chunk"), "{written}");
-        assert!(written.contains("chunk=3"), "fields must be rendered: {written}");
-        assert!(!written.contains('\u{1b}'), "no ANSI codes in a plain writer");
+        assert!(
+            written.contains("chunk=3"),
+            "fields must be rendered: {written}"
+        );
+        assert!(
+            !written.contains('\u{1b}'),
+            "no ANSI codes in a plain writer"
+        );
     }
 
     #[cfg(not(target_os = "android"))]
@@ -988,7 +1005,9 @@ mod tests {
             ..LogConfig::default()
         };
         let settings = LogSettings::from_config(&config, None);
-        let sink = settings.file.expect("an explicit path always yields a sink");
+        let sink = settings
+            .file
+            .expect("an explicit path always yields a sink");
         assert_eq!(sink.dir, PathBuf::from("/var/log"));
         assert_eq!(sink.stem, "stt.log");
 

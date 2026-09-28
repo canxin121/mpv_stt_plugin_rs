@@ -3,7 +3,6 @@ use crate::common::{MpvSttError, Result};
 use crate::crypto::{AuthToken, EncryptionKey};
 use crate::srt::SrtFile;
 use libc;
-use tracing::{debug, trace, warn};
 use opusic_sys as opus;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -13,6 +12,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant, SystemTime};
+use tracing::{debug, trace, warn};
 
 pub type SttFerrumConfig = crate::config::SttFerrumConfig;
 
@@ -282,10 +282,13 @@ impl FerrumBackend {
             .body(payload);
         let endpoint = format!("{}/transcribe", self.server_url);
         let request_future = async {
-            let response = request.send().await.map_err(|e| MpvSttError::TranslationRequest {
-                url: endpoint.clone(),
-                source: e,
-            })?;
+            let response = request
+                .send()
+                .await
+                .map_err(|e| MpvSttError::TranslationRequest {
+                    url: endpoint.clone(),
+                    source: e,
+                })?;
             let status = response.status();
             if !status.is_success() {
                 let text = response

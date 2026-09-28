@@ -1,8 +1,8 @@
 use crate::common::Result;
-use tracing::debug;
 use crate::config::SttConfig;
 use std::path::Path;
 use std::sync::{Arc, atomic::AtomicU64};
+use tracing::debug;
 
 pub use crate::config::BackendKind;
 

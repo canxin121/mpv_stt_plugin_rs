@@ -1,5 +1,5 @@
-use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use crate::common::{MpvSttError, Result};
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce, aead::Aead};
 use sha2::{Digest, Sha256};
 
 const NONCE_SIZE: usize = 12;
