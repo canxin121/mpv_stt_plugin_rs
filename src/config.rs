@@ -179,7 +179,9 @@ impl Default for SttFerrumConfig {
 pub struct SttOpenAiConfig {
     /// Base URL of an OpenAI-compatible transcription server, e.g. http://127.0.0.1:8000.
     pub server_addr: String,
-    /// Model id sent in the multipart form, e.g. "sensevoice" or "fun-asr-mlt-nano".
+    /// Model id sent in the multipart form; must be one the server offers —
+    /// subtitle-gateway: "sensevoice" / "fun-asr-mlt-nano", OpenAI:
+    /// "whisper-1", Groq: "whisper-large-v3" / "whisper-large-v3-turbo".
     pub model: String,
     /// Optional language hint (e.g. "ja", "zh", "en").
     pub language: Option<String>,

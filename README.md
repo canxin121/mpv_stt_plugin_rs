@@ -38,7 +38,10 @@ mpv_stt_plugin_rs/
 | Cargo feature | 配置字段 | 协议 |
 |---|---|---|
 | `stt_ferrum` | `[stt.ferrum]` | 自定义 ferrum 协议:raw-body POST `/transcribe`,支持 Opus 压缩 / AES-256-GCM 加密 / 鉴权 / 模型选择(`x-model`)/ 语言提示(`x-language`) |
-| `stt_openai` | `[stt.openai]` | 标准 OpenAI `POST /v1/audio/transcriptions`(multipart),任何兼容服务端可用(如 Groq) |
+| `stt_openai` | `[stt.openai]` | 标准 OpenAI `POST /v1/audio/transcriptions`(multipart),任何兼容服务端可用:本地 subtitle-gateway(`model = "sensevoice"`)、OpenAI(`whisper-1`)、Groq(`whisper-large-v3`) |
+
+> `model` 必须是服务端实际提供的 id,写错会在第一个音频块上报
+> `Server error (404 Not Found): model_not_found`。
 
 两个 feature 默认同时开启;需要单后端专用构建时用 `--no-default-features --features stt_openai`。
 
@@ -168,7 +171,7 @@ backend = "openai"           # openai(默认) | ferrum
 [stt.openai]
 server_addr = "https://api.groq.com/openai"   # 任意 OpenAI 兼容 /v1/audio/transcriptions
 api_key = "..."              # 可选;设置后发 Authorization: Bearer {key}
-model = "whisper-large-v3"   # multipart form 里的 model
+model = "whisper-large-v3"   # multipart form 里的 model;必须是服务端提供的模型
 language = "ja"              # 可选语言提示(ja/zh/en...);省略 = 服务端自动检测
 timeout_ms = 120000
 max_retry = 3
