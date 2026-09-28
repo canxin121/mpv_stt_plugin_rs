@@ -139,9 +139,9 @@ impl Default for SttConfig {
     }
 }
 
-/// Custom "ferrum" protocol backend: postcard-free raw HTTP against a
-/// ferrum-capable server (e.g. subtitle-gateway's /transcribe endpoint), with
-/// optional Opus compression, AES-GCM encryption and token auth.
+/// Custom "ferrum" protocol backend: raw HTTP against a ferrum-capable server
+/// (e.g. subtitle-gateway's /transcribe endpoint), with optional Opus
+/// compression, AES-GCM encryption and token auth.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SttFerrumConfig {
     pub server_addr: String,

@@ -42,6 +42,11 @@ mpv_stt_plugin_rs/
 
 两个 feature 默认同时开启;需要单后端专用构建时用 `--no-default-features --features stt_openai`。
 
+`openai` 后端只发**标准字段**:`file` / `model` / `language` / `response_format=verbose_json`
+/ `timestamp_granularities[]=segment`。分段靠后两个字段(OpenAI 只在 `verbose_json` 下
+返回 `segments` 数组);服务端若忽略它们、只回 `{"text": ...}`,或返回空 `segments`,
+插件就退化成**每个音频块一条字幕**,而不是写一个空 SRT 覆盖已有字幕。
+
 ### 翻译后端
 
 翻译同样走**远程接口**,两种协议**同时编译、运行时选择**(`config.translate.backend`):
@@ -168,6 +173,9 @@ language = "ja"              # 可选语言提示(ja/zh/en...);省略 = 服务�
 timeout_ms = 120000
 max_retry = 3
 
+# 分段时间戳不需要配置:插件固定请求 response_format=verbose_json +
+# timestamp_granularities[]=segment(标准 OpenAI 字段);服务端不支持时自动退化成
+# 每块一条字幕。
 # [stt.ferrum]
 # server_addr = "http://127.0.0.1:8000"
 # model = "sensevoice"       # 通过 x-model header 传给服务端
@@ -228,10 +236,15 @@ demuxer_max_bytes = 0         # 可选;网络流缓存上限
 ./scripts/cargo-with-deps.sh test
 ```
 
-`translate.rs` 里标了 `#[ignore]` 的端到端测试需要本地跑一个 subtitle-gateway:
+`translate.rs` / `stt/openai.rs` 里标了 `#[ignore]` 的端到端测试需要本地跑一个
+subtitle-gateway:
 
 ```bash
 cargo test --lib -- --ignored translate_against_live_gateway
+
+# STT 那条要真实语音(静音 WAV 转写不出内容),用 bench 语料或自己的录音:
+MPV_STT_PLUGIN_RS_LIVE_AUDIO=/path/to/speech.wav \
+  cargo test --lib -- --ignored openai_backend_against_live_server
 ```
 
 ## License
