@@ -1,60 +1,152 @@
 [package]
 name = "mpv_stt_plugin_rs"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+description = "MPV real-time subtitle plugin (pure remote client: ASR + translation via subtitle-gateway)"
+license = "MIT"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# Error handling
 thiserror = "2.0.17"
+
+# Serialization
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.148"
-postcard = { version = "1.1.3", default-features = false, features = [
-    "use-std",
-] }
-figment = { version = "0.10.19", features = ["env", "toml"] }
-directories = "6.0.0"
-tempfile = "3.24.0"
-wait-timeout = "0.2.1"
-parking_lot = "0.12.5"
-srtlib = "0.2.0"
-log = "0.4.29"
-env_logger = "0.11.8"
-mpv-client = "1.1.0"
-translators = { version = "0.1.5", features = ["google", "tokio-async"] }
-tokio = { version = "1.48.0", features = ["rt", "time"] }
-whisper-rs = { version = "0.15.1", optional = true }
-hound = "3.5.1"
-libc = "0.2.178"
-futures = "0.3.31"
-android_logger = "0.15.1"
+
+# Crypto (ferrum protocol AES-256-GCM / auth token)
 aes-gcm = "0.10.3"
 sha2 = "0.10.9"
 rand = "0.9.2"
-libopusenc-static-sys = { git = "https://github.com/canxin121/libopusenc-static-sys", optional = true }
+
+# Logging. `tracing` is the only logging facade the plugin talks to; the
+# subscriber is assembled in `logging.rs`. `tracing-log` is deliberately NOT
+# installed, so records from third-party crates that still use `log`
+# (reqwest/hyper/tokio) are dropped instead of flooding the file sink.
+tracing = { version = "0.1.44", features = ["attributes"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "std",
+    "fmt",
+    "ansi",
+    "env-filter",
+    "registry",
+    "json",
+] }
+tracing-error = "0.2.1"
+
+# Async runtime (translate.rs uses tokio::spawn + channels)
+tokio = { version = "1.48.0", features = ["rt", "net", "time", "macros"] }
+futures = "0.3.31"
+
+# Audio processing
+hound = "3.5.1"
+tempfile = "3.24.0"
+
+# SRT subtitle files
+srtlib = "0.2.0"
+
+# Config
+figment = { version = "0.10.19", features = ["env", "toml"] }
+directories = "6.0.0"
+
+# Process
+wait-timeout = "0.2.1"
+
+# Concurrency
+parking_lot = "0.12.5"
+
+# mpv C API (bindgen-only crate)
+mpv-client = "1.1.0"
+
+libc = "0.2.178"
+
+# stt_ferrum feature: Opus compression + AES encryption support
+hex = { version = "0.4", optional = true }
+opusic-sys = { version = "0.5.8", optional = true }
+
+# Non-optional: used by the DeepL/LibreTranslate-compatible remote translation
+# backends (always compiled in) as well as the stt_ferrum / stt_openai backends.
+reqwest = { version = "0.12.28", default-features = false, features = [
+    "blocking",
+    "json",
+    "multipart",
+    "rustls-tls",
+] }
 
 [build-dependencies]
 cc = "1.1.31"
 
+# Desktop: link against a prebuilt FFmpeg (brew on macOS, BtbN on Linux/Windows).
+# Without the `build` feature, ffmpeg-sys-next uses FFMPEG_DIR / pkg-config
+# instead of compiling FFmpeg from source.
+# Pinned to the fork's master, which handles FFmpeg 9's new side-data enum
+# variants (AV_PKT_DATA_HEVC_CONF, AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5, the
+# IAMF ones). Do NOT float this to the fork's default branch: the fork's
+# origin/HEAD is stale (a v8-era commit whose match arms do not compile against
+# ffmpeg-sys-next 9.x). And do NOT float to ffmpeg-next v9.0.0's own release —
+# its match arms are incomplete for FFmpeg 9 as well.
+
 [target.'cfg(not(target_os = "android"))'.dependencies]
-ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg", features = [
-    "build",
-    "static",
+ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg", rev = "3751e2800d5d2f0215d69031285aadebac5db8fc", features = [
     "software-resampling",
 ] }
+tracing-appender = "0.2.5"
 
+# Android: dynamically link libffmpeg from the prebuilt prefix (FFMPEG_DIR).
 [target.'cfg(target_os = "android")'.dependencies]
-ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg" }
+ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg", rev = "3751e2800d5d2f0215d69031285aadebac5db8fc" }
+# logcat layer. It brings in android_log-sys (`#[link(name = "log")]`), so the
+# crate needs no hand-written `__android_log_write` extern.
+tracing-android = "0.2.0"
+
+# mpv-client 1.1.0 declares `const MPV_FORMAT: u32` while its own bindgen types
+# `mpv_format` as `i32` under MSVC, so it does not build on Windows. The fork
+# types the constants as `ffi::mpv_format` instead and is otherwise the same
+# 1.1.0 source. Patch only `mpv-client`: its inner manifest already path-declares
+# mpv-client-sys, so patching that too would give the same build unit two names.
+[patch.crates-io]
+mpv-client = { path = "third_party/mpv-client/mpv-client" }
 
 [features]
-default = ["stt_local_cpu"]
-stt_local_cpu = ["dep:whisper-rs"]
-stt_local_cuda = ["dep:whisper-rs", "whisper-rs/cuda"]
-stt_remote_udp = ["dep:libopusenc-static-sys"]
+# Pure remote client: both protocols are compiled in, the active one is picked
+# at runtime by the `protocol` of the STT source `[stt] source` names.
+default = ["stt_ferrum", "stt_openai"]
+stt_ferrum = ["dep:hex", "dep:opusic-sys"]
+stt_openai = []
+
+[lints.clippy]
+# The group sits below the individual `allow`s so a listed lint can opt out.
+all = { level = "deny", priority = -1 }
+# Collapsing these hurts more than it helps here: the collapsed form is a
+# longer one-line expression, and several of the sites pair a cheap guard with
+# a body whose comment explains why the two conditions belong together. The
+# nesting is what keeps the shape of the decision readable.
+collapsible_if = "allow"
+# `&x` where `x` is already a reference. The signal is not worth the edit
+# churn: the call sites in question build `&str`/`&Path` for a generic
+# parameter, where the extra `&` is how the code reads best.
+needless_borrows_for_generic_args = "allow"
+# Which of two equivalent forms a small `impl` takes (hand-written vs derived)
+# is not a defect worth failing a build over.
+derivable_impls = "allow"
+# A doc comment belongs to the item below it even when the item is a private
+# helper, and one blank line there is a readability choice, not a bug.
+empty_line_after_doc_comments = "allow"
+# `format!("{}", &x)` in a log field: the `&` is noise, not a mistake, and
+# rewriting every one of them is churn without a correctness payoff.
+useless_borrows_in_formatting = "allow"
+# `if a > b { a - b } else { 0 }` written out where the guard is the point: the
+# branches sit next to the comments explaining the millisecond comparison, and
+# `saturating_sub` would hide which side is the subtrahend.
+implicit_saturating_sub = "allow"
 
 [profile.release]
 opt-level = 3
 lto = true
 codegen-units = 1
+# Keep file/line tables for the panic hook's backtrace while still stripping
+# full symbols. Without this a crash log names functions but no source lines.
+debug = "line-tables-only"
 strip = true

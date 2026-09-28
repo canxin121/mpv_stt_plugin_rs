@@ -1,11 +1,11 @@
-use crate::error::Result;
-use crate::srt::{SrtFile, SubtitleEntry};
-use log::{debug, trace};
-use srtlib::Timestamp;
+use crate::common::Result;
+use crate::srt::{SrtFile, SubtitleEntry, Timestamp};
 use std::collections::BTreeMap;
 use std::path::Path;
+use tracing::{debug, trace};
 
 /// Manages subtitles in memory and syncs to disk
+#[derive(Default)]
 pub struct SubtitleManager {
     /// Subtitles indexed by start time in milliseconds
     entries: BTreeMap<u32, SubtitleEntry>,
@@ -15,8 +15,9 @@ pub struct SubtitleManager {
 impl SubtitleManager {
     pub fn new() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            // SRT cue numbering starts at 1, so an empty manager does too.
             next_index: 1,
+            ..Default::default()
         }
     }
 
@@ -27,12 +28,15 @@ impl SubtitleManager {
 
     /// Add multiple entries from an SRT file
     pub fn add_from_srt(&mut self, srt: &SrtFile) {
-        trace!("Adding {} entries from SRT file", srt.entries.len());
+        trace!(
+            entries = srt.entries.len(),
+            "merging an SRT file into the manager"
+        );
         for entry in &srt.entries {
             let start_ms = Self::timestamp_to_millis(entry.start_time);
             self.entries.insert(start_ms, entry.clone());
         }
-        debug!("Total subtitles in manager: {}", self.entries.len());
+        debug!(total = self.entries.len(), "subtitles in manager");
     }
 
     /// Remove all entries after a given timestamp (for seek backward)
@@ -43,7 +47,7 @@ impl SubtitleManager {
         self.entries.retain(|k, _| *k <= start_ms);
         let removed = before_count - self.entries.len();
         if removed > 0 {
-            debug!("Removed {} entries after {}ms", removed, start_ms);
+            debug!(removed, start_ms, "dropped subtitles after a seek");
         }
     }
 
@@ -55,7 +59,7 @@ impl SubtitleManager {
     /// Update an entry with translation (for async translation)
     pub fn update_translation(&mut self, start_ms: u32, translation: &str) {
         if translation.trim().is_empty() {
-            trace!("Skipping empty translation for entry at {}ms", start_ms);
+            trace!(start_ms, "ignoring an empty translation");
             return;
         }
         if let Some(entry) = self.entries.get_mut(&start_ms) {
@@ -64,10 +68,10 @@ impl SubtitleManager {
             let already_present = entry.text.lines().any(|line| line.trim() == normalized);
             if !already_present {
                 entry.text = format!("{}\n{}", entry.text, translation);
-                trace!("Updated translation for entry at {}ms", start_ms);
+                trace!(start_ms, "attached a translation to a cue");
             }
         } else {
-            debug!("Entry not found for translation update at {}ms", start_ms);
+            debug!(start_ms, "no cue to attach this translation to");
         }
     }
 
@@ -79,12 +83,12 @@ impl SubtitleManager {
 
     /// Write all subtitles to file
     pub fn save_to_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
-        trace!("Saving {} subtitle entries to file", self.entries.len());
+        trace!(entries = self.entries.len(), "writing the merged subtitles");
         let mut srt = SrtFile::new();
 
         // Reindex entries sequentially
         self.next_index = 1;
-        for (_, entry) in self.entries.iter_mut() {
+        for entry in self.entries.values_mut() {
             entry.index = self.next_index;
             srt.append_entry(entry.clone());
             self.next_index += 1;
@@ -127,7 +131,6 @@ impl SubtitleManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use srtlib::Timestamp;
 
     #[test]
     fn test_timestamp_to_millis() {

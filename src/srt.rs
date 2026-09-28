@@ -1,9 +1,12 @@
-use crate::error::{MpvSttPluginRsError, Result};
-use log::{debug, trace};
-use srtlib::{Subtitle, Subtitles, Timestamp};
+use crate::common::{MpvSttError, Result};
+use srtlib::{Subtitle, Subtitles};
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use tracing::{debug, trace};
+
+// Re-export Timestamp for external use
+pub use srtlib::Timestamp;
 
 #[derive(Debug, Clone)]
 pub struct SubtitleEntry {
@@ -14,7 +17,6 @@ pub struct SubtitleEntry {
 }
 
 impl SubtitleEntry {
-    /// Convert from srtlib::Subtitle
     fn from_srtlib(sub: Subtitle) -> Self {
         Self {
             index: sub.num as u32,
@@ -45,21 +47,20 @@ impl fmt::Display for SubtitleEntry {
     }
 }
 
+#[derive(Default)]
 pub struct SrtFile {
     pub entries: Vec<SubtitleEntry>,
 }
 
 impl SrtFile {
     pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn parse<P: AsRef<Path>>(path: P) -> Result<Self> {
-        trace!("Parsing SRT file: {}", path.as_ref().display());
+        trace!(path = %path.as_ref().display(), "parsing an SRT file");
         let subs = Subtitles::parse_from_file(path.as_ref(), None)
-            .map_err(|e| MpvSttPluginRsError::InvalidSrt(e.to_string()))?;
+            .map_err(|e| MpvSttError::InvalidSrt(e.to_string()))?;
 
         let entries: Vec<SubtitleEntry> = subs
             .to_vec()
@@ -67,13 +68,13 @@ impl SrtFile {
             .map(SubtitleEntry::from_srtlib)
             .collect();
 
-        debug!("Parsed SRT file with {} entries", entries.len());
+        debug!(entries = entries.len(), "parsed an SRT file");
         Ok(Self { entries })
     }
 
     pub fn parse_content(content: &str) -> Result<Self> {
         let subs = Subtitles::parse_from_str(content.to_string())
-            .map_err(|e| MpvSttPluginRsError::InvalidSrt(e.to_string()))?;
+            .map_err(|e| MpvSttError::InvalidSrt(e.to_string()))?;
 
         let entries: Vec<SubtitleEntry> = subs
             .to_vec()
@@ -85,10 +86,10 @@ impl SrtFile {
     }
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        trace!("Saving SRT file to: {}", path.as_ref().display());
+        trace!(path = %path.as_ref().display(), "writing an SRT file");
         let content = self.to_string();
         fs::write(path, content)?;
-        debug!("Saved SRT file with {} entries", self.entries.len());
+        debug!(entries = self.entries.len(), "wrote an SRT file");
         Ok(())
     }
 
@@ -117,25 +118,23 @@ impl fmt::Display for SrtFile {
     }
 }
 
-/// Offset all timestamps in an SRT file by a given number of milliseconds
 pub fn offset_srt_file<P: AsRef<Path>>(
     input_path: P,
     output_path: P,
     offset_ms: i64,
 ) -> Result<()> {
-    trace!("Offsetting SRT timestamps by {}ms", offset_ms);
+    trace!(offset_ms, "shifting SRT timestamps");
     let mut subs = Subtitles::parse_from_file(input_path.as_ref(), None)
-        .map_err(|e| MpvSttPluginRsError::InvalidSrt(e.to_string()))?;
+        .map_err(|e| MpvSttError::InvalidSrt(e.to_string()))?;
 
-    // srtlib uses i64 milliseconds for add_milliseconds
     for sub in &mut subs {
         sub.add_milliseconds(offset_ms);
     }
 
     subs.write_to_file(output_path.as_ref(), None)
         .map_err(|e| match e {
-            srtlib::ParsingError::IOError(io_err) => MpvSttPluginRsError::Io(io_err),
-            _ => MpvSttPluginRsError::InvalidSrt(e.to_string()),
+            srtlib::ParsingError::IOError(io_err) => MpvSttError::Io(io_err),
+            _ => MpvSttError::InvalidSrt(e.to_string()),
         })?;
 
     Ok(())

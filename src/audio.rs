@@ -1,30 +1,30 @@
-use crate::error::{MpvSttPluginRsError, Result};
+use crate::common::{MpvSttError, Result};
 use ffmpeg::format::Sample;
 use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::util::mathematics::rescale;
 use ffmpeg::util::mathematics::rescale::Rescale;
 use ffmpeg_next as ffmpeg;
-use log::{debug, trace};
 use std::path::Path;
 use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Duration, Instant};
+use tracing::{debug, trace};
 
 static FFMPEG_INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
 fn ensure_ffmpeg() -> Result<()> {
     match FFMPEG_INIT.get_or_init(|| ffmpeg::init().map_err(|e| e.to_string())) {
         Ok(()) => Ok(()),
-        Err(err) => Err(MpvSttPluginRsError::AudioExtractionFailed(format!(
+        Err(err) => Err(MpvSttError::AudioExtractionFailed(format!(
             "ffmpeg init failed: {err}"
         ))),
     }
 }
 
-fn ffmpeg_err(context: &str, err: impl std::fmt::Display) -> MpvSttPluginRsError {
-    MpvSttPluginRsError::AudioExtractionFailed(format!("{context}: {err}"))
+fn ffmpeg_err(context: &str, err: impl std::fmt::Display) -> MpvSttError {
+    MpvSttError::AudioExtractionFailed(format!("{context}: {err}"))
 }
 
 fn check_timeout(start: Instant, timeout: Duration, label: &str) -> Result<()> {
@@ -32,7 +32,7 @@ fn check_timeout(start: Instant, timeout: Duration, label: &str) -> Result<()> {
         return Ok(());
     }
     if start.elapsed() > timeout {
-        return Err(MpvSttPluginRsError::ProcessTimeout(format!(
+        return Err(MpvSttError::ProcessTimeout(format!(
             "{label} timed out after {}ms",
             timeout.as_millis()
         )));
@@ -48,6 +48,19 @@ fn output_channel_layout(channels: u8) -> ffmpeg::channel_layout::ChannelLayout 
     }
 }
 
+/// Decoded frames may carry an UNSPEC channel order (empty mask), e.g. WAV
+/// files without an explicit channel mask. FFmpeg 9's `swr_convert_frame`
+/// strict-compares the frame layout against the configured source layout and
+/// returns `AVERROR_INPUT_CHANGED` on any mismatch. Normalize the frame layout
+/// to a concrete one derived from the channel count so it matches the
+/// resampler configuration.
+fn normalize_frame_layout(frame: &mut ffmpeg::frame::Audio) {
+    if frame.channel_layout().is_empty() {
+        frame.set_channel_layout(output_channel_layout(frame.channels() as u8));
+    }
+}
+
+#[derive(Clone)]
 pub struct AudioExtractor {
     output_sample_rate: u32,
     output_channels: u8,
@@ -93,7 +106,7 @@ impl AudioExtractor {
 
     fn check_cancel(&self, generation: u64) -> Result<()> {
         if self.cancel_generation.load(Ordering::Relaxed) != generation {
-            return Err(MpvSttPluginRsError::AudioExtractionCancelled);
+            return Err(MpvSttError::AudioExtractionCancelled);
         }
         Ok(())
     }
@@ -113,18 +126,18 @@ impl AudioExtractor {
         let input_str = input_path
             .as_ref()
             .to_str()
-            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid input path".to_string()))?;
+            .ok_or_else(|| MpvSttError::InvalidPath("Invalid input path".to_string()))?;
         let output_str = output_path
             .as_ref()
             .to_str()
-            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid output path".to_string()))?;
+            .ok_or_else(|| MpvSttError::InvalidPath("Invalid output path".to_string()))?;
 
         trace!(
-            "Extracting audio: {}ms-{}ms from {} -> {}",
             start_ms,
-            start_ms + duration_ms,
-            input_str,
-            output_str
+            end_ms = start_ms + duration_ms,
+            input = input_str,
+            output = output_str,
+            "extracting audio with ffmpeg"
         );
 
         let cancel_generation = Arc::clone(&self.cancel_generation);
@@ -144,7 +157,7 @@ impl AudioExtractor {
         if start_ms > 0 {
             let position = (start_ms as i64).rescale((1, 1000), rescale::TIME_BASE);
             if let Err(err) = ictx.seek(position, ..position) {
-                trace!("ffmpeg seek failed, falling back to decode+skip: {err}");
+                trace!(error = %err, "ffmpeg seek failed; decoding from the start and skipping");
             } else {
                 seeked = true;
             }
@@ -154,7 +167,7 @@ impl AudioExtractor {
             .streams()
             .best(ffmpeg::media::Type::Audio)
             .ok_or_else(|| {
-                MpvSttPluginRsError::AudioExtractionFailed("No audio stream found".to_string())
+                MpvSttError::AudioExtractionFailed("No audio stream found".to_string())
             })?;
         let stream_index = input_stream.index();
 
@@ -166,11 +179,32 @@ impl AudioExtractor {
             .audio()
             .map_err(|e| ffmpeg_err("audio decoder failed", e))?;
 
+        // Containers with a coarse index (MPEG-PS, MPEG-TS) seek to a keyframe
+        // before the requested position, so the demuxer hands the decoder
+        // packets that belong to the old timeline. Without a flush the codec
+        // keeps its pre-seek state and rejects the first packets after the
+        // seek with "Invalid data found when processing input", which aborts
+        // the whole extraction.
+        if seeked {
+            decoder.flush();
+        }
+
         let output_layout = output_channel_layout(self.output_channels);
         let output_format = Sample::I16(SampleType::Packed);
+
+        // The decoder is not opened yet, so its `channel_layout()` may carry an
+        // empty mask (channels > 0 but layout unknown). FFmpeg 9's swr compares
+        // this against the decoded frame's layout and fails with
+        // AVERROR_INPUT_CHANGED. Derive a concrete source layout from the
+        // channel count instead, so it matches the frames once decoded.
+        let src_layout = if decoder.channel_layout().is_empty() {
+            output_channel_layout(decoder.channels() as u8)
+        } else {
+            decoder.channel_layout()
+        };
         let mut resampler = ffmpeg::software::resampling::Context::get(
             decoder.format(),
-            decoder.channel_layout(),
+            src_layout,
             decoder.rate() as u32,
             output_format,
             output_layout,
@@ -209,20 +243,35 @@ impl AudioExtractor {
 
             check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
             self.check_cancel(run_generation)?;
-            decoder
-                .send_packet(&packet)
-                .map_err(|e| ffmpeg_err("send packet failed", e))?;
+            if let Err(err) = decoder.send_packet(&packet) {
+                // Containers with a coarse index (MPEG-PS above all) seek to a
+                // point that is not a packet boundary, so the demuxer hands the
+                // decoder a truncated first packet. One malformed packet is not
+                // worth aborting a chunk the user is waiting on: drop it and
+                // keep reading, which is what ffmpeg's own CLI does. Every other
+                // error still fails the extraction.
+                if err == ffmpeg::Error::InvalidData {
+                    trace!(
+                        pos = packet.pts(),
+                        "skipping a malformed packet after the seek"
+                    );
+                    continue;
+                }
+                return Err(ffmpeg_err("send packet failed", err));
+            }
 
             while decoder.receive_frame(&mut decoded).is_ok() {
                 check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
                 self.check_cancel(run_generation)?;
+
+                normalize_frame_layout(&mut decoded);
 
                 let mut resampled = ffmpeg::frame::Audio::empty();
                 let _ = resampler
                     .run(&decoded, &mut resampled)
                     .map_err(|e| ffmpeg_err("resample failed", e))?;
 
-                let frames = resampled.samples() as usize;
+                let frames = resampled.samples();
                 if frames == 0 {
                     continue;
                 }
@@ -230,7 +279,7 @@ impl AudioExtractor {
                 let data = resampled.data(0);
                 let sample_count = data.len() / std::mem::size_of::<i16>();
                 if sample_count < frames * channels {
-                    return Err(MpvSttPluginRsError::AudioExtractionFailed(
+                    return Err(MpvSttError::AudioExtractionFailed(
                         "resampled frame shorter than expected".to_string(),
                     ));
                 }
@@ -271,12 +320,15 @@ impl AudioExtractor {
             while decoder.receive_frame(&mut decoded).is_ok() {
                 check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
                 self.check_cancel(run_generation)?;
+
+                normalize_frame_layout(&mut decoded);
+
                 let mut resampled = ffmpeg::frame::Audio::empty();
                 let _ = resampler
                     .run(&decoded, &mut resampled)
                     .map_err(|e| ffmpeg_err("resample failed", e))?;
 
-                let frames = resampled.samples() as usize;
+                let frames = resampled.samples();
                 if frames == 0 {
                     continue;
                 }
@@ -284,7 +336,7 @@ impl AudioExtractor {
                 let data = resampled.data(0);
                 let sample_count = data.len() / std::mem::size_of::<i16>();
                 if sample_count < frames * channels {
-                    return Err(MpvSttPluginRsError::AudioExtractionFailed(
+                    return Err(MpvSttError::AudioExtractionFailed(
                         "resampled frame shorter than expected".to_string(),
                     ));
                 }
@@ -317,12 +369,12 @@ impl AudioExtractor {
         self.check_cancel(run_generation)?;
         writer.finalize()?;
         if target_frames > 0 && written_frames == 0 {
-            return Err(MpvSttPluginRsError::AudioExtractionFailed(
+            return Err(MpvSttError::AudioExtractionFailed(
                 "no audio samples decoded".to_string(),
             ));
         }
 
-        debug!("Audio extraction completed successfully");
+        debug!(frames = written_frames, "audio extraction finished");
         Ok(())
     }
 
@@ -336,14 +388,17 @@ impl AudioExtractor {
         let path_str = path
             .as_ref()
             .to_str()
-            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid path".to_string()))?;
+            .ok_or_else(|| MpvSttError::InvalidPath("Invalid path".to_string()))?;
 
         let start_time = Instant::now();
         let ictx = ffmpeg::format::input(&path).map_err(|e| ffmpeg_err("open input failed", e))?;
         check_timeout(start_time, self.ffprobe_timeout, "ffprobe")?;
 
         let has_audio = ictx.streams().best(ffmpeg::media::Type::Audio).is_some();
-        trace!("validate_audio({}): {}", path_str, has_audio);
+        trace!(
+            path = path_str,
+            has_audio, "checked whether the file carries audio"
+        );
         Ok(has_audio)
     }
 }
@@ -351,6 +406,20 @@ impl AudioExtractor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    /// Every container `scripts/gen-test-media.sh` derives from the committed
+    /// clip. The list lives here as well as in the script because the test is
+    /// what has to notice a container regressing; the script only has to build
+    /// them.
+    const CONTAINERS: [&str; 11] = [
+        "mp4", "mkv", "mov", "avi", "webm", "ts", "flv", "wmv", "mpg", "mp3", "m4a",
+    ];
+
+    /// The clip's speech peaks around -9 dBFS, an all-silent track is digital
+    /// silence. Anything above this is unambiguously the real audio rather than
+    /// a demuxer that handed back an empty track.
+    const SILENCE_PEAK: i16 = 500;
 
     #[test]
     fn test_audio_extractor_new() {
@@ -364,5 +433,99 @@ mod tests {
         let extractor = AudioExtractor::default();
         assert_eq!(extractor.output_sample_rate, 16000);
         assert_eq!(extractor.output_channels, 1);
+    }
+
+    /// Peak absolute sample of a WAV written by the extractor.
+    fn peak_of(path: &Path) -> i16 {
+        let mut reader = hound::WavReader::open(path).expect("open extracted WAV");
+        reader
+            .samples::<i16>()
+            .map(|s| s.expect("read sample").unsigned_abs() as i16)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Length of an extracted WAV in milliseconds.
+    fn duration_ms_of(path: &Path) -> u64 {
+        let reader = hound::WavReader::open(path).expect("open extracted WAV");
+        let spec = reader.spec();
+        u64::from(reader.duration()) * 1000 / u64::from(spec.sample_rate)
+    }
+
+    /// The same Japanese speech, muxed into every container the plugin is
+    /// likely to be handed, must extract to the same thing: five seconds of
+    /// 16 kHz mono audio that is not silence. A container that demuxes to an
+    /// empty track produces no subtitles at all, and an `Ok` return hides it.
+    ///
+    /// The clip is `testdata/ja_all.mp4`; the matrix comes from
+    /// `scripts/gen-test-media.sh` (build artifact, so it is not in the repo):
+    ///
+    ///   ./scripts/gen-test-media.sh
+    ///   ./scripts/cargo-with-deps.sh test --lib -- --ignored audio_extraction_covers_every_container
+    ///
+    /// Without the generated matrix the test reports and passes, so running
+    /// every `#[ignore]`d test on a fresh checkout does not fail.
+    #[test]
+    #[ignore = "needs the container matrix from scripts/gen-test-media.sh"]
+    fn audio_extraction_covers_every_container() {
+        let media_dir = std::env::var_os("MPV_STT_PLUGIN_RS_TEST_MEDIA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/testmedia"));
+
+        if !media_dir.is_dir() {
+            eprintln!(
+                "skipping: {} is missing; run scripts/gen-test-media.sh first",
+                media_dir.display()
+            );
+            return;
+        }
+
+        // 55 s in lands inside the longest clip, clear of the 0.8 s silence
+        // gaps that separate the source clips. Seeking there exercises the
+        // `start_ms > 0` branch, including the fall-back to decoding from the
+        // start when a container cannot seek.
+        let mid_start_ms = 55_000;
+        let window_ms = 5_000;
+
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let extractor = AudioExtractor::default();
+
+        for container in CONTAINERS {
+            let media = media_dir.join(format!("ja_all.{container}"));
+            assert!(media.is_file(), "{container}: missing {}", media.display());
+
+            assert!(
+                extractor.validate_audio(&media).unwrap_or(false),
+                "{container}: validate_audio did not find an audio stream"
+            );
+
+            for (label, start_ms) in [("head", 0), ("mid", mid_start_ms)] {
+                let wav = dir.path().join(format!("{container}-{label}.wav"));
+                extractor
+                    .extract_audio_segment(&media, &wav, start_ms, window_ms)
+                    .unwrap_or_else(|e| {
+                        panic!("{container}/{label}: extract at {start_ms} ms failed: {e}")
+                    });
+
+                let spec = hound::WavReader::open(&wav)
+                    .expect("open extracted WAV")
+                    .spec();
+                assert_eq!(spec.sample_rate, 16_000, "{container}/{label}: sample rate");
+                assert_eq!(spec.channels, 1, "{container}/{label}: channels");
+
+                let peak = peak_of(&wav);
+                assert!(
+                    peak > SILENCE_PEAK,
+                    "{container}/{label}: extracted {window_ms} ms starting at {start_ms} ms \
+                     came back silent (peak {peak}); the demuxer found no audio"
+                );
+
+                let duration = duration_ms_of(&wav);
+                assert!(
+                    duration.abs_diff(window_ms) < 400,
+                    "{container}/{label}: expected ~{window_ms} ms, got {duration} ms"
+                );
+            }
+        }
     }
 }
