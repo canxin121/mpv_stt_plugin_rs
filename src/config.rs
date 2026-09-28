@@ -4,44 +4,37 @@ use figment::{
     providers::{Env, Format, Serialized, Toml},
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::PathBuf;
 use tracing::warn;
 
-/// Which remote STT backend to use at runtime. The plugin is a pure remote
-/// client: both backends are compiled in, and this key selects the active one
-/// (no compile-time feature exclusivity).
+/// Wire protocol an STT source speaks. The plugin is a pure remote client:
+/// both protocols are compiled in, and a source's `protocol` picks which one
+/// its requests use.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum BackendKind {
+pub enum SttProtocol {
     Ferrum,
     OpenAi,
 }
 
-impl Default for BackendKind {
-    fn default() -> Self {
-        BackendKind::OpenAi
-    }
-}
-
-impl std::fmt::Display for BackendKind {
+impl std::fmt::Display for SttProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self {
-            BackendKind::Ferrum => "ferrum",
-            BackendKind::OpenAi => "openai",
+            SttProtocol::Ferrum => "ferrum",
+            SttProtocol::OpenAi => "openai",
         };
         write!(f, "{label}")
     }
 }
 
-/// Which translation backend to use at runtime. Every backend is compiled in
-/// (no feature exclusivity); this key selects the active one. Mirrors
-/// `BackendKind` for the STT backends.
+/// Wire protocol a translation source speaks. Every protocol is compiled in
+/// (no feature exclusivity); a source's `protocol` picks which one its
+/// requests use. Mirrors `SttProtocol` for the STT side.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum TranslateBackendKind {
-    /// Try the built-in free sources in order, first success wins.
-    Auto,
+pub enum TranslateSourceProtocol {
     /// Built-in free source: Google's web translate endpoint.
     Google,
     /// Built-in free source: Microsoft Edge's translate endpoint.
@@ -54,21 +47,14 @@ pub enum TranslateBackendKind {
     LibreTranslate,
 }
 
-impl Default for TranslateBackendKind {
-    fn default() -> Self {
-        TranslateBackendKind::Auto
-    }
-}
-
-impl std::fmt::Display for TranslateBackendKind {
+impl std::fmt::Display for TranslateSourceProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self {
-            TranslateBackendKind::Auto => "auto",
-            TranslateBackendKind::Google => "google",
-            TranslateBackendKind::Edge => "edge",
-            TranslateBackendKind::Alibaba => "alibaba",
-            TranslateBackendKind::DeepL => "deepl",
-            TranslateBackendKind::LibreTranslate => "libretranslate",
+            TranslateSourceProtocol::Google => "google",
+            TranslateSourceProtocol::Edge => "edge",
+            TranslateSourceProtocol::Alibaba => "alibaba",
+            TranslateSourceProtocol::DeepL => "deepl",
+            TranslateSourceProtocol::LibreTranslate => "libretranslate",
         };
         write!(f, "{label}")
     }
@@ -177,113 +163,160 @@ impl Default for LogConfig {
     }
 }
 
+/// `[stt]`: which declared source is active, and the sources themselves.
+///
+/// Sources are declared as a map so a name is written exactly once
+/// (`[stt.sources.groq]`), and the same protocol can be declared any number of
+/// times with different servers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SttConfig {
-    /// Runtime backend selector: which of the compiled remote backends is active.
-    pub backend: BackendKind,
-    pub ferrum: Option<SttFerrumConfig>,
-    pub openai: Option<SttOpenAiConfig>,
+    /// Name of the source to use. Empty = the only declared one, which is why
+    /// a single-source config needs no `source` line at all.
+    pub source: String,
+    /// Declared sources, keyed by name. `BTreeMap` so error messages and log
+    /// lines list them in a stable order.
+    pub sources: BTreeMap<String, SttSourceConfig>,
+}
+
+impl SttConfig {
+    /// The name of the source the selector resolves to, or the reason it does
+    /// not resolve. Kept here (not in `stt`) so both the runner and the tests
+    /// see the same wording.
+    pub fn active_source_name(&self) -> Result<&str, String> {
+        let declared = || {
+            if self.sources.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.sources.keys().cloned().collect::<Vec<_>>().join(", ")
+            }
+        };
+        if !self.source.is_empty() {
+            return self
+                .sources
+                .contains_key(&self.source)
+                .then_some(self.source.as_str())
+                .ok_or_else(|| {
+                    format!(
+                        "STT has no source named {:?}; declared: {}",
+                        self.source,
+                        declared()
+                    )
+                });
+        }
+        match self.sources.len() {
+            0 => Err("STT has no source declared; add [stt.sources.<name>]".to_string()),
+            1 => Ok(self.sources.keys().next().map(String::as_str).unwrap_or("")),
+            n => Err(format!(
+                "STT has {n} sources but no [stt] source selected; declared: {}",
+                declared()
+            )),
+        }
+    }
 }
 
 impl Default for SttConfig {
     fn default() -> Self {
         Self {
-            backend: BackendKind::default(),
-            ferrum: Some(SttFerrumConfig::default()),
-            openai: Some(SttOpenAiConfig::default()),
+            source: String::new(),
+            sources: BTreeMap::new(),
         }
     }
 }
 
-/// Custom "ferrum" protocol backend: raw HTTP against a ferrum-capable server
-/// (e.g. subtitle-gateway's /transcribe endpoint), with optional Opus
-/// compression, AES-GCM encryption and token auth.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SttFerrumConfig {
-    pub server_addr: String,
-    /// Model id sent via the `x-model` header, e.g. "sensevoice" or "fun-asr-mlt-nano".
-    pub model: String,
-    /// Optional language hint sent via the `x-language` header (e.g. "ja",
-    /// "zh", "en"); `None` = server auto-detects.
+/// One declared STT source. The fields are the union of what both protocols
+/// read; `protocol` decides which of them the request actually uses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SttSourceConfig {
+    /// Which wire protocol this source speaks. Required: STT ships no built-in
+    /// source, so nothing here can be inferred from the name alone.
+    pub protocol: Option<SttProtocol>,
+    /// Base URL of the transcription server, e.g. `http://127.0.0.1:8000`
+    /// (OpenAI-compatible) or `http://127.0.0.1:9000` (ferrum).
+    pub server_addr: Option<String>,
+    /// Model id. `openai` sends it as the multipart `model` field, `ferrum` as
+    /// the `x-model` header. Must be one the server offers — subtitle-gateway:
+    /// "sensevoice" / "fun-asr-mlt-nano", OpenAI: "whisper-1", Groq:
+    /// "whisper-large-v3" / "whisper-large-v3-turbo".
+    pub model: Option<String>,
+    /// Optional language hint (e.g. "ja", "zh", "en"); omitted = server
+    /// auto-detects. `openai` sends it as the multipart `language` field,
+    /// `ferrum` as the `x-language` header.
     pub language: Option<String>,
-    pub timeout_ms: u64,
-    pub max_retry: usize,
-    /// Enable Opus compression to reduce network payload size.
-    pub use_opus: bool,
-    pub enable_encryption: bool,
-    pub encryption_key: String,
-    pub auth_secret: String,
-}
-
-impl Default for SttFerrumConfig {
-    fn default() -> Self {
-        Self {
-            server_addr: "http://127.0.0.1:9000".to_string(),
-            model: "sensevoice".to_string(),
-            language: None,
-            timeout_ms: 120_000,
-            max_retry: 3,
-            use_opus: true,
-            enable_encryption: false,
-            encryption_key: String::new(),
-            auth_secret: String::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SttOpenAiConfig {
-    /// Base URL of an OpenAI-compatible transcription server, e.g. http://127.0.0.1:8000.
-    pub server_addr: String,
-    /// Model id sent in the multipart form; must be one the server offers —
-    /// subtitle-gateway: "sensevoice" / "fun-asr-mlt-nano", OpenAI:
-    /// "whisper-1", Groq: "whisper-large-v3" / "whisper-large-v3-turbo".
-    pub model: String,
-    /// Optional language hint (e.g. "ja", "zh", "en").
-    pub language: Option<String>,
-    /// Optional API key sent as `Authorization: Bearer {key}` for servers that
-    /// require auth (e.g. OpenAI-hosted or any key-gated compatible service).
-    /// `None` omits the header (local subtitle-gateway needs no key).
+    /// Optional API key. `openai` sends `Authorization: Bearer {key}` for
+    /// servers that require auth; omitted for a local gateway that needs none.
     pub api_key: Option<String>,
-    pub timeout_ms: u64,
-    pub max_retry: usize,
+    pub timeout_ms: Option<u64>,
+    pub max_retry: Option<usize>,
+    /// `ferrum` only: Opus compression to reduce network payload size.
+    pub use_opus: Option<bool>,
+    /// `ferrum` only: AES-GCM encryption of the request payload.
+    pub enable_encryption: Option<bool>,
+    /// `ferrum` only: passphrase for `enable_encryption`.
+    pub encryption_key: Option<String>,
+    /// `ferrum` only: shared secret for the `x-auth-token` header.
+    pub auth_secret: Option<String>,
 }
 
-impl Default for SttOpenAiConfig {
-    fn default() -> Self {
-        Self {
-            server_addr: "http://127.0.0.1:8000".to_string(),
-            model: "sensevoice".to_string(),
-            language: None,
-            api_key: None,
-            timeout_ms: 120_000,
-            max_retry: 3,
+impl SttSourceConfig {
+    /// The fields the OpenAI protocol reads, with the shipped defaults filled
+    /// in for anything the source left out.
+    pub fn openai(&self) -> crate::stt::SttOpenAiConfig {
+        crate::stt::SttOpenAiConfig {
+            server_addr: self
+                .server_addr
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:8000".to_string()),
+            model: self
+                .model
+                .clone()
+                .unwrap_or_else(|| "sensevoice".to_string()),
+            language: self.language.clone(),
+            api_key: self.api_key.clone(),
+            timeout_ms: self.timeout_ms.unwrap_or(120_000),
+            max_retry: self.max_retry.unwrap_or(3),
+        }
+    }
+
+    /// The fields the ferrum protocol reads, with the shipped defaults filled
+    /// in. A ferrum source carries the auth/encryption knobs verbatim: the
+    /// protocol itself talks raw-body POST, Opus and AES-GCM, so nothing is
+    /// inferred from the name.
+    pub fn ferrum(&self) -> crate::stt::SttFerrumConfig {
+        crate::stt::SttFerrumConfig {
+            server_addr: self
+                .server_addr
+                .clone()
+                .unwrap_or_else(|| "http://127.0.0.1:9000".to_string()),
+            model: self
+                .model
+                .clone()
+                .unwrap_or_else(|| "sensevoice".to_string()),
+            language: self.language.clone(),
+            timeout_ms: self.timeout_ms.unwrap_or(120_000),
+            max_retry: self.max_retry.unwrap_or(3),
+            use_opus: self.use_opus.unwrap_or(true),
+            enable_encryption: self.enable_encryption.unwrap_or(false),
+            encryption_key: self.encryption_key.clone().unwrap_or_default(),
+            auth_secret: self.auth_secret.clone().unwrap_or_default(),
         }
     }
 }
 
+/// `[translate]`: which declared (or built-in) source is active, plus any
+/// sources the user declares on top of the built-in ones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslateConfig {
     pub from_lang: String,
     pub to_lang: String,
     pub concurrency: usize,
-    /// Runtime backend selector: which of the compiled translation backends is
-    /// active (`auto` | `google` | `edge` | `alibaba` | `deepl` |
-    /// `libretranslate`). `auto` walks the built-in free sources in order.
-    pub backend: TranslateBackendKind,
-    /// DeepL-compatible translation service base URL (e.g. the subtitle-gateway
-    /// gateway at its default port 8000, or an upstream DeepL-compatible API).
-    pub server_addr: String,
-    /// Optional API key, sent as `Authorization: DeepL-Auth-Key {key}`.
-    pub api_key: String,
-    /// LibreTranslate backend (only read when `backend = "libretranslate"`).
-    pub libretranslate: Option<TranslateLibreTranslateConfig>,
-    /// Built-in free source: Google (read when `backend` is `google` or `auto`).
-    pub google: Option<TranslateGoogleConfig>,
-    /// Built-in free source: Microsoft Edge (`edge` or `auto`).
-    pub edge: Option<TranslateEdgeConfig>,
-    /// Built-in free source: Alibaba (`alibaba` or `auto`).
-    pub alibaba: Option<TranslateAlibabaConfig>,
+    /// Name of the source to use, or `auto` to walk the built-in free sources
+    /// (`google_free` → `edge_free` → `alibaba_free`) until one answers.
+    pub source: String,
+    /// Declared sources, keyed by name. Naming a built-in source here (e.g.
+    /// `[translate.sources.edge_free]`) overrides just the fields written; the
+    /// rest stay at the built-in values. `auto` is reserved and cannot be
+    /// declared.
+    pub sources: BTreeMap<String, TranslateSourceConfig>,
 }
 
 impl Default for TranslateConfig {
@@ -292,91 +325,26 @@ impl Default for TranslateConfig {
             from_lang: "en".to_string(),
             to_lang: "zh".to_string(),
             concurrency: 4,
-            backend: TranslateBackendKind::default(),
-            server_addr: "http://127.0.0.1:8000".to_string(),
-            api_key: String::new(),
-            libretranslate: Some(TranslateLibreTranslateConfig::default()),
-            google: Some(TranslateGoogleConfig::default()),
-            edge: Some(TranslateEdgeConfig::default()),
-            alibaba: Some(TranslateAlibabaConfig::default()),
+            source: "auto".to_string(),
+            sources: BTreeMap::new(),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranslateLibreTranslateConfig {
-    /// LibreTranslate-compatible service base URL.
-    pub server_addr: String,
-    /// Optional API key, sent in the request body as `api_key`.
-    pub api_key: String,
-}
-
-impl Default for TranslateLibreTranslateConfig {
-    fn default() -> Self {
-        Self {
-            server_addr: "http://127.0.0.1:8000".to_string(),
-            api_key: String::new(),
-        }
-    }
-}
-
-/// Built-in free source. The endpoint is baked into the `Default`, so the
-/// `[translate.google]` section normally stays unwritten; it exists to point
-/// the source at a different host.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranslateGoogleConfig {
-    /// Base URL of Google's web translate endpoint.
-    pub server_addr: String,
-    /// Reserved; not sent on the query string.
-    pub api_key: String,
-}
-
-impl Default for TranslateGoogleConfig {
-    fn default() -> Self {
-        Self {
-            server_addr: "https://clients5.google.com".to_string(),
-            api_key: String::new(),
-        }
-    }
-}
-
-/// Built-in free source. Microsoft's endpoint also accepts an API key, which
-/// switches the request onto the official channel.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranslateEdgeConfig {
-    /// Base URL of Microsoft Edge's translate endpoint.
-    pub server_addr: String,
-    /// Optional key; when set the request carries it.
-    pub api_key: String,
-}
-
-impl Default for TranslateEdgeConfig {
-    fn default() -> Self {
-        Self {
-            server_addr: "https://edge.microsoft.com".to_string(),
-            api_key: String::new(),
-        }
-    }
-}
-
-/// Built-in free source. The endpoint is baked into the `Default`, so the
-/// `[translate.alibaba]` section normally stays unwritten.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TranslateAlibabaConfig {
-    /// Base URL of translate.alibaba.com (the token and translate calls hang
-    /// off it).
-    pub server_addr: String,
-    /// Reserved; not sent on the request.
-    pub api_key: String,
-}
-
-impl Default for TranslateAlibabaConfig {
-    fn default() -> Self {
-        Self {
-            server_addr: "https://translate.alibaba.com".to_string(),
-            api_key: String::new(),
-        }
-    }
+/// One declared translation source. Every field is optional so that overriding
+/// a built-in source is a one-liner: `[translate.sources.edge_free]` with only
+/// `api_key` keeps the built-in host.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TranslateSourceConfig {
+    /// Wire protocol. Required unless the name is one of the built-in ones,
+    /// which already imply a protocol.
+    pub protocol: Option<TranslateSourceProtocol>,
+    /// Base URL, e.g. `https://api-free.deepl.com`. Defaults to the built-in
+    /// host for a built-in name, else to `http://127.0.0.1:8000`.
+    pub server_addr: Option<String>,
+    /// Optional API key: `deepl` sends it as `Authorization: DeepL-Auth-Key`,
+    /// `libretranslate` in the body, `edge` as `Ocp-Apim-Subscription-Key`.
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

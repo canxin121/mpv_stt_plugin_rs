@@ -1,5 +1,6 @@
-use super::{BackendKind, SttBackend, SttDeviceNotice};
+use super::{SttBackend, SttDeviceNotice};
 use crate::common::{MpvSttError, Result};
+use crate::config::SttProtocol;
 use crate::srt::{SrtFile, SubtitleEntry, Timestamp};
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
@@ -12,7 +13,24 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, trace, warn};
 
-pub type SttOpenAiConfig = crate::config::SttOpenAiConfig;
+/// The OpenAI protocol's own fields, as resolved from a named source.
+#[derive(Debug, Clone, Default)]
+pub struct SttOpenAiConfig {
+    /// Base URL of an OpenAI-compatible transcription server, e.g. http://127.0.0.1:8000.
+    pub server_addr: String,
+    /// Model id sent in the multipart form; must be one the server offers —
+    /// subtitle-gateway: "sensevoice" / "fun-asr-mlt-nano", OpenAI:
+    /// "whisper-1", Groq: "whisper-large-v3" / "whisper-large-v3-turbo".
+    pub model: String,
+    /// Optional language hint (e.g. "ja", "zh", "en").
+    pub language: Option<String>,
+    /// Optional API key sent as `Authorization: Bearer {key}` for servers that
+    /// require auth (e.g. OpenAI-hosted or any key-gated compatible service).
+    /// `None` omits the header (local subtitle-gateway needs no key).
+    pub api_key: Option<String>,
+    pub timeout_ms: u64,
+    pub max_retry: usize,
+}
 
 /// OpenAI-compatible backend: posts 16 kHz mono PCM WAV chunks to
 /// `POST {server}/v1/audio/transcriptions` (multipart form) and turns the
@@ -382,8 +400,8 @@ fn normalize_server_url(raw: &str) -> String {
 }
 
 impl SttBackend for OpenAiBackend {
-    fn kind(&self) -> BackendKind {
-        BackendKind::OpenAi
+    fn protocol(&self) -> SttProtocol {
+        SttProtocol::OpenAi
     }
 
     fn transcribe<P: AsRef<Path>>(

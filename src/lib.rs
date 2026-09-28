@@ -17,8 +17,8 @@ pub use crate::logging::{LogFormat, LogSettings, install_panic_hook};
 pub use crate::srt::{SrtFile, SubtitleEntry};
 pub use audio::AudioExtractor;
 pub use config::{
-    BackendKind, Config, InferenceDevice, LogConfig, TranslateAlibabaConfig, TranslateBackendKind,
-    TranslateEdgeConfig, TranslateGoogleConfig, TranslateLibreTranslateConfig,
+    Config, InferenceDevice, LogConfig, SttProtocol, SttSourceConfig, TranslateSourceConfig,
+    TranslateSourceProtocol,
 };
 #[cfg(feature = "stt_ferrum")]
 pub use stt::SttFerrumConfig;
@@ -26,4 +26,4 @@ pub use stt::SttFerrumConfig;
 pub use stt::SttOpenAiConfig;
 pub use stt::{SttBackend, SttRunner};
 pub use subtitle_manager::SubtitleManager;
-pub use translate::{Translator, TranslatorConfig};
+pub use translate::{ResolvedSource, Translator, TranslatorConfig};

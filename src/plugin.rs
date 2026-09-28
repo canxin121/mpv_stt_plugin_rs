@@ -357,16 +357,16 @@ impl PluginState {
             .with_ffmpeg_timeout(config.timeout.ffmpeg_ms)
             .with_ffprobe_timeout(config.timeout.ffprobe_ms);
 
-        // Initialize the STT backend chosen at runtime by [stt] backend key.
-        // Both remote backends are compiled in; `from_config` matches the
-        // `config.stt.backend` enum to the active one.
+        // Initialize the STT backend of the source named by `[stt] source`.
+        // Both remote protocols are compiled in; `from_config` resolves the
+        // name and matches the source's protocol to the active backend.
         let stt_runner = SttRunner::from_config(&config.stt)?;
         let transcription_worker = TranscriptionWorker::new(audio_extractor, stt_runner);
         let paths = TempPaths::new()?;
 
         // Initialize async translation queue (always enabled)
         let async_translation_queue = Some(AsyncTranslationQueue::new(
-            Self::build_translator_config(&config),
+            Self::build_translator_config(&config)?,
         ));
 
         Ok(Self {
@@ -402,39 +402,29 @@ impl PluginState {
         })
     }
 
-    fn build_translator_config(config: &Config) -> TranslatorConfig {
-        let default_libretranslate = crate::config::TranslateLibreTranslateConfig::default();
-        let libretranslate = config
-            .translate
-            .libretranslate
-            .as_ref()
-            .unwrap_or(&default_libretranslate);
-        let default_google = crate::config::TranslateGoogleConfig::default();
-        let google = config.translate.google.as_ref().unwrap_or(&default_google);
-        let default_edge = crate::config::TranslateEdgeConfig::default();
-        let edge = config.translate.edge.as_ref().unwrap_or(&default_edge);
-        let default_alibaba = crate::config::TranslateAlibabaConfig::default();
-        let alibaba = config
-            .translate
-            .alibaba
-            .as_ref()
-            .unwrap_or(&default_alibaba);
-
-        TranslatorConfig::new(
+    fn build_translator_config(config: &Config) -> crate::common::Result<TranslatorConfig> {
+        // Every declared source is resolved up front, so a typo in one of them
+        // fails at startup with a message naming the offending source rather
+        // than on the first cue that happens to use it.
+        let mut translator = TranslatorConfig::new(
             config.translate.from_lang.clone(),
             config.translate.to_lang.clone(),
         )
-        .with_backend(config.translate.backend)
         .with_timeout_ms(config.timeout.translate_ms)
         .with_concurrency(config.translate.concurrency)
-        .with_server_addr(config.translate.server_addr.clone())
-        .with_api_key(config.translate.api_key.clone())
-        .with_libretranslate_server_addr(libretranslate.server_addr.clone())
-        .with_libretranslate_api_key(libretranslate.api_key.clone())
-        .with_google_server_addr(google.server_addr.clone())
-        .with_edge_server_addr(edge.server_addr.clone())
-        .with_edge_api_key(edge.api_key.clone())
-        .with_alibaba_server_addr(alibaba.server_addr.clone())
+        .with_source(config.translate.source.clone());
+
+        for (name, declared) in &config.translate.sources {
+            translator = translator.with_source_config(name, declared)?;
+        }
+
+        // The active selector is resolved too: a name that matches nothing is
+        // a configuration error, not something to discover mid-session.
+        if translator.source != crate::translate::AUTO_SOURCE {
+            translator.active_source()?;
+        }
+
+        Ok(translator)
     }
 
     fn local_chunk_size(&self) -> u64 {
@@ -1868,8 +1858,10 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
         // The effective configuration, field by field. Never the whole
         // `Config`: it carries API keys, encryption keys and auth secrets.
         info!(
-            backend = %config.stt.backend,
-            translate_backend = %config.translate.backend,
+            stt_source = %config.stt.source,
+            stt_sources = %config.stt.sources.keys().cloned().collect::<Vec<_>>().join(","),
+            translate_source = %config.translate.source,
+            translate_sources = %config.translate.sources.keys().cloned().collect::<Vec<_>>().join(","),
             translate = %format!("{}->{}", config.translate.from_lang, config.translate.to_lang),
             local_chunk_ms = config.chunk.local_ms,
             network_chunk_ms = config.chunk.network_ms,
@@ -2141,12 +2133,27 @@ mod tests {
         }
     }
 
+    /// A config with one declared STT source. The plugin refuses to start
+    /// without one, so every test that builds a `PluginState` needs this.
+    fn test_config() -> Config {
+        let mut config = Config::default();
+        config.stt.sources.insert(
+            "local".to_string(),
+            crate::config::SttSourceConfig {
+                protocol: Some(crate::config::SttProtocol::OpenAi),
+                server_addr: Some("http://127.0.0.1:8000".to_string()),
+                ..Default::default()
+            },
+        );
+        config
+    }
+
     /// A cue whose translation was given up on must not be offered to the
     /// backend again, and the user must be able to retry explicitly (toggle /
     /// clear cache) once the backend is back.
     #[test]
     fn failed_translations_are_not_requeued_until_explicitly_reset() {
-        let mut state = PluginState::new(Config::default()).unwrap();
+        let mut state = PluginState::new(test_config()).unwrap();
 
         assert!(!state.translation_failed(1_000));
         state.failed_translations.insert(1_000);
@@ -2167,7 +2174,7 @@ mod tests {
     /// slate, so a stale give-up cannot mute the next media's subtitles.
     #[test]
     fn stopping_a_session_clears_translation_failures() {
-        let mut state = PluginState::new(Config::default()).unwrap();
+        let mut state = PluginState::new(test_config()).unwrap();
         state.failed_translations.insert(1_000);
         state.translation_failure_reported = true;
 
@@ -2179,7 +2186,7 @@ mod tests {
 
     #[test]
     fn stopping_a_session_does_not_permanently_shutdown_the_plugin() {
-        let mut state = PluginState::new(Config::default()).unwrap();
+        let mut state = PluginState::new(test_config()).unwrap();
         state.running = true;
         state.mode = Some(ProcessingMode::Network);
 
@@ -2230,10 +2237,16 @@ mod tests {
         writer.finalize().unwrap();
 
         let mut config = Config::default();
-        let openai = config.stt.openai.as_mut().unwrap();
-        openai.server_addr = format!("http://{addr}");
-        openai.timeout_ms = 30_000;
-        openai.max_retry = 1;
+        config.stt.sources.insert(
+            "stub".to_string(),
+            crate::config::SttSourceConfig {
+                protocol: Some(crate::config::SttProtocol::OpenAi),
+                server_addr: Some(format!("http://{addr}")),
+                timeout_ms: Some(30_000),
+                max_retry: Some(1),
+                ..Default::default()
+            },
+        );
         let audio = AudioExtractor::default().with_ffmpeg_timeout(5_000);
         let stt = SttRunner::from_config(&config.stt).unwrap();
         let mut worker = TranscriptionWorker::new(audio, stt);

@@ -1,6 +1,6 @@
 use crate::audio::AudioExtractor;
-use crate::config::TranslateBackendKind;
-use crate::translate::{Translator, TranslatorConfig};
+use crate::config::TranslateSourceProtocol;
+use crate::translate::{ResolvedSource, Translator, TranslatorConfig};
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -43,15 +43,15 @@ pub extern "C" fn translator_init(from_lang: *const c_char, to_lang: *const c_ch
         let from_lang = c_str_to_string(from_lang).unwrap_or_else(|| "auto".to_string());
         let to_lang = c_str_to_string(to_lang).unwrap_or_else(|| "en".to_string());
 
+        let source = ResolvedSource::builtin("deepl");
         debug!(
             from_lang = %from_lang,
             to_lang = %to_lang,
-            backend = "deepl",
-            server = "default",
+            source = %source,
+            server = %source.server_addr,
             "translator initialized via FFI"
         );
-        let config =
-            TranslatorConfig::new(from_lang, to_lang).with_backend(TranslateBackendKind::DeepL);
+        let config = TranslatorConfig::new(from_lang, to_lang).with_source(source.name.clone());
         let translator = Translator::new(config);
         *translator_state().lock() = Some(translator);
         0
@@ -77,14 +77,19 @@ pub extern "C" fn translator_init_remote(
         debug!(
             from_lang = %from_lang,
             to_lang = %to_lang,
-            backend = "deepl",
+            source = "deepl",
             server = %server_addr,
             "translator initialized via FFI"
         );
         let config = TranslatorConfig::new(from_lang, to_lang)
-            .with_backend(TranslateBackendKind::DeepL)
-            .with_server_addr(server_addr)
-            .with_api_key(api_key);
+            .with_source("deepl")
+            .with_source_addr(
+                "deepl",
+                TranslateSourceProtocol::DeepL,
+                server_addr,
+                api_key,
+            )
+            .expect("the deepl protocol is always resolvable");
         let translator = Translator::new(config);
         *translator_state().lock() = Some(translator);
         0
@@ -111,14 +116,19 @@ pub extern "C" fn translator_init_libretranslate(
         debug!(
             from_lang = %from_lang,
             to_lang = %to_lang,
-            backend = "libretranslate",
+            source = "libretranslate",
             server = %server_addr,
             "translator initialized via FFI"
         );
         let config = TranslatorConfig::new(from_lang, to_lang)
-            .with_backend(TranslateBackendKind::LibreTranslate)
-            .with_libretranslate_server_addr(server_addr)
-            .with_libretranslate_api_key(api_key);
+            .with_source("libretranslate")
+            .with_source_addr(
+                "libretranslate",
+                TranslateSourceProtocol::LibreTranslate,
+                server_addr,
+                api_key,
+            )
+            .expect("the libretranslate protocol is always resolvable");
         let translator = Translator::new(config);
         *translator_state().lock() = Some(translator);
         0

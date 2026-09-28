@@ -1,7 +1,8 @@
 use crate::common::{MpvSttError, Result};
-use crate::config::TranslateBackendKind;
+use crate::config::{TranslateSourceConfig, TranslateSourceProtocol};
 use crate::srt::SrtFile;
 use futures::stream::StreamExt;
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{
@@ -15,48 +16,143 @@ use tracing::{debug, trace, warn};
 const MAX_TRANSLATE_RETRIES: usize = 2;
 const RETRY_BASE_DELAY_MS: u64 = 250;
 
-/// Endpoints of the built-in free sources. Kept here (as well as in the config
-/// defaults) so `TranslatorConfig::default()` — used directly by tests and by
-/// the FFI initializers — never ends up with an empty host.
-const GOOGLE_DEFAULT_SERVER: &str = "https://clients5.google.com";
-const EDGE_DEFAULT_SERVER: &str = "https://edge.microsoft.com";
-const ALIBABA_DEFAULT_SERVER: &str = "https://translate.alibaba.com";
+/// Name of the reserved selector value that walks the built-in free sources.
+pub const AUTO_SOURCE: &str = "auto";
 
-/// The built-in free sources, in fallback order. `Auto` walks this.
-const FREE_SOURCES: [TranslateBackendKind; 3] = [
-    TranslateBackendKind::Google,
-    TranslateBackendKind::Edge,
-    TranslateBackendKind::Alibaba,
+/// A built-in source: a name that resolves without being declared, because its
+/// protocol and endpoint are known. `[translate.sources.<name>]` may still be
+/// written to override individual fields.
+struct BuiltinSource {
+    name: &'static str,
+    protocol: TranslateSourceProtocol,
+    server_addr: &'static str,
+}
+
+/// The built-in sources. The first three are the free web endpoints `auto`
+/// walks in order; the last two are the external protocols, which point at a
+/// local service by default so that selecting them needs no address either.
+const BUILTIN_SOURCES: [BuiltinSource; 5] = [
+    BuiltinSource {
+        name: "google_free",
+        protocol: TranslateSourceProtocol::Google,
+        server_addr: "https://clients5.google.com",
+    },
+    BuiltinSource {
+        name: "edge_free",
+        protocol: TranslateSourceProtocol::Edge,
+        server_addr: "https://edge.microsoft.com",
+    },
+    BuiltinSource {
+        name: "alibaba_free",
+        protocol: TranslateSourceProtocol::Alibaba,
+        server_addr: "https://translate.alibaba.com",
+    },
+    BuiltinSource {
+        name: "deepl",
+        protocol: TranslateSourceProtocol::DeepL,
+        server_addr: "http://127.0.0.1:8000",
+    },
+    BuiltinSource {
+        name: "libretranslate",
+        protocol: TranslateSourceProtocol::LibreTranslate,
+        server_addr: "http://127.0.0.1:8000",
+    },
 ];
+
+/// The names `auto` walks, in order: the built-in free sources only. Sources
+/// the user declared are never picked silently by `auto` — using a paid or
+/// self-hosted endpoint has to be an explicit choice.
+const FREE_SOURCE_NAMES: [&str; 3] = ["google_free", "edge_free", "alibaba_free"];
+
+/// Where a protocol points when neither the built-in table nor the source says
+/// otherwise. Only the two external protocols can get here: the free ones have
+/// a host built in, and a non-built-in name must state its protocol anyway.
+fn protocol_default_server(protocol: TranslateSourceProtocol) -> &'static str {
+    match protocol {
+        TranslateSourceProtocol::DeepL | TranslateSourceProtocol::LibreTranslate => {
+            "http://127.0.0.1:8000"
+        }
+        TranslateSourceProtocol::Google => "https://clients5.google.com",
+        TranslateSourceProtocol::Edge => "https://edge.microsoft.com",
+        TranslateSourceProtocol::Alibaba => "https://translate.alibaba.com",
+    }
+}
+
+fn builtin(name: &str) -> Option<&'static BuiltinSource> {
+    BUILTIN_SOURCES.iter().find(|s| s.name == name)
+}
+
+/// Resolve one named source: the declared fields win, the built-in entry (for
+/// a built-in name) fills the gaps, and a name that is neither built-in nor
+/// fully declared is an error rather than a guess.
+pub fn resolve_source(
+    name: &str,
+    declared: Option<&TranslateSourceConfig>,
+) -> Result<ResolvedSource> {
+    let builtin = builtin(name);
+    let empty = TranslateSourceConfig::default();
+    let declared = declared.unwrap_or(&empty);
+
+    let protocol = match declared.protocol.or(builtin.map(|b| b.protocol)) {
+        Some(protocol) => protocol,
+        None => {
+            return Err(MpvSttError::TranslationFailed(format!(
+                "translation source {name:?} is not built-in and has no protocol; \
+                 set protocol to one of: google, edge, alibaba, deepl, libretranslate"
+            )));
+        }
+    };
+    let server_addr = declared
+        .server_addr
+        .clone()
+        .or_else(|| builtin.map(|b| b.server_addr.to_string()))
+        .unwrap_or_else(|| protocol_default_server(protocol).to_string());
+
+    Ok(ResolvedSource {
+        name: name.to_string(),
+        protocol,
+        server_addr,
+        api_key: declared.api_key.clone().unwrap_or_default(),
+    })
+}
+
+/// A source with every field decided: what the request helpers read.
+#[derive(Clone, Debug)]
+pub struct ResolvedSource {
+    pub name: String,
+    pub protocol: TranslateSourceProtocol,
+    pub server_addr: String,
+    pub api_key: String,
+}
+
+impl ResolvedSource {
+    /// A built-in source as it resolves with no override at all. Used by the
+    /// FFI initializers and by tests.
+    pub fn builtin(name: &str) -> Self {
+        resolve_source(name, None).expect("built-in names always resolve")
+    }
+}
+
+impl std::fmt::Display for ResolvedSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.name, self.protocol)
+    }
+}
 
 /// How much of a response body a diagnostics message keeps.
 const BODY_SNIPPET_CHARS: usize = 160;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TranslatorConfig {
     pub from_lang: String,
     pub to_lang: String,
     pub timeout_ms: u64,
     pub concurrency: usize,
-    /// Which translation backend is active.
-    pub backend: TranslateBackendKind,
-    /// DeepL-compatible translation service base URL.
-    pub server_addr: String,
-    /// Optional API key, sent as `Authorization: DeepL-Auth-Key {key}`.
-    pub api_key: String,
-    /// LibreTranslate base URL (only used when `backend == LibreTranslate`).
-    pub libretranslate_server_addr: String,
-    /// Optional API key, sent in the request body as `api_key` (only used for
-    /// LibreTranslate).
-    pub libretranslate_api_key: String,
-    /// Google free source base URL (used by `backend == Google` and by `Auto`).
-    pub google_server_addr: String,
-    /// Edge free source base URL (used by `backend == Edge` and by `Auto`).
-    pub edge_server_addr: String,
-    /// Optional Edge key; when set the request carries it.
-    pub edge_api_key: String,
-    /// Alibaba free source base URL (used by `backend == Alibaba` and by `Auto`).
-    pub alibaba_server_addr: String,
+    /// Name of the active source, or `auto` for the built-in free chain.
+    pub source: String,
+    /// Every source this config can name, already resolved. Built-in names may
+    /// be absent: the resolver falls back to the built-in table for those.
+    pub sources: BTreeMap<String, ResolvedSource>,
 }
 
 impl Default for TranslatorConfig {
@@ -66,15 +162,8 @@ impl Default for TranslatorConfig {
             to_lang: "en".to_string(),
             timeout_ms: 30_000,
             concurrency: 4,
-            backend: TranslateBackendKind::default(),
-            server_addr: "http://127.0.0.1:8000".to_string(),
-            api_key: String::new(),
-            libretranslate_server_addr: "http://127.0.0.1:8000".to_string(),
-            libretranslate_api_key: String::new(),
-            google_server_addr: GOOGLE_DEFAULT_SERVER.to_string(),
-            edge_server_addr: EDGE_DEFAULT_SERVER.to_string(),
-            edge_api_key: String::new(),
-            alibaba_server_addr: ALIBABA_DEFAULT_SERVER.to_string(),
+            source: AUTO_SOURCE.to_string(),
+            sources: BTreeMap::new(),
         }
     }
 }
@@ -98,49 +187,94 @@ impl TranslatorConfig {
         self
     }
 
-    pub fn with_backend(mut self, backend: TranslateBackendKind) -> Self {
-        self.backend = backend;
+    pub fn with_source(mut self, source: impl Into<String>) -> Self {
+        self.source = source.into();
         self
     }
 
-    pub fn with_server_addr(mut self, server_addr: String) -> Self {
-        self.server_addr = server_addr;
-        self
+    /// Declare (or override) a source by name, resolving it as it goes.
+    pub fn with_source_config(
+        mut self,
+        name: &str,
+        declared: &TranslateSourceConfig,
+    ) -> Result<Self> {
+        let resolved = resolve_source(name, Some(declared))?;
+        self.sources.insert(name.to_string(), resolved);
+        Ok(self)
     }
 
-    pub fn with_api_key(mut self, api_key: String) -> Self {
-        self.api_key = api_key;
-        self
+    /// Declare a source that is nothing but a server address — the shape the
+    /// FFI initializers and most tests need.
+    pub fn with_source_addr(
+        self,
+        name: &str,
+        protocol: TranslateSourceProtocol,
+        server_addr: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<Self> {
+        self.with_source_config(
+            name,
+            &TranslateSourceConfig {
+                protocol: Some(protocol),
+                server_addr: Some(server_addr.into()),
+                api_key: Some(api_key.into()),
+            },
+        )
     }
 
-    pub fn with_libretranslate_server_addr(mut self, server_addr: String) -> Self {
-        self.libretranslate_server_addr = server_addr;
-        self
+    /// The active source, or the reason `source` does not name one. `auto` is
+    /// not a source: the free chain resolves each of its members in turn.
+    pub fn active_source(&self) -> Result<ResolvedSource> {
+        if self.source == AUTO_SOURCE {
+            return Err(MpvSttError::TranslationFailed(
+                "auto is not a source; it walks the built-in free sources".to_string(),
+            ));
+        }
+        if let Some(source) = self.sources.get(&self.source) {
+            return Ok(source.clone());
+        }
+        if let Some(builtin) = builtin(&self.source) {
+            return resolve_source(builtin.name, None);
+        }
+        let declared = || {
+            if self.sources.is_empty() {
+                "(none)".to_string()
+            } else {
+                self.sources.keys().cloned().collect::<Vec<_>>().join(", ")
+            }
+        };
+        let builtin_names = BUILTIN_SOURCES
+            .iter()
+            .map(|s| s.name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(MpvSttError::TranslationFailed(format!(
+            "translation source {:?} is not declared; declared: {}; built-in: {}",
+            self.source,
+            declared(),
+            builtin_names
+        )))
     }
 
-    pub fn with_libretranslate_api_key(mut self, api_key: String) -> Self {
-        self.libretranslate_api_key = api_key;
-        self
-    }
-
-    pub fn with_google_server_addr(mut self, server_addr: String) -> Self {
-        self.google_server_addr = server_addr;
-        self
-    }
-
-    pub fn with_edge_server_addr(mut self, server_addr: String) -> Self {
-        self.edge_server_addr = server_addr;
-        self
-    }
-
-    pub fn with_edge_api_key(mut self, api_key: String) -> Self {
-        self.edge_api_key = api_key;
-        self
-    }
-
-    pub fn with_alibaba_server_addr(mut self, server_addr: String) -> Self {
-        self.alibaba_server_addr = server_addr;
-        self
+    /// Install a `source` named `name` pointing at `server_addr`, replacing any
+    /// previous definition. Convenience for the FFI initializers.
+    pub fn set_source(
+        &mut self,
+        name: &str,
+        protocol: TranslateSourceProtocol,
+        server_addr: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> Result<()> {
+        let resolved = resolve_source(
+            name,
+            Some(&TranslateSourceConfig {
+                protocol: Some(protocol),
+                server_addr: Some(server_addr.into()),
+                api_key: Some(api_key.into()),
+            }),
+        )?;
+        self.sources.insert(name.to_string(), resolved);
+        Ok(())
     }
 }
 
@@ -188,7 +322,7 @@ impl Translator {
                 Ok(translated) => return Ok(translated),
                 Err(e) => {
                     warn!(
-                        backend = %self.config.backend,
+                        source = %self.config.source,
                         attempt = attempt + 1,
                         error = %e,
                         cause = %crate::logging::err_chain(&e),
@@ -612,7 +746,7 @@ impl AsyncTranslationQueue {
                     last_error = crate::logging::err_chain(&e);
                     warn!(
                         start_ms = task.start_ms,
-                        backend = %config.backend,
+                        source = %config.source,
                         attempt = attempt + 1,
                         error = %e,
                         cause = %last_error,
@@ -698,15 +832,15 @@ impl Drop for AsyncTranslationQueue {
 /// `Authorization: DeepL-Auth-Key {key}` header. Response
 /// `{"translations": [{"detected_source_language", "text"}]}`.
 
-fn deepl_url(config: &TranslatorConfig) -> String {
-    format!("{}/v1/translate", config.server_addr.trim_end_matches('/'))
+fn deepl_url(source: &ResolvedSource) -> String {
+    format!("{}/v1/translate", source.server_addr.trim_end_matches('/'))
 }
 
-fn deepl_headers(config: &TranslatorConfig) -> reqwest::header::HeaderMap {
+fn deepl_headers(source: &ResolvedSource) -> reqwest::header::HeaderMap {
     let mut headers = reqwest::header::HeaderMap::new();
-    if !config.api_key.is_empty() {
+    if !source.api_key.is_empty() {
         if let Ok(value) =
-            reqwest::header::HeaderValue::from_str(&format!("DeepL-Auth-Key {}", config.api_key))
+            reqwest::header::HeaderValue::from_str(&format!("DeepL-Auth-Key {}", source.api_key))
         {
             headers.insert(reqwest::header::AUTHORIZATION, value);
         }
@@ -770,15 +904,15 @@ fn parse_deepl_response(body: &str, text: &str) -> Result<String> {
 /// Async single-shot DeepL request (used by the async queue worker).
 async fn deepl_translate_async(
     client: &reqwest::Client,
-    config: &TranslatorConfig,
+    source: &ResolvedSource,
     from_lang: &str,
     to_lang: &str,
     text: &str,
 ) -> Result<String> {
-    let url = deepl_url(config);
+    let url = deepl_url(source);
     let response = client
         .post(url.clone())
-        .headers(deepl_headers(config))
+        .headers(deepl_headers(source))
         .json(&deepl_body(from_lang, to_lang, text))
         .send()
         .await
@@ -795,11 +929,8 @@ async fn deepl_translate_async(
 /// does NOT use an Authorization header). Response: single q →
 /// `{"translatedText": "..."}`; array q → `{"translations": [...]}`.
 
-fn libre_url(config: &TranslatorConfig) -> String {
-    format!(
-        "{}/translate",
-        config.libretranslate_server_addr.trim_end_matches('/')
-    )
+fn libre_url(source: &ResolvedSource) -> String {
+    format!("{}/translate", source.server_addr.trim_end_matches('/'))
 }
 
 fn libre_body(from_lang: &str, to_lang: &str, text: &str, api_key: &str) -> serde_json::Value {
@@ -869,20 +1000,15 @@ fn parse_libre_response(body: &str, text: &str) -> Result<String> {
 /// Async single-shot LibreTranslate request (used by the async queue worker).
 async fn libre_translate_async(
     client: &reqwest::Client,
-    config: &TranslatorConfig,
+    source: &ResolvedSource,
     from_lang: &str,
     to_lang: &str,
     text: &str,
 ) -> Result<String> {
-    let url = libre_url(config);
+    let url = libre_url(source);
     let response = client
         .post(url.clone())
-        .json(&libre_body(
-            from_lang,
-            to_lang,
-            text,
-            &config.libretranslate_api_key,
-        ))
+        .json(&libre_body(from_lang, to_lang, text, &source.api_key))
         .send()
         .await
         .map_err(|e| MpvSttError::TranslationRequest { url, source: e })?;
@@ -900,11 +1026,8 @@ async fn libre_translate_async(
 ///
 /// POST is deliberately NOT used: the endpoint answers 429 to form-encoded
 /// POSTs no matter the query, while the equivalent GET works.
-fn google_url(config: &TranslatorConfig) -> String {
-    format!(
-        "{}/translate_a/t",
-        config.google_server_addr.trim_end_matches('/')
-    )
+fn google_url(source: &ResolvedSource) -> String {
+    format!("{}/translate_a/t", source.server_addr.trim_end_matches('/'))
 }
 
 /// `sl` is the pre-normalized source; an empty value means "auto", which this
@@ -991,10 +1114,10 @@ fn parse_google_response(body: &str, text: &str) -> Result<String> {
 /// with a BARE JSON ARRAY of texts as the body (a bare string is rejected with
 /// a 400). Response is one object per input, in order, each carrying
 /// `translations[0].text`.
-fn edge_url(config: &TranslatorConfig) -> String {
+fn edge_url(source: &ResolvedSource) -> String {
     format!(
         "{}/translate/translatetext",
-        config.edge_server_addr.trim_end_matches('/')
+        source.server_addr.trim_end_matches('/')
     )
 }
 
@@ -1061,17 +1184,17 @@ fn parse_edge_response(body: &str, text: &str) -> Result<String> {
 /// carrying it across cues needs a session the plugin does not keep); a stale
 /// token comes back as a 302 to the site root, which is retried once with a
 /// fresh token before it is reported.
-fn alibaba_csrf_url(config: &TranslatorConfig) -> String {
+fn alibaba_csrf_url(source: &ResolvedSource) -> String {
     format!(
         "{}/api/translate/csrftoken",
-        config.alibaba_server_addr.trim_end_matches('/')
+        source.server_addr.trim_end_matches('/')
     )
 }
 
-fn alibaba_url(config: &TranslatorConfig) -> String {
+fn alibaba_url(source: &ResolvedSource) -> String {
     format!(
         "{}/api/translate/text",
-        config.alibaba_server_addr.trim_end_matches('/')
+        source.server_addr.trim_end_matches('/')
     )
 }
 
@@ -1196,15 +1319,15 @@ fn alibaba_handle_response<T>(
 /// freshly fetched token before it is reported.
 async fn alibaba_translate_async(
     client: &reqwest::Client,
-    config: &TranslatorConfig,
+    source: &ResolvedSource,
     from_lang: &str,
     to_lang: &str,
     text: &str,
 ) -> Result<String> {
-    let mut response = alibaba_post(client, config, from_lang, to_lang, text).await?;
+    let mut response = alibaba_post(client, source, from_lang, to_lang, text).await?;
     if response.status().is_redirection() {
         debug!("the Alibaba CSRF token went stale; retrying with a fresh one");
-        response = alibaba_post(client, config, from_lang, to_lang, text).await?;
+        response = alibaba_post(client, source, from_lang, to_lang, text).await?;
     }
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
@@ -1216,12 +1339,12 @@ async fn alibaba_translate_async(
 /// plugin has no other use for.
 async fn alibaba_post(
     client: &reqwest::Client,
-    config: &TranslatorConfig,
+    source: &ResolvedSource,
     from_lang: &str,
     to_lang: &str,
     text: &str,
 ) -> Result<reqwest::Response> {
-    let csrf_url = alibaba_csrf_url(config);
+    let csrf_url = alibaba_csrf_url(source);
     let response = client
         .get(csrf_url.clone())
         .headers(alibaba_headers())
@@ -1242,7 +1365,7 @@ async fn alibaba_post(
         .text("_csrf", token.clone())
         .text("domain", "general".to_string());
 
-    let url = alibaba_url(config);
+    let url = alibaba_url(source);
     client
         .post(url.clone())
         .headers(alibaba_headers())
@@ -1267,16 +1390,15 @@ fn free_source_status_error(server: &str, status: reqwest::StatusCode, body: &st
 /// Per-source async request, so the fallback chain below can be written once
 /// for both the blocking and the async caller.
 async fn translate_source_async(
-    source: TranslateBackendKind,
+    source: &ResolvedSource,
     client: &reqwest::Client,
-    config: &TranslatorConfig,
     from_lang: &str,
     to_lang: &str,
     text: &str,
 ) -> Result<String> {
-    match source {
-        TranslateBackendKind::Google => {
-            let url = google_url(config);
+    match source.protocol {
+        TranslateSourceProtocol::Google => {
+            let url = google_url(source);
             let response = client
                 .get(url.clone())
                 .headers(browser_headers())
@@ -1288,17 +1410,17 @@ async fn translate_source_async(
             let body = response.text().await.unwrap_or_default();
             google_handle_response(status, &body, text)
         }
-        TranslateBackendKind::Edge => {
-            let url = edge_url(config);
+        TranslateSourceProtocol::Edge => {
+            let url = edge_url(source);
             let request = client
                 .post(url.clone())
                 .headers(browser_headers())
                 .query(&edge_params(from_lang, to_lang))
                 .json(&[text]);
-            let request = if config.edge_api_key.is_empty() {
+            let request = if source.api_key.is_empty() {
                 request
             } else {
-                request.header("Ocp-Apim-Subscription-Key", &config.edge_api_key)
+                request.header("Ocp-Apim-Subscription-Key", &source.api_key)
             };
             let response = request
                 .send()
@@ -1308,12 +1430,15 @@ async fn translate_source_async(
             let body = response.text().await.unwrap_or_default();
             edge_handle_response(status, &body, text)
         }
-        TranslateBackendKind::Alibaba => {
-            alibaba_translate_async(client, config, from_lang, to_lang, text).await
+        TranslateSourceProtocol::Alibaba => {
+            alibaba_translate_async(client, source, from_lang, to_lang, text).await
         }
-        other => Err(MpvSttError::TranslationFailed(format!(
-            "{other} is not a built-in free source"
-        ))),
+        TranslateSourceProtocol::DeepL => {
+            deepl_translate_async(client, source, from_lang, to_lang, text).await
+        }
+        TranslateSourceProtocol::LibreTranslate => {
+            libre_translate_async(client, source, from_lang, to_lang, text).await
+        }
     }
 }
 
@@ -1321,16 +1446,15 @@ async fn translate_source_async(
 /// blocking client cannot be driven from inside the async worker, so the two
 /// request paths are written separately but share every URL/body/parse helper.
 fn translate_source_blocking(
-    source: TranslateBackendKind,
+    source: &ResolvedSource,
     client: &reqwest::blocking::Client,
-    config: &TranslatorConfig,
     from_lang: &str,
     to_lang: &str,
     text: &str,
 ) -> Result<String> {
-    match source {
-        TranslateBackendKind::Google => {
-            let url = google_url(config);
+    match source.protocol {
+        TranslateSourceProtocol::Google => {
+            let url = google_url(source);
             let response = client
                 .get(url.clone())
                 .headers(browser_headers())
@@ -1341,17 +1465,17 @@ fn translate_source_blocking(
             let body = response.text().unwrap_or_default();
             google_handle_response(status, &body, text)
         }
-        TranslateBackendKind::Edge => {
-            let url = edge_url(config);
+        TranslateSourceProtocol::Edge => {
+            let url = edge_url(source);
             let request = client
                 .post(url.clone())
                 .headers(browser_headers())
                 .query(&edge_params(from_lang, to_lang))
                 .json(&[text]);
-            let request = if config.edge_api_key.is_empty() {
+            let request = if source.api_key.is_empty() {
                 request
             } else {
-                request.header("Ocp-Apim-Subscription-Key", &config.edge_api_key)
+                request.header("Ocp-Apim-Subscription-Key", &source.api_key)
             };
             let response = request
                 .send()
@@ -1362,26 +1486,46 @@ fn translate_source_blocking(
         }
         // Alibaba needs the token hop, which this path does without a runtime:
         // the blocking client drives the same two requests inline.
-        TranslateBackendKind::Alibaba => {
-            alibaba_translate_blocking(client, config, from_lang, to_lang, text)
+        TranslateSourceProtocol::Alibaba => {
+            alibaba_translate_blocking(client, source, from_lang, to_lang, text)
         }
-        other => Err(MpvSttError::TranslationFailed(format!(
-            "{other} is not a built-in free source"
-        ))),
+        TranslateSourceProtocol::DeepL => {
+            let url = deepl_url(source);
+            let response = client
+                .post(url.clone())
+                .headers(deepl_headers(source))
+                .json(&deepl_body(from_lang, to_lang, text))
+                .send()
+                .map_err(|e| MpvSttError::TranslationRequest { url, source: e })?;
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            deepl_handle_response(status, &body, text)
+        }
+        TranslateSourceProtocol::LibreTranslate => {
+            let url = libre_url(source);
+            let response = client
+                .post(url.clone())
+                .json(&libre_body(from_lang, to_lang, text, &source.api_key))
+                .send()
+                .map_err(|e| MpvSttError::TranslationRequest { url, source: e })?;
+            let status = response.status();
+            let body = response.text().unwrap_or_default();
+            libre_handle_response(status, &body, text)
+        }
     }
 }
 
 fn alibaba_translate_blocking(
     client: &reqwest::blocking::Client,
-    config: &TranslatorConfig,
+    source: &ResolvedSource,
     from_lang: &str,
     to_lang: &str,
     text: &str,
 ) -> Result<String> {
-    let mut response = alibaba_post_blocking(client, config, from_lang, to_lang, text)?;
+    let mut response = alibaba_post_blocking(client, source, from_lang, to_lang, text)?;
     if response.status().is_redirection() {
         debug!("the Alibaba CSRF token went stale; retrying with a fresh one");
-        response = alibaba_post_blocking(client, config, from_lang, to_lang, text)?;
+        response = alibaba_post_blocking(client, source, from_lang, to_lang, text)?;
     }
     let status = response.status();
     let body = response.text().unwrap_or_default();
@@ -1390,12 +1534,12 @@ fn alibaba_translate_blocking(
 
 fn alibaba_post_blocking(
     client: &reqwest::blocking::Client,
-    config: &TranslatorConfig,
+    source: &ResolvedSource,
     from_lang: &str,
     to_lang: &str,
     text: &str,
 ) -> Result<reqwest::blocking::Response> {
-    let csrf_url = alibaba_csrf_url(config);
+    let csrf_url = alibaba_csrf_url(source);
     let response = client
         .get(csrf_url.clone())
         .headers(alibaba_headers())
@@ -1415,7 +1559,7 @@ fn alibaba_post_blocking(
         .text("_csrf", token.clone())
         .text("domain", "general".to_string());
 
-    let url = alibaba_url(config);
+    let url = alibaba_url(source);
     client
         .post(url.clone())
         .headers(alibaba_headers())
@@ -1438,8 +1582,9 @@ async fn translate_free_async(
     text: &str,
 ) -> Result<String> {
     let mut last_error = None;
-    for source in FREE_SOURCES {
-        match translate_source_async(source, client, config, from_lang, to_lang, text).await {
+    for name in FREE_SOURCE_NAMES {
+        let source = free_source(config, name)?;
+        match translate_source_async(&source, client, from_lang, to_lang, text).await {
             Ok(translated) if !translated.trim().is_empty() => return Ok(translated),
             Ok(_) => {
                 warn!(source = %source, "a free source returned nothing; trying the next one");
@@ -1471,8 +1616,9 @@ fn translate_free_blocking(
     text: &str,
 ) -> Result<String> {
     let mut last_error = None;
-    for source in FREE_SOURCES {
-        match translate_source_blocking(source, client, config, from_lang, to_lang, text) {
+    for name in FREE_SOURCE_NAMES {
+        let source = free_source(config, name)?;
+        match translate_source_blocking(&source, client, from_lang, to_lang, text) {
             Ok(translated) if !translated.trim().is_empty() => return Ok(translated),
             Ok(_) => {
                 warn!(source = %source, "a free source returned nothing; trying the next one");
@@ -1496,9 +1642,19 @@ fn translate_free_blocking(
     }))
 }
 
-/// Total dispatch for the async queue. `auto` walks the free sources via
-/// `translate_free_async`; a named free source is tried alone (no silent
-/// downgrade); the two external protocols are unchanged.
+/// One link of the free chain: the declared source of that name if there is
+/// one, else the built-in endpoint. Declaring `[translate.sources.google_free]`
+/// is therefore how a user points one link somewhere else.
+fn free_source(config: &TranslatorConfig, name: &str) -> Result<ResolvedSource> {
+    match config.sources.get(name) {
+        Some(source) => Ok(source.clone()),
+        None => resolve_source(name, None),
+    }
+}
+
+/// Total dispatch for the async queue. `auto` walks the built-in free sources
+/// via `translate_free_async`; a named source is tried alone (no silent
+/// downgrade), and its protocol decides how the request is written.
 async fn translate_async(
     client: &reqwest::Client,
     config: &TranslatorConfig,
@@ -1506,22 +1662,11 @@ async fn translate_async(
     to_lang: &str,
     text: &str,
 ) -> Result<String> {
-    match config.backend {
-        TranslateBackendKind::Auto => {
-            translate_free_async(client, config, from_lang, to_lang, text).await
-        }
-        TranslateBackendKind::Google
-        | TranslateBackendKind::Edge
-        | TranslateBackendKind::Alibaba => {
-            translate_source_async(config.backend, client, config, from_lang, to_lang, text).await
-        }
-        TranslateBackendKind::DeepL => {
-            deepl_translate_async(client, config, from_lang, to_lang, text).await
-        }
-        TranslateBackendKind::LibreTranslate => {
-            libre_translate_async(client, config, from_lang, to_lang, text).await
-        }
+    if config.source == AUTO_SOURCE {
+        return translate_free_async(client, config, from_lang, to_lang, text).await;
     }
+    let source = config.active_source()?;
+    translate_source_async(&source, client, from_lang, to_lang, text).await
 }
 
 /// Total dispatch for the blocking `Translator`.
@@ -1532,44 +1677,11 @@ fn translate_blocking(
     to_lang: &str,
     text: &str,
 ) -> Result<String> {
-    match config.backend {
-        TranslateBackendKind::Auto => {
-            translate_free_blocking(client, config, from_lang, to_lang, text)
-        }
-        TranslateBackendKind::Google
-        | TranslateBackendKind::Edge
-        | TranslateBackendKind::Alibaba => {
-            translate_source_blocking(config.backend, client, config, from_lang, to_lang, text)
-        }
-        TranslateBackendKind::DeepL => {
-            let url = deepl_url(config);
-            let response = client
-                .post(url.clone())
-                .headers(deepl_headers(config))
-                .json(&deepl_body(from_lang, to_lang, text))
-                .send()
-                .map_err(|e| MpvSttError::TranslationRequest { url, source: e })?;
-            let status = response.status();
-            let body = response.text().unwrap_or_default();
-            deepl_handle_response(status, &body, text)
-        }
-        TranslateBackendKind::LibreTranslate => {
-            let url = libre_url(config);
-            let response = client
-                .post(url.clone())
-                .json(&libre_body(
-                    from_lang,
-                    to_lang,
-                    text,
-                    &config.libretranslate_api_key,
-                ))
-                .send()
-                .map_err(|e| MpvSttError::TranslationRequest { url, source: e })?;
-            let status = response.status();
-            let body = response.text().unwrap_or_default();
-            libre_handle_response(status, &body, text)
-        }
+    if config.source == AUTO_SOURCE {
+        return translate_free_blocking(client, config, from_lang, to_lang, text);
     }
+    let source = config.active_source()?;
+    translate_source_blocking(&source, client, from_lang, to_lang, text)
 }
 
 fn normalize_lang_code(code: &str, allow_auto: bool) -> String {
@@ -1684,19 +1796,89 @@ mod tests {
         format!("http://{}", addr)
     }
 
+    /// One named foreign source, the shape most tests need: a config whose
+    /// active source speaks `protocol` to a stub's address.
+    fn config_for(
+        protocol: TranslateSourceProtocol,
+        server: impl Into<String>,
+        api_key: impl Into<String>,
+    ) -> TranslatorConfig {
+        TranslatorConfig::new("en".to_string(), "zh".to_string())
+            .with_source("test")
+            .with_source_addr("test", protocol, server, api_key)
+            .expect("a fully declared source always resolves")
+    }
+
     #[test]
     fn test_translator_config() {
-        let config = TranslatorConfig::new("ja".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::DeepL)
-            .with_timeout_ms(5000)
-            .with_server_addr("http://127.0.0.1:8000".to_string())
-            .with_api_key("k".to_string());
+        let config = config_for(TranslateSourceProtocol::DeepL, "http://127.0.0.1:8000", "k")
+            .with_timeout_ms(5000);
 
-        assert_eq!(config.from_lang, "ja");
+        assert_eq!(config.from_lang, "en");
         assert_eq!(config.to_lang, "zh");
         assert_eq!(config.timeout_ms, 5000);
-        assert_eq!(config.server_addr, "http://127.0.0.1:8000");
-        assert_eq!(config.api_key, "k");
+        assert_eq!(config.source, "test");
+        let active = config.active_source().unwrap();
+        assert_eq!(active.protocol, TranslateSourceProtocol::DeepL);
+        assert_eq!(active.server_addr, "http://127.0.0.1:8000");
+        assert_eq!(active.api_key, "k");
+    }
+
+    #[test]
+    fn a_builtin_name_resolves_without_being_declared() {
+        let config = TranslatorConfig::new("ja".to_string(), "zh".to_string())
+            .with_source("edge_free")
+            .with_source_config(
+                "edge_free",
+                &TranslateSourceConfig {
+                    api_key: Some("k".to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let active = config.active_source().unwrap();
+        assert_eq!(active.protocol, TranslateSourceProtocol::Edge);
+        // The override kept the built-in host and supplied only the key.
+        assert_eq!(active.server_addr, "https://edge.microsoft.com");
+        assert_eq!(active.api_key, "k");
+
+        // Untouched, the same name still resolves to the shipped endpoint.
+        let plain = TranslatorConfig::new("ja".to_string(), "zh".to_string())
+            .with_source("google_free")
+            .active_source()
+            .unwrap();
+        assert_eq!(plain.protocol, TranslateSourceProtocol::Google);
+        assert_eq!(plain.server_addr, "https://clients5.google.com");
+    }
+
+    #[test]
+    fn an_unknown_source_name_reports_what_is_available() {
+        let config = TranslatorConfig::new("ja".to_string(), "zh".to_string())
+            .with_source("typo")
+            .with_source_addr("groq", TranslateSourceProtocol::DeepL, "http://x", "")
+            .unwrap();
+
+        let message = format!("{}", config.active_source().unwrap_err());
+        assert!(message.contains("typo"), "got: {message}");
+        assert!(
+            message.contains("groq"),
+            "declared names missing: {message}"
+        );
+        assert!(
+            message.contains("google_free"),
+            "built-in names missing: {message}"
+        );
+    }
+
+    #[test]
+    fn a_source_without_a_protocol_is_rejected() {
+        let err = TranslatorConfig::new("ja".to_string(), "zh".to_string())
+            .with_source_config("mystery", &TranslateSourceConfig::default())
+            .unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("mystery"), "got: {message}");
+        assert!(message.contains("protocol"), "got: {message}");
     }
 
     #[test]
@@ -1714,9 +1896,7 @@ mod tests {
             thread::sleep(Duration::from_secs(2));
         });
 
-        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::DeepL)
-            .with_server_addr(format!("http://{addr}"))
+        let config = config_for(TranslateSourceProtocol::DeepL, format!("http://{addr}"), "")
             .with_timeout_ms(30_000);
         let mut queue = AsyncTranslationQueue::new(config);
         queue.submit(TranslationTask {
@@ -1756,10 +1936,7 @@ mod tests {
                 r#"{"translations":[{"detected_source_language":"EN","text":"你好"}]}"#.to_string(),
             )
         });
-        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::DeepL)
-            .with_server_addr(server)
-            .with_api_key("testkey".to_string());
+        let config = config_for(TranslateSourceProtocol::DeepL, server, "testkey");
         let translator = Translator::new(config);
         let result = translator.translate("hello").unwrap();
         assert_eq!(result, "你好");
@@ -1768,9 +1945,7 @@ mod tests {
     #[test]
     fn test_translate_remote_handles_upstream_error() {
         let server = spawn_stub_deepl(|_| (401, r#"{"message":"bad key"}"#.to_string()));
-        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::DeepL)
-            .with_server_addr(server);
+        let config = config_for(TranslateSourceProtocol::DeepL, server, "");
         let translator = Translator::new(config);
         let msg = format!("{}", translator.translate("hello").unwrap_err());
         assert!(msg.contains("401"), "got: {}", msg);
@@ -1785,9 +1960,7 @@ mod tests {
                 r#"{"translations":[{"detected_source_language":"EN","text":"你好"}]}"#.to_string(),
             )
         });
-        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::DeepL)
-            .with_server_addr(server);
+        let config = config_for(TranslateSourceProtocol::DeepL, server, "");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -1797,7 +1970,8 @@ mod tests {
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap();
-            let result = deepl_translate_async(&client, &config, "en", "zh", "hello")
+            let source = config.active_source().unwrap();
+            let result = deepl_translate_async(&client, &source, "en", "zh", "hello")
                 .await
                 .unwrap();
             assert_eq!(result, "你好");
@@ -1831,10 +2005,7 @@ mod tests {
     fn failed_translation_is_reported_as_a_give_up() {
         let server =
             spawn_stub_deepl(|_head| (503, r#"{"message":"upstream not configured"}"#.to_string()));
-        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::DeepL)
-            .with_server_addr(server)
-            .with_timeout_ms(5_000);
+        let config = config_for(TranslateSourceProtocol::DeepL, server, "").with_timeout_ms(5_000);
         let queue = AsyncTranslationQueue::new(config);
         queue.submit(TranslationTask {
             start_ms: 1_500,
@@ -1874,11 +2045,12 @@ mod tests {
     #[test]
     #[ignore]
     fn translate_against_live_gateway() {
-        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::DeepL)
-            .with_server_addr("http://127.0.0.1:8100".to_string())
-            .with_api_key("testkey".to_string())
-            .with_timeout_ms(10_000);
+        let config = config_for(
+            TranslateSourceProtocol::DeepL,
+            "http://127.0.0.1:8100",
+            "testkey",
+        )
+        .with_timeout_ms(10_000);
         let translator = Translator::new(config);
         let result = translator
             .translate("hello")
@@ -1906,10 +2078,7 @@ mod tests {
             assert_eq!(parsed["q"], "hello");
             (200, r#"{"translatedText":"你好"}"#.to_string())
         });
-        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::LibreTranslate)
-            .with_libretranslate_server_addr(server)
-            .with_libretranslate_api_key("testkey".to_string());
+        let config = config_for(TranslateSourceProtocol::LibreTranslate, server, "testkey");
         let translator = Translator::new(config);
         let result = translator.translate("hello").unwrap();
         assert_eq!(result, "你好");
@@ -1918,9 +2087,7 @@ mod tests {
     #[test]
     fn test_translate_remote_libretranslate_handles_upstream_error() {
         let server = spawn_stub_libre(|_, _| (401, r#"{"error":"bad key"}"#.to_string()));
-        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::LibreTranslate)
-            .with_libretranslate_server_addr(server);
+        let config = config_for(TranslateSourceProtocol::LibreTranslate, server, "");
         let translator = Translator::new(config);
         let msg = format!("{}", translator.translate("hello").unwrap_err());
         assert!(msg.contains("401"), "got: {}", msg);
@@ -1963,20 +2130,18 @@ mod tests {
                     .to_string(),
             )
         });
-        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::LibreTranslate)
-            .with_libretranslate_server_addr(server)
-            .with_libretranslate_api_key("k".to_string());
+        let config = config_for(TranslateSourceProtocol::LibreTranslate, server, "k");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
+        let source = config.active_source().unwrap();
         runtime.block_on(async {
             let client = reqwest::Client::builder()
                 .timeout(Duration::from_secs(5))
                 .build()
                 .unwrap();
-            let result = libre_translate_async(&client, &config, "en", "zh", "hello")
+            let result = libre_translate_async(&client, &source, "en", "zh", "hello")
                 .await
                 .unwrap();
             assert_eq!(result, "你好");
@@ -1990,11 +2155,12 @@ mod tests {
     #[test]
     #[ignore]
     fn translate_libretranslate_against_live_gateway() {
-        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::LibreTranslate)
-            .with_libretranslate_server_addr("http://127.0.0.1:8100".to_string())
-            .with_libretranslate_api_key("testkey".to_string())
-            .with_timeout_ms(10_000);
+        let config = config_for(
+            TranslateSourceProtocol::LibreTranslate,
+            "http://127.0.0.1:8100",
+            "testkey",
+        )
+        .with_timeout_ms(10_000);
         let translator = Translator::new(config);
         let result = translator
             .translate("hello")
@@ -2070,8 +2236,7 @@ mod tests {
             assert!(head.contains("q=hello"), "got: {head}");
             (200, r#"["你好"]"#.to_string())
         });
-        let config =
-            free_source_config(TranslateBackendKind::Google).with_google_server_addr(server);
+        let config = free_source_config("google_free", server);
         let translated = translate_with_stub(&config, "hello").unwrap();
         assert_eq!(translated, "你好");
     }
@@ -2085,8 +2250,9 @@ mod tests {
             (200, r#"[["你好","ja"]]"#.to_string())
         });
         let config = TranslatorConfig::new("auto".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::Google)
-            .with_google_server_addr(server);
+            .with_source("google_free")
+            .with_source_addr("google_free", TranslateSourceProtocol::Google, server, "")
+            .unwrap();
         let translated = translate_with_stub(&config, "こんにちは").unwrap();
         assert_eq!(translated, "你好");
     }
@@ -2094,8 +2260,7 @@ mod tests {
     #[test]
     fn google_reports_a_throttled_source_with_the_status() {
         let server = spawn_stub_free(|_head, _body| (429, "too many requests".to_string()));
-        let config =
-            free_source_config(TranslateBackendKind::Google).with_google_server_addr(server);
+        let config = free_source_config("google_free", server);
         let err = translate_with_stub(&config, "hello").unwrap_err();
         let text = format!("{err}");
         assert!(text.contains("429"), "got: {text}");
@@ -2122,7 +2287,7 @@ mod tests {
                     .to_string(),
             )
         });
-        let config = free_source_config(TranslateBackendKind::Edge).with_edge_server_addr(server);
+        let config = free_source_config("edge_free", server);
         let translated = translate_with_stub(&config, "hello").unwrap();
         assert_eq!(translated, "你好");
     }
@@ -2139,8 +2304,9 @@ mod tests {
             (200, r#"[{"translations":[{"text":"你好"}]}]"#.to_string())
         });
         let config = TranslatorConfig::new("auto".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::Edge)
-            .with_edge_server_addr(server);
+            .with_source("edge_free")
+            .with_source_addr("edge_free", TranslateSourceProtocol::Edge, server, "")
+            .unwrap();
         let translated = translate_with_stub(&config, "こんにちは").unwrap();
         assert_eq!(translated, "你好");
     }
@@ -2200,8 +2366,7 @@ mod tests {
                     .to_string(),
             )
         });
-        let config =
-            free_source_config(TranslateBackendKind::Alibaba).with_alibaba_server_addr(server);
+        let config = free_source_config("alibaba_free", server);
         let translated = translate_with_stub(&config, "こんにちは").unwrap();
         assert_eq!(translated, "你好");
     }
@@ -2223,8 +2388,7 @@ mod tests {
                 r#"{"success":true,"data":{"translateText":"你好"}}"#.to_string(),
             )
         });
-        let config =
-            free_source_config(TranslateBackendKind::Alibaba).with_alibaba_server_addr(server);
+        let config = free_source_config("alibaba_free", server);
         let translated = translate_with_stub(&config, "こんにちは").unwrap();
         assert_eq!(translated, "你好");
     }
@@ -2265,9 +2429,11 @@ mod tests {
         });
 
         let config = TranslatorConfig::new("ja".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::Auto)
-            .with_google_server_addr(google)
-            .with_edge_server_addr(edge);
+            .with_source(AUTO_SOURCE)
+            .with_source_addr("google_free", TranslateSourceProtocol::Google, google, "")
+            .unwrap()
+            .with_source_addr("edge_free", TranslateSourceProtocol::Edge, edge, "")
+            .unwrap();
         let translated = translate_with_stub(&config, "こんにちは").unwrap();
         assert_eq!(translated, "你好");
         // Each call path (blocking and async) tries Google exactly once; a
@@ -2286,10 +2452,18 @@ mod tests {
         let alibaba = spawn_stub_free(|_head, _body| (502, "bad gateway".to_string()));
 
         let config = TranslatorConfig::new("ja".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::Auto)
-            .with_google_server_addr(google)
-            .with_edge_server_addr(edge)
-            .with_alibaba_server_addr(alibaba)
+            .with_source(AUTO_SOURCE)
+            .with_source_addr("google_free", TranslateSourceProtocol::Google, google, "")
+            .unwrap()
+            .with_source_addr("edge_free", TranslateSourceProtocol::Edge, edge, "")
+            .unwrap()
+            .with_source_addr(
+                "alibaba_free",
+                TranslateSourceProtocol::Alibaba,
+                alibaba,
+                "",
+            )
+            .unwrap()
             .with_timeout_ms(5_000);
         let queue = AsyncTranslationQueue::new(config);
         queue.submit(TranslationTask {
@@ -2332,10 +2506,14 @@ mod tests {
             (200, r#"[{"translations":[{"text":"你好"}]}]"#.to_string())
         });
 
+        // Google is named, so the working Edge source must stay untouched even
+        // though `auto` would have used it.
         let config = TranslatorConfig::new("ja".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::Google)
-            .with_google_server_addr(google)
-            .with_edge_server_addr(edge);
+            .with_source("google_free")
+            .with_source_addr("google_free", TranslateSourceProtocol::Google, google, "")
+            .unwrap()
+            .with_source_addr("edge_free", TranslateSourceProtocol::Edge, edge, "")
+            .unwrap();
         let err = translate_with_stub(&config, "こんにちは").unwrap_err();
         assert!(format!("{err}").contains("429"), "got: {err}");
         assert_eq!(
@@ -2348,10 +2526,30 @@ mod tests {
     #[test]
     fn the_free_source_defaults_are_the_shipped_endpoints() {
         let config = TranslatorConfig::default();
-        assert_eq!(config.google_server_addr, GOOGLE_DEFAULT_SERVER);
-        assert_eq!(config.edge_server_addr, EDGE_DEFAULT_SERVER);
-        assert_eq!(config.alibaba_server_addr, ALIBABA_DEFAULT_SERVER);
-        assert_eq!(config.backend, TranslateBackendKind::Auto);
+        assert_eq!(config.source, AUTO_SOURCE);
+        let shipped = [
+            (
+                "google_free",
+                TranslateSourceProtocol::Google,
+                "https://clients5.google.com",
+            ),
+            (
+                "edge_free",
+                TranslateSourceProtocol::Edge,
+                "https://edge.microsoft.com",
+            ),
+            (
+                "alibaba_free",
+                TranslateSourceProtocol::Alibaba,
+                "https://translate.alibaba.com",
+            ),
+        ];
+        for (name, protocol, server) in shipped {
+            let source = resolve_source(name, None).unwrap();
+            assert_eq!(source.protocol, protocol, "{name}");
+            assert_eq!(source.server_addr, server, "{name}");
+            assert!(source.api_key.is_empty(), "{name}");
+        }
     }
 
     /// Live check of the built-in free sources, one request per source against
@@ -2360,29 +2558,45 @@ mod tests {
     #[test]
     #[ignore]
     fn translate_free_sources_against_live_endpoints() {
-        for backend in FREE_SOURCES {
-            let config = free_source_config(backend).with_timeout_ms(20_000);
+        for name in FREE_SOURCE_NAMES {
+            let config = TranslatorConfig::new("ja".to_string(), "zh".to_string())
+                .with_source(name)
+                .with_timeout_ms(20_000);
             let translator = Translator::new(config);
             let translated = translator
                 .translate("こんにちは、世界。")
-                .unwrap_or_else(|e| panic!("{backend} failed: {e}"));
+                .unwrap_or_else(|e| panic!("{name} failed: {e}"));
             assert!(
                 translated.contains('你') || translated.contains('好'),
-                "{backend} returned something unexpected: {translated}"
+                "{name} returned something unexpected: {translated}"
             );
         }
         // And `auto` must land on whichever source answers first.
         let config = TranslatorConfig::new("ja".to_string(), "zh".to_string())
-            .with_backend(TranslateBackendKind::Auto)
+            .with_source(AUTO_SOURCE)
             .with_timeout_ms(20_000);
         let translator = Translator::new(config);
         assert!(translator.translate("ありがとうございます。").is_ok());
     }
 
-    fn free_source_config(backend: TranslateBackendKind) -> TranslatorConfig {
+    /// A config whose active source is one free source, pointed at a stub.
+    /// `translate_with_stub` then drives both call paths through it.
+    fn free_source_config(name: &str, server: impl Into<String>) -> TranslatorConfig {
         TranslatorConfig::new("ja".to_string(), "zh".to_string())
-            .with_backend(backend)
+            .with_source(name)
+            .with_source_addr(name, protocol_of(name), server, "")
+            .expect("a fully declared source always resolves")
             .with_timeout_ms(5_000)
+    }
+
+    /// The protocol a built-in free source speaks, for tests that name one.
+    fn protocol_of(name: &str) -> TranslateSourceProtocol {
+        match name {
+            "google_free" => TranslateSourceProtocol::Google,
+            "edge_free" => TranslateSourceProtocol::Edge,
+            "alibaba_free" => TranslateSourceProtocol::Alibaba,
+            other => panic!("{other} is not a built-in free source"),
+        }
     }
 
     /// Like `spawn_stub_deepl` but for the free sources: always reads the body

@@ -1,14 +1,12 @@
 use crate::common::Result;
-use crate::config::SttConfig;
+use crate::config::{SttConfig, SttProtocol};
 use std::path::Path;
 use std::sync::{Arc, atomic::AtomicU64};
 use tracing::debug;
 
-pub use crate::config::BackendKind;
-
 /// Common trait for all speech-to-text backends.
 pub trait SttBackend: Send {
-    fn kind(&self) -> BackendKind;
+    fn protocol(&self) -> SttProtocol;
 
     fn transcribe<P: AsRef<Path>>(
         &mut self,
@@ -36,8 +34,9 @@ pub struct SttDeviceNotice {
     pub gpu_device: i32,
 }
 
-// Backend modules. Both remote backends are compiled in (the plugin is a pure
-// remote client); the active one is chosen at runtime via `config.stt.backend`.
+// Backend modules. Both remote protocols are compiled in (the plugin is a pure
+// remote client); which one a request uses is decided by the active source's
+// `protocol`.
 #[cfg(feature = "stt_ferrum")]
 mod ferrum;
 
@@ -51,8 +50,8 @@ pub use ferrum::SttFerrumConfig;
 #[cfg(feature = "stt_openai")]
 pub use openai::SttOpenAiConfig;
 
-/// Runtime-selected STT backend. Both remote backends are compiled in; which
-/// one actually runs is decided from `SttConfig::backend` at startup.
+/// The STT backend of the selected source. Both remote protocols are compiled
+/// in; which one runs is decided from `[stt] source` at startup.
 pub enum SttRunner {
     #[cfg(feature = "stt_ferrum")]
     Ferrum(ferrum::FerrumBackend),
@@ -61,61 +60,67 @@ pub enum SttRunner {
 }
 
 impl SttRunner {
-    /// Build the active backend from the runtime config, matching `cfg.backend`.
+    /// Build the backend of the selected source. `cfg.source` names it; an
+    /// empty `source` means the only declared one. A selector that resolves to
+    /// nothing is an error rather than a fallback: silently transcribing with
+    /// an unintended source is worse than not starting.
     pub fn from_config(cfg: &SttConfig) -> Result<Self> {
-        match cfg.backend {
-            BackendKind::Ferrum => {
+        let name = cfg.active_source_name().map_err(|e| {
+            crate::common::MpvSttError::SttFailed(format!("{e}; protocols: openai, ferrum"))
+        })?;
+        let source = cfg
+            .sources
+            .get(name)
+            .expect("the resolved name is always a declared source");
+        let protocol = source.protocol.ok_or_else(|| {
+            crate::common::MpvSttError::SttFailed(format!(
+                "STT source {name:?} has no protocol; set protocol = \"openai\" or \"ferrum\""
+            ))
+        })?;
+
+        match protocol {
+            SttProtocol::Ferrum => {
                 #[cfg(feature = "stt_ferrum")]
                 {
-                    let ferrum_cfg = cfg.ferrum.as_ref().ok_or_else(|| {
-                        crate::common::MpvSttError::SttFailed(
-                            "Missing [stt.ferrum] configuration".to_string(),
-                        )
-                    })?;
+                    let ferrum_cfg = source.ferrum();
                     debug!(
-                        backend = "ferrum",
+                        source = %name,
+                        protocol = %protocol,
                         server = %ferrum_cfg.server_addr,
                         model = %ferrum_cfg.model,
                         language = ferrum_cfg.language.as_deref().unwrap_or("auto"),
                         opus = ferrum_cfg.use_opus,
                         encrypted = ferrum_cfg.enable_encryption,
-                        "selected the STT backend"
+                        "selected the STT source"
                     );
-                    Ok(SttRunner::Ferrum(ferrum::FerrumBackend::new(
-                        ferrum_cfg.clone(),
-                    )?))
+                    Ok(SttRunner::Ferrum(ferrum::FerrumBackend::new(ferrum_cfg)?))
                 }
                 #[cfg(not(feature = "stt_ferrum"))]
                 {
-                    let _ = cfg;
+                    let _ = source;
                     Err(crate::common::MpvSttError::SttFailed(
                         "stt_ferrum feature not enabled".to_string(),
                     ))
                 }
             }
-            BackendKind::OpenAi => {
+            SttProtocol::OpenAi => {
                 #[cfg(feature = "stt_openai")]
                 {
-                    let openai_cfg = cfg.openai.as_ref().ok_or_else(|| {
-                        crate::common::MpvSttError::SttFailed(
-                            "Missing [stt.openai] configuration".to_string(),
-                        )
-                    })?;
+                    let openai_cfg = source.openai();
                     debug!(
-                        backend = "openai",
+                        source = %name,
+                        protocol = %protocol,
                         server = %openai_cfg.server_addr,
                         model = %openai_cfg.model,
                         language = openai_cfg.language.as_deref().unwrap_or("auto"),
                         authenticated = openai_cfg.api_key.is_some(),
-                        "selected the STT backend"
+                        "selected the STT source"
                     );
-                    Ok(SttRunner::OpenAi(openai::OpenAiBackend::new(
-                        openai_cfg.clone(),
-                    )?))
+                    Ok(SttRunner::OpenAi(openai::OpenAiBackend::new(openai_cfg)?))
                 }
                 #[cfg(not(feature = "stt_openai"))]
                 {
-                    let _ = cfg;
+                    let _ = source;
                     Err(crate::common::MpvSttError::SttFailed(
                         "stt_openai feature not enabled".to_string(),
                     ))
@@ -126,12 +131,12 @@ impl SttRunner {
 }
 
 impl SttBackend for SttRunner {
-    fn kind(&self) -> BackendKind {
+    fn protocol(&self) -> SttProtocol {
         match self {
             #[cfg(feature = "stt_ferrum")]
-            SttRunner::Ferrum(b) => b.kind(),
+            SttRunner::Ferrum(b) => b.protocol(),
             #[cfg(feature = "stt_openai")]
-            SttRunner::OpenAi(b) => b.kind(),
+            SttRunner::OpenAi(b) => b.protocol(),
         }
     }
 

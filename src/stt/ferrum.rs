@@ -1,5 +1,6 @@
-use super::{BackendKind, SttBackend, SttDeviceNotice};
+use super::{SttBackend, SttDeviceNotice};
 use crate::common::{MpvSttError, Result};
+use crate::config::SttProtocol;
 use crate::crypto::{AuthToken, EncryptionKey};
 use crate::srt::SrtFile;
 use libc;
@@ -14,7 +15,23 @@ use std::sync::{
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, trace, warn};
 
-pub type SttFerrumConfig = crate::config::SttFerrumConfig;
+/// The ferrum protocol's own fields, as resolved from a named source.
+#[derive(Debug, Clone, Default)]
+pub struct SttFerrumConfig {
+    pub server_addr: String,
+    /// Model id sent via the `x-model` header, e.g. "sensevoice" or "fun-asr-mlt-nano".
+    pub model: String,
+    /// Optional language hint sent via the `x-language` header (e.g. "ja",
+    /// "zh", "en"); `None` = server auto-detects.
+    pub language: Option<String>,
+    pub timeout_ms: u64,
+    pub max_retry: usize,
+    /// Enable Opus compression to reduce network payload size.
+    pub use_opus: bool,
+    pub enable_encryption: bool,
+    pub encryption_key: String,
+    pub auth_secret: String,
+}
 
 const HEADER_REQUEST_ID: &str = "x-request-id";
 const HEADER_DURATION_MS: &str = "x-duration-ms";
@@ -511,8 +528,8 @@ fn normalize_server_url(raw: &str) -> String {
 }
 
 impl SttBackend for FerrumBackend {
-    fn kind(&self) -> BackendKind {
-        BackendKind::Ferrum
+    fn protocol(&self) -> SttProtocol {
+        SttProtocol::Ferrum
     }
 
     fn transcribe<P: AsRef<Path>>(
