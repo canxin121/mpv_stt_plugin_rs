@@ -160,7 +160,8 @@ setup_android_env() {
     export STRIP="${toolchain}/bin/llvm-strip"
 
     local target_env="${rust_target//-/_}"
-    # bash 3.2 has no ${var^^}; the macOS runners ship it.
+    # bash 3.2 (what macOS still ships as /bin/bash) has no ${var^^}, so upper-
+    # case the triple with tr.
     local upper_target
     upper_target="$(printf '%s' "${rust_target}" | tr '[:lower:]' '[:upper:]')"
     local linker_var="CARGO_TARGET_${upper_target//-/_}_LINKER"
