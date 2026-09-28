@@ -190,17 +190,20 @@ jobs:
         with:
           path: artifacts
 
-      # One zip per platform so each download is self-contained: the plugin,
-      # plus the FFmpeg shared libraries it needs on Linux and Windows.
+      # One zip per platform, laid out so the plugin and the FFmpeg runtime
+      # libraries it needs sit at the zip root: unzip it into
+      # ~/.config/mpv/scripts and the plugin is in place (Linux and Windows
+      # also need the runtime/ directory next to it).
       - name: Package
         run: |
-          cd artifacts
-          for d in */; do
-            name="${d%/}"
-            zip -qr "../${name}.zip" "$name"
+          mkdir -p out
+          for d in artifacts/*/; do
+            name="$(basename "${d}")"
+            plugin="$(find "${d}" -name 'libmpv_stt_plugin_rs.so' -o -name 'mpv_stt_plugin_rs.dll' | head -1)"
+            test -n "${plugin}" || { echo "no plugin found under ${d}" >&2; exit 1; }
+            (cd "$(dirname "${plugin}")" && zip -qr "${GITHUB_WORKSPACE}/out/${name}.zip" .)
           done
-          cd ..
-          ls -lh ./*.zip
+          ls -lh out/
 
       - name: Publish
         env:
@@ -210,4 +213,4 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
-            ./*.zip
+            out/*.zip
