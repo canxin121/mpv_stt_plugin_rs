@@ -220,9 +220,41 @@ server_addr = "http://127.0.0.1:8000"
 api_key = ""
 ```
 
-`deepl` 协议期望 `POST {server}/v1/translate`,body
+`deepl` 协议期望 `POST {server}/v1/translate`(`server_addr` 写基址 `https://api-free.deepl.com`,
+路径由插件补),body
 `{"text": [...], "target_lang": "ZH", "source_lang": "JA"}`(source_lang 省略 = auto),
 响应 `{"translations": [{"text": "..."}]}`。
+
+### 免费/自建翻译服务
+
+两个协议都是普通 HTTP,所以换服务商就是改 `server_addr`/`api_key`/`from_lang`/`to_lang`,
+不需要改代码 —— 前提是对方讲的是这两种形状之一。下面按"改配置能不能接上"分两组
+(2026-09 实测核对,服务端随时可能变)。
+
+**改配置就能接上的**
+
+| 服务 | 怎么连 | 说明 |
+|---|---|---|
+| [subtitle-gateway](https://github.com/canxin121/subtitle-gateway) | `backend = "deepl"`,`server_addr = "http://127.0.0.1:8000"` | 本仓库配套网关,ASR 与翻译同一端点 |
+| [DeepL API Free](https://www.deepl.com/en/signup?isApi=true) | `backend = "deepl"`,`server_addr = "https://api-free.deepl.com"`,`api_key = "<xxx:fx>"` | 50 万字符/月,免费 key 带 `:fx` 后缀;日译中质量最好;需注册 |
+| [LibreTranslate](https://github.com/LibreTranslate/LibreTranslate) | `backend = "libretranslate"`,`server_addr = "http://127.0.0.1:5000"` | 自建:不限量、不出内网。`pip install libretranslate` 或官方 Docker 镜像;默认监听 `127.0.0.1:5000`;AGPL-3.0;Argos 引擎,日译中绕英语 |
+| 公共 LibreTranslate 镜像 | `backend = "libretranslate"`,`server_addr = "https://translate.hostux.net"` | 无需 key,但**必须显式写 `from_lang`**(镜像不接受省略 `source`);`to_lang` 只能写 `zh` 或 `zh-Hans`,写 `zh-CN` 会 400;Argos 引擎,质量明显低于 DeepL |
+
+**要加协议变体才能接的**
+
+请求形状既不是 DeepL 的 `{"text":[...],"target_lang":"ZH"}`,也不是 LibreTranslate 的
+`{"q":"...","source":"ja","target":"zh"}`,光改 `server_addr` 连不上 —— 得在
+`src/translate.rs` 里补一套 URL / body / 响应解析。
+
+| 服务 | 形状 | 额度与注意 |
+|---|---|---|
+| [MTranServer](https://github.com/xxnuo/MTranServer) | `POST /translate`,`{"from","to","text"}` → `{"result"}`,另带 `/translate/batch` | 单文件二进制,无需显卡;Bergamot 引擎,日译中绕英语 |
+| Google Cloud Translation(基础版 v2) | `POST /language/translate/v2`,`{"q":[...],"target":"zh"}` → `data.translations[]` | 50 万字符/月免费,但**必须绑定信用卡**才能开通 |
+| Azure Translator(F0) | `POST /translate?api-version=3.0&to=zh-Hans`,key 走 `Ocp-Apim-Subscription-Key` | 200 万字符/月免费,同样**必须绑卡**;且按小时限速(约 3.3 万字符/分钟) |
+
+已失效、不要再配的:**`libretranslate.com` 官方站**(已无免费 key,最低 $14/月)、
+**Lingva / SimplyTranslate 公共实例**(要么被 Cloudflare 拦,要么返回空译文)、
+**MyMemory**(整个 IP 共享每日 5000 字符额度,单次查询上限 500 字符,极易耗尽)。
 
 ### 其他
 
