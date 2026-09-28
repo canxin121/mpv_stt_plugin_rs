@@ -28,7 +28,10 @@ mpv_stt_plugin_rs/
 │       └── openai.rs        # OpenAI 协议后端(stt_openai)
 ├── scripts/
 │   ├── cargo-with-deps.sh   # 宿主构建(自动拉 mpv 头文件 + 设 FFMPEG_DIR)
-│   └── build-android.sh     # Android 交叉编译
+│   ├── build-android.sh     # Android 交叉编译
+│   ├── gen-test-media.sh    # 由 testdata/ 生成容器矩阵(target/testmedia)
+│   └── e2e-media-matrix.sh  # 逐容器真播一遍、断言出字幕(静音运行)
+├── testdata/ja_all.mp4      # 容器矩阵的源素材(见「测试」)
 └── toolchains/android*.cmake
 ```
 
@@ -430,6 +433,34 @@ cargo test --lib -- --ignored translate_against_live_gateway
 MPV_STT_PLUGIN_RS_LIVE_AUDIO=/path/to/speech.wav \
   cargo test --lib -- --ignored openai_backend_against_live_server
 ```
+
+### 容器矩阵
+
+`testdata/ja_all.mp4` 是一段 101.7 s 的日语素材(黑画面 + 七段语料拼接的音轨),
+用来验证**换个容器还灵不灵** —— 抽不出音轨的容器用户只会看到"没有字幕"。
+`scripts/gen-test-media.sh` 把它转成 mp4/mkv/mov/avi/webm/ts/flv/wmv/mpg 与
+mp3/m4a,产物在 `target/testmedia/`(构建产物,不进仓库):
+
+```bash
+./scripts/gen-test-media.sh
+
+# 离线层:每种容器各抽一段,断言抽到的是 16 kHz 单声道、时长对得上、且不是静音
+./scripts/cargo-with-deps.sh test --lib -- --ignored audio_extraction_covers_every_container
+```
+
+没有生成素材时这条测试会打印一行提示然后通过,所以在干净检出上跑全量
+`--ignored` 不会因此变红。素材目录可以用 `MPV_STT_PLUGIN_RS_TEST_MEDIA` 指定。
+
+端到端那层要一个在跑的 STT 服务(本地 subtitle-gateway 或 Groq),逐容器真的
+播一遍并确认出字幕、没有失败的块:
+
+```bash
+MPV_STT_PLUGIN_RS_CONFIG=~/"Library/Application Support/mpv/mpv_stt_plugin_rs.toml" \
+  ./scripts/e2e-media-matrix.sh
+```
+
+脚本只用 `MPV_STT_PLUGIN_RS_CONFIG` 传路径,不读、不回显配置文件内容;每次播放都带
+`--ao=null --vo=null`,**不会发出声音**。
 
 ## License
 
