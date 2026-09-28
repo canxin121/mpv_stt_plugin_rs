@@ -283,6 +283,29 @@ LibreTranslate,光改 `server_addr` 接不上 —— 内置源已经覆盖了这
 **Lingva / SimplyTranslate 公共实例**(要么被 Cloudflare 拦,要么返回空译文)、
 **MyMemory**(整个 IP 共享每日 5000 字符额度,单次查询上限 500 字符,极易耗尽)。
 
+想自己注册一个 DeepL API Free:
+
+1. 打开 [DeepL 注册页](https://www.deepl.com/en/signup?cta=checkout&is_api=true&productId=api-developer)。
+   **先用无痕窗口,或先退出已登录的 DeepL 翻译账号** —— 已登录时这个链接会退化成普通
+   翻译账号注册,注册完在账号页里找不到 API key。
+2. 邮箱 + 密码注册,套餐选 **API Developer**(免费档,不绑卡)。注册完要做一次邮箱验证,
+   不验证 key 用不了。
+3. 去 [账号 → API keys](https://www.deepl.com/en/your-account/keys) 复制那串 key,
+   免费档的 key 结尾带 `:fx`。
+4. 填进配置:
+
+```toml
+[translate]
+backend = "deepl"
+server_addr = "https://api-free.deepl.com"   # 不看 key 也不看套餐,免费档固定是 api-free
+api_key = "<你的 xxx:fx>"
+from_lang = "ja"
+to_lang = "zh"
+```
+
+额度是 100 万字符/月,超了不会自动扣费,只会停到下个月。要查用量:
+[账号 → Usage](https://www.deepl.com/en/your-account/usage)。
+
 ### 其他
 
 ```toml
