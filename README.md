@@ -154,13 +154,16 @@ mv ~/.config/mpv/scripts/.libmpv_stt_plugin_rs.so.new \
 | `Ctrl+Shift+T` | 开启/停止新字幕的自动翻译 |
 | `Ctrl+Shift+C` | 清除当前媒体的字幕与翻译缓存 |
 
-强绑定是**给 mpv 的按键**用的,只对命令行 mpv 生效。IINA 不把按键交给 mpv:它自己查
-`input_conf` 里的表,命中哪一行就把那一行的 mpv 命令原样执行
-(`mpv_command_string`,见 IINA 源码 `PlayerWindowController.handleKeyBinding`),
-不经过 mpv 的输入引擎。所以在 IINA 里按键走的是**你自己那张表**,插件注册的强绑定
-没有机会参与,表里写什么就执行什么。
+强绑定是**给 mpv 的按键**用的,只对命令行 mpv 生效。IINA 不把按键交给 mpv 的输入
+引擎:它自己查 `input_conf` 里的表,命中哪一行就把那一行的 mpv 命令原样执行
+(`mpv_command_string`,见 IINA 源码 `PlayerWindowController.handleKeyBinding`),所以
+插件注册的强绑定在 IINA 里没有机会参与——IINA 下按键走的始终是**你自己那张表**。
 
-IINA 下需要在当前 `input_conf` 里补上这三行(`设置 → 快捷键`可见/可改)。目标是插件的
+这张表里的条目一旦**存在但目标名字写错**,按键就会静默失效:命令被打到不存在的客户端
+上,mpv 返回 `error running command`,IINA 只在它自己的日志里记一行,界面上没有任何
+提示。表现为"按了没反应",插件侧连一条日志都不会有。
+
+IINA 下要在当前 `input_conf` 里写这三行(`设置 → 快捷键`可见/可改),目标是插件的
 客户端名,即加载时用的文件名去掉 `.so`——按上面「安装」一节的路径就是
 `libmpv_stt_plugin_rs`:
 
@@ -170,12 +173,11 @@ Ctrl+Shift+T script-message-to libmpv_stt_plugin_rs toggle-translate
 Ctrl+Shift+C script-message-to libmpv_stt_plugin_rs clear-cache
 ```
 
-名字写错的调用会以 `error running command` 失败,IINA 只在它自己的日志里记一行,用户
-看不到任何提示,表现为"按了没反应"。
+改完要**重启 IINA**:`input_conf` 只在启动时读一次。
 
-可打印字符上的 `Shift` 会被折叠:mpv 与 IINA 都把 `Ctrl+Shift+S` 记成 `Ctrl+S`,两者
-是同一个绑定(插件日志里也能看到强绑定注册在 `Ctrl+S`)。既然同表里同一个键只有一条
-生效,自己写绑定时就别再用 `Ctrl+S`。
+可打印字符上的 `Shift` 会被折叠:`Ctrl+Shift+S` 与 `Ctrl+S` 是同一个绑定(mpv 与 IINA
+都这么归一化,插件日志里也看得到强绑定注册在 `Ctrl+S`)。同一个键在表里只有一条生效,
+自己写绑定时别再写 `Ctrl+S`。
 
 音频抽取和远程 STT 在独立 worker 中执行,不会占用 mpv/IINA 的事件线程。即使
 服务端正在推理或失去响应,上述快捷键、切换文件和退出仍会立即处理;停止、seek 或
