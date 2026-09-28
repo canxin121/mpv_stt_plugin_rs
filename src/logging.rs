@@ -33,6 +33,8 @@ use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Span, Subscriber};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::filter::{EnvFilter, LevelFilter};
+// Only the two sinks that take a `MakeWriter` go through `fmt`.
+#[cfg(not(target_os = "android"))]
 use tracing_subscriber::fmt as tsfmt;
 use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
@@ -376,7 +378,9 @@ fn scope(directives: &str) -> String {
 /// One event per line, optionally with span lifecycle lines.
 ///
 /// `W: for<'w> MakeWriter<'w>` rather than a concrete writer so the same
-/// function serves stderr and the rotating appender.
+/// function serves stderr and the rotating appender. Android builds neither
+/// stderr nor a file sink, so there it has no caller.
+#[cfg(not(target_os = "android"))]
 fn event_layer<S, W>(format: LogFormat, writer: W, ansi: bool) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
@@ -676,6 +680,9 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::sync::{Arc, Mutex as StdMutex};
+    // `event_layer` and its `MakeWriter` bound sit behind the same cfg.
+    #[cfg(not(target_os = "android"))]
+    use tracing_subscriber::fmt as tsfmt;
 
     /// A `MakeWriter` the tests can read back.
     #[derive(Clone, Default)]
