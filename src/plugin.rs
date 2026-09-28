@@ -575,7 +575,10 @@ impl PluginState {
                     if p.exists() {
                         match std::fs::remove_file(p) {
                             Ok(()) => removed += 1,
-                            Err(e) => error!(
+                            // A cache file the user asked to delete but could
+                            // not be: worth recording, not worth a session
+                            // teardown or a line on screen.
+                            Err(e) => warn!(
                                 error = %e,
                                 cause = %logging::err_chain(&e),
                                 path = %p.display(),
@@ -1940,9 +1943,7 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
             drain_osd(client);
             match event {
                 Event::Shutdown => {
-                    info!("shutting down");
                     state.shutdown();
-                    info!("shutdown complete");
                     return 0;
                 }
                 Event::ClientMessage(msg) => {
