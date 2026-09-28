@@ -990,7 +990,7 @@ dependencies = [
 
 [[package]]
 name = "mpv_stt_plugin_rs"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes-gcm",
  "cc",
