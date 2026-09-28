@@ -1,9 +1,9 @@
-use tracing::{debug, trace};
 use crate::common::{MpvSttError, Result};
 use srtlib::{Subtitle, Subtitles};
 use std::fmt;
 use std::fs;
 use std::path::Path;
+use tracing::{debug, trace};
 
 // Re-export Timestamp for external use
 pub use srtlib::Timestamp;
