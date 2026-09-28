@@ -101,6 +101,14 @@ ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg", rev = "3751e28
 # crate needs no hand-written `__android_log_write` extern.
 tracing-android = "0.2.0"
 
+# mpv-client 1.1.0 declares `const MPV_FORMAT: u32` while its own bindgen types
+# `mpv_format` as `i32` under MSVC, so it does not build on Windows. The fork
+# types the constants as `ffi::mpv_format` instead and is otherwise the same
+# 1.1.0 source. Patch only `mpv-client`: its inner manifest already path-declares
+# mpv-client-sys, so patching that too would give the same build unit two names.
+[patch.crates-io]
+mpv-client = { path = "third_party/mpv-client/mpv-client" }
+
 [features]
 # Pure remote client: both protocols are compiled in, the active one is picked
 # at runtime by the `protocol` of the STT source `[stt] source` names.

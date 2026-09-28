@@ -35,6 +35,8 @@ mpv_stt_plugin_rs/
 │   ├── gen-test-media.sh    # 由 testdata/ 生成容器矩阵(target/testmedia)
 │   └── e2e-media-matrix.sh  # 逐容器真播一遍、断言出字幕(静音运行)
 ├── testdata/ja_all.mp4      # 容器矩阵的源素材(见「测试」)
+├── third_party/
+│   └── mpv-client/          # mpv-client fork(submodule,修了 Windows 上的 MPV_FORMAT 类型)
 └── toolchains/android*.cmake
 ```
 

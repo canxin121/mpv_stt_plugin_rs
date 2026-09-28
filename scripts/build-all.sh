@@ -106,8 +106,8 @@ host_platform() {
 }
 
 # --- mpv headers -----------------------------------------------------------
-# ffmpeg-sys-next and mpv-client-sys are bindgen-only: they need mpv/client.h,
-# not a libmpv to link (the host process provides the symbols).
+# mpv-client-sys is bindgen-only: it needs mpv/client.h, not a libmpv to link
+# (the host process provides the symbols).
 ensure_mpv_headers() {
     if [[ ! -d "${MPV_HEADERS_DIR}" ]]; then
         log "[setup] cloning mpv headers (depth=1) into ${MPV_HEADERS_DIR}"

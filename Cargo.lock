@@ -976,8 +976,6 @@ dependencies = [
 [[package]]
 name = "mpv-client"
 version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "91a022afedfdefb0033ab5a4373dba7bc427c09bda27e134cf539f1ed230ea4d"
 dependencies = [
  "libc",
  "mpv-client-sys",
@@ -986,8 +984,6 @@ dependencies = [
 [[package]]
 name = "mpv-client-sys"
 version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "39c0d45bb600e29318acb024e92e03c12ce78cf9530eaaa8f5a98dca4f54f8c6"
 dependencies = [
  "bindgen 0.70.1",
 ]
