@@ -1,3 +1,10 @@
+//! C ABI for the translation, audio and SRT entry points.
+//!
+//! Every exported function takes caller-owned C strings. Rust cannot verify
+//! the pointers, so each one is a safe `extern "C"` wrapper around an `unsafe`
+//! body: the boundary is the wrapper, and the crate exposes no safe function
+//! that dereferences a raw pointer.
+
 use crate::audio::AudioExtractor;
 use crate::config::TranslateSourceProtocol;
 use crate::translate::{ResolvedSource, Translator, TranslatorConfig};
@@ -19,7 +26,12 @@ fn translator_state() -> &'static Mutex<Option<Translator>> {
     TRANSLATOR.get_or_init(|| Mutex::new(None))
 }
 
-/// Helper to convert C string to Rust String
+/// Helper to convert C string to Rust String.
+///
+/// # Safety
+///
+/// `c_str` is null or points at a NUL-terminated string that stays valid for
+/// the duration of the call.
 unsafe fn c_str_to_string(c_str: *const c_char) -> Option<String> {
     if c_str.is_null() {
         return None;
@@ -30,15 +42,19 @@ unsafe fn c_str_to_string(c_str: *const c_char) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Helper to convert Rust String to C string (caller must free)
+/// Helper to convert Rust String to C string (caller must free).
 fn string_to_c_str(s: String) -> *mut c_char {
     CString::new(s).unwrap_or_default().into_raw()
 }
 
 /// Initialize Translator configuration (points at the default remote
 /// DeepL-compatible server on 127.0.0.1:8000, no API key).
+///
+/// # Safety
+///
+/// Both pointers are null or NUL-terminated strings valid for the call.
 #[unsafe(no_mangle)]
-pub extern "C" fn translator_init(from_lang: *const c_char, to_lang: *const c_char) -> i32 {
+pub unsafe extern "C" fn translator_init(from_lang: *const c_char, to_lang: *const c_char) -> i32 {
     unsafe {
         let from_lang = c_str_to_string(from_lang).unwrap_or_else(|| "auto".to_string());
         let to_lang = c_str_to_string(to_lang).unwrap_or_else(|| "en".to_string());
@@ -60,8 +76,12 @@ pub extern "C" fn translator_init(from_lang: *const c_char, to_lang: *const c_ch
 
 /// Initialize Translator configuration with an explicit remote server and
 /// optional API key. Null pointers fall back to defaults.
+///
+/// # Safety
+///
+/// Every pointer is null or a NUL-terminated string valid for the call.
 #[unsafe(no_mangle)]
-pub extern "C" fn translator_init_remote(
+pub unsafe extern "C" fn translator_init_remote(
     from_lang: *const c_char,
     to_lang: *const c_char,
     server_addr: *const c_char,
@@ -99,8 +119,12 @@ pub extern "C" fn translator_init_remote(
 /// Initialize Translator configuration for the LibreTranslate protocol with an
 /// explicit remote server and optional API key (sent in the body as `api_key`).
 /// Null pointers fall back to defaults.
+///
+/// # Safety
+///
+/// Every pointer is null or a NUL-terminated string valid for the call.
 #[unsafe(no_mangle)]
-pub extern "C" fn translator_init_libretranslate(
+pub unsafe extern "C" fn translator_init_libretranslate(
     from_lang: *const c_char,
     to_lang: *const c_char,
     server_addr: *const c_char,
@@ -135,9 +159,13 @@ pub extern "C" fn translator_init_libretranslate(
     }
 }
 
-/// Extract audio segment from media file
+/// Extract audio segment from media file.
+///
+/// # Safety
+///
+/// Both pointers are null or NUL-terminated strings valid for the call.
 #[unsafe(no_mangle)]
-pub extern "C" fn extract_audio(
+pub unsafe extern "C" fn extract_audio(
     input_path: *const c_char,
     output_path: *const c_char,
     start_ms: u64,
@@ -173,9 +201,14 @@ pub extern "C" fn extract_audio(
     }
 }
 
-/// Translate text
+/// Translate text. Returns an owned C string the caller frees with
+/// `free_string`, or null on failure.
+///
+/// # Safety
+///
+/// `text` is null or a NUL-terminated string valid for the call.
 #[unsafe(no_mangle)]
-pub extern "C" fn translate_text(text: *const c_char) -> *mut c_char {
+pub unsafe extern "C" fn translate_text(text: *const c_char) -> *mut c_char {
     unsafe {
         let text_str = match c_str_to_string(text) {
             Some(s) => s,
@@ -203,9 +236,16 @@ pub extern "C" fn translate_text(text: *const c_char) -> *mut c_char {
     }
 }
 
-/// Translate SRT file
+/// Translate SRT file.
+///
+/// # Safety
+///
+/// Both pointers are null or NUL-terminated strings valid for the call.
 #[unsafe(no_mangle)]
-pub extern "C" fn translate_srt(input_path: *const c_char, output_path: *const c_char) -> i32 {
+pub unsafe extern "C" fn translate_srt(
+    input_path: *const c_char,
+    output_path: *const c_char,
+) -> i32 {
     unsafe {
         let input = match c_str_to_string(input_path) {
             Some(s) => s,
@@ -242,9 +282,13 @@ pub extern "C" fn translate_srt(input_path: *const c_char, output_path: *const c
     }
 }
 
-/// Offset SRT file timestamps
+/// Offset SRT file timestamps.
+///
+/// # Safety
+///
+/// Both pointers are null or NUL-terminated strings valid for the call.
 #[unsafe(no_mangle)]
-pub extern "C" fn offset_srt(
+pub unsafe extern "C" fn offset_srt(
     input_path: *const c_char,
     output_path: *const c_char,
     offset_ms: i64,
@@ -277,9 +321,14 @@ pub extern "C" fn offset_srt(
     }
 }
 
-/// Free a C string allocated by this library
+/// Free a C string allocated by this library.
+///
+/// # Safety
+///
+/// `s` is null, or a pointer this library returned from `translate_text` and
+/// has not already been freed.
 #[unsafe(no_mangle)]
-pub extern "C" fn free_string(s: *mut c_char) {
+pub unsafe extern "C" fn free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe {
             let _ = CString::from_raw(s);

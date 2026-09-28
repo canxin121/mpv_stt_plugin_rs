@@ -461,6 +461,19 @@ pub struct AsyncTranslationQueue {
     generation: Arc<AtomicU64>,
 }
 
+/// Everything the worker thread owns for the lifetime of one batch: the
+/// result channel back to the plugin, the source resolution, and the two
+/// cancellation handles. Grouped so a batch's plumbing travels as one value
+/// instead of as a run of identically-typed `&Arc<...>` arguments.
+struct BatchContext<'a> {
+    result_sender: &'a Sender<QueuedResult>,
+    config: &'a Arc<TranslatorConfig>,
+    shutdown_flag: &'a Arc<AtomicBool>,
+    generation: &'a Arc<AtomicU64>,
+    runtime: &'a tokio::runtime::Runtime,
+    client: &'a reqwest::Client,
+}
+
 impl AsyncTranslationQueue {
     pub fn new(config: TranslatorConfig) -> Self {
         let (task_sender, task_receiver) = channel::<Option<QueuedTask>>();
@@ -599,30 +612,33 @@ impl AsyncTranslationQueue {
 
             Self::process_remote(
                 &tasks,
-                &result_sender,
-                &config,
-                &shutdown_flag,
-                &generation,
+                BatchContext {
+                    result_sender: &result_sender,
+                    config: &config,
+                    shutdown_flag: &shutdown_flag,
+                    generation: &generation,
+                    runtime,
+                    client: &client,
+                },
                 current_generation,
-                runtime,
-                &client,
             );
 
             debug!(tasks = task_count, "translation batch finished");
         }
     }
 
-    /// Process translation tasks using the remote DeepL-compatible API
-    fn process_remote(
-        tasks: &[TranslationTask],
-        result_sender: &Sender<QueuedResult>,
-        config: &Arc<TranslatorConfig>,
-        shutdown_flag: &Arc<AtomicBool>,
-        generation: &Arc<AtomicU64>,
-        task_generation: u64,
-        runtime: &tokio::runtime::Runtime,
-        client: &reqwest::Client,
-    ) {
+    /// Process one batch: hand every task to the resolved translation source,
+    /// `concurrency` at a time, and forward the outcomes back as they land.
+    fn process_remote(tasks: &[TranslationTask], batch: BatchContext<'_>, task_generation: u64) {
+        let BatchContext {
+            result_sender,
+            config,
+            shutdown_flag,
+            generation,
+            runtime,
+            client,
+        } = batch;
+
         if tasks.is_empty() {
             return;
         }
@@ -831,7 +847,6 @@ impl Drop for AsyncTranslationQueue {
 /// `{"text": [..], "target_lang": "ZH", "source_lang": "EN"}` and an optional
 /// `Authorization: DeepL-Auth-Key {key}` header. Response
 /// `{"translations": [{"detected_source_language", "text"}]}`.
-
 fn deepl_url(source: &ResolvedSource) -> String {
     format!("{}/v1/translate", source.server_addr.trim_end_matches('/'))
 }
@@ -928,7 +943,6 @@ async fn deepl_translate_async(
 /// "format": "text", "api_key": "..."}` (key optional, in body — LibreTranslate
 /// does NOT use an Authorization header). Response: single q →
 /// `{"translatedText": "..."}`; array q → `{"translations": [...]}`.
-
 fn libre_url(source: &ResolvedSource) -> String {
     format!("{}/translate", source.server_addr.trim_end_matches('/'))
 }

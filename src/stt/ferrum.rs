@@ -423,7 +423,7 @@ impl FerrumBackend {
         // Pad last frame with zeros if not aligned.
         let rem = pcm.len() % frame_size;
         if rem != 0 {
-            pcm.extend(std::iter::repeat(0).take(frame_size - rem));
+            pcm.extend(std::iter::repeat_n(0, frame_size - rem));
         }
 
         let mut encoded = Vec::with_capacity(pcm.len() / 2);

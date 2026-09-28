@@ -5,6 +5,7 @@ use std::path::Path;
 use tracing::{debug, trace};
 
 /// Manages subtitles in memory and syncs to disk
+#[derive(Default)]
 pub struct SubtitleManager {
     /// Subtitles indexed by start time in milliseconds
     entries: BTreeMap<u32, SubtitleEntry>,
@@ -14,8 +15,9 @@ pub struct SubtitleManager {
 impl SubtitleManager {
     pub fn new() -> Self {
         Self {
-            entries: BTreeMap::new(),
+            // SRT cue numbering starts at 1, so an empty manager does too.
             next_index: 1,
+            ..Default::default()
         }
     }
 
@@ -86,7 +88,7 @@ impl SubtitleManager {
 
         // Reindex entries sequentially
         self.next_index = 1;
-        for (_, entry) in self.entries.iter_mut() {
+        for entry in self.entries.values_mut() {
             entry.index = self.next_index;
             srt.append_entry(entry.clone());
             self.next_index += 1;

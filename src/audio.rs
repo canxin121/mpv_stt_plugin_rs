@@ -248,7 +248,7 @@ impl AudioExtractor {
                     .run(&decoded, &mut resampled)
                     .map_err(|e| ffmpeg_err("resample failed", e))?;
 
-                let frames = resampled.samples() as usize;
+                let frames = resampled.samples();
                 if frames == 0 {
                     continue;
                 }
@@ -305,7 +305,7 @@ impl AudioExtractor {
                     .run(&decoded, &mut resampled)
                     .map_err(|e| ffmpeg_err("resample failed", e))?;
 
-                let frames = resampled.samples() as usize;
+                let frames = resampled.samples();
                 if frames == 0 {
                     continue;
                 }

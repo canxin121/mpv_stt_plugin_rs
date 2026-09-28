@@ -102,11 +102,37 @@ ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg", rev = "3751e28
 tracing-android = "0.2.0"
 
 [features]
-# Pure remote client: both backends are compiled in, the active one is picked
-# at runtime via `config.stt.backend`.
+# Pure remote client: both protocols are compiled in, the active one is picked
+# at runtime by the `protocol` of the STT source `[stt] source` names.
 default = ["stt_ferrum", "stt_openai"]
 stt_ferrum = ["dep:hex", "dep:opusic-sys"]
 stt_openai = []
+
+[lints.clippy]
+# The group sits below the individual `allow`s so a listed lint can opt out.
+all = { level = "deny", priority = -1 }
+# Collapsing these hurts more than it helps here: the collapsed form is a
+# longer one-line expression, and several of the sites pair a cheap guard with
+# a body whose comment explains why the two conditions belong together. The
+# nesting is what keeps the shape of the decision readable.
+collapsible_if = "allow"
+# `&x` where `x` is already a reference. The signal is not worth the edit
+# churn: the call sites in question build `&str`/`&Path` for a generic
+# parameter, where the extra `&` is how the code reads best.
+needless_borrows_for_generic_args = "allow"
+# Which of two equivalent forms a small `impl` takes (hand-written vs derived)
+# is not a defect worth failing a build over.
+derivable_impls = "allow"
+# A doc comment belongs to the item below it even when the item is a private
+# helper, and one blank line there is a readability choice, not a bug.
+empty_line_after_doc_comments = "allow"
+# `format!("{}", &x)` in a log field: the `&` is noise, not a mistake, and
+# rewriting every one of them is churn without a correctness payoff.
+useless_borrows_in_formatting = "allow"
+# `if a > b { a - b } else { 0 }` written out where the guard is the point: the
+# branches sit next to the comments explaining the millisecond comparison, and
+# `saturating_sub` would hide which side is the subtrahend.
+implicit_saturating_sub = "allow"
 
 [profile.release]
 opt-level = 3

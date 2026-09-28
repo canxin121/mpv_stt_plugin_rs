@@ -52,9 +52,14 @@ pub use openai::SttOpenAiConfig;
 
 /// The STT backend of the selected source. Both remote protocols are compiled
 /// in; which one runs is decided from `[stt] source` at startup.
+///
+/// The ferrum backend is boxed: it carries the whole resolved config inline
+/// (~1.2 KB, against ~120 bytes for the OpenAI one), and one `SttRunner` lives
+/// for the lifetime of a session, so the indirection costs nothing and keeps
+/// the enum from sizing every move to its largest arm.
 pub enum SttRunner {
     #[cfg(feature = "stt_ferrum")]
-    Ferrum(ferrum::FerrumBackend),
+    Ferrum(Box<ferrum::FerrumBackend>),
     #[cfg(feature = "stt_openai")]
     OpenAi(openai::OpenAiBackend),
 }
@@ -93,7 +98,9 @@ impl SttRunner {
                         encrypted = ferrum_cfg.enable_encryption,
                         "selected the STT source"
                     );
-                    Ok(SttRunner::Ferrum(ferrum::FerrumBackend::new(ferrum_cfg)?))
+                    Ok(SttRunner::Ferrum(Box::new(ferrum::FerrumBackend::new(
+                        ferrum_cfg,
+                    )?)))
                 }
                 #[cfg(not(feature = "stt_ferrum"))]
                 {

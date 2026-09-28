@@ -47,15 +47,14 @@ impl fmt::Display for SubtitleEntry {
     }
 }
 
+#[derive(Default)]
 pub struct SrtFile {
     pub entries: Vec<SubtitleEntry>,
 }
 
 impl SrtFile {
     pub fn new() -> Self {
-        Self {
-            entries: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn parse<P: AsRef<Path>>(path: P) -> Result<Self> {
