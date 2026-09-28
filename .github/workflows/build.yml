@@ -1,0 +1,213 @@
+name: build
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  desktop:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux-x86_64
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            platform: darwin-arm64
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            platform: windows-x86_64
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config
+
+      # macOS links the brew FFmpeg dylibs at their install paths; nothing is
+      # compiled from source.
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ffmpeg
+
+      # Bash steps don't inherit the MSVC INCLUDE/LIB environment.
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Git Bash prepends its own /usr/bin — which ships a GNU link.exe — ahead
+      # of the MSVC bin directories, so rustc's link step picks the wrong
+      # linker and fails. Point cargo at the real one by full path.
+      - name: Point cargo at the MSVC linker
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          vc="${VCToolsInstallDir//\\//}"
+          vc="${vc%/}"
+          test -f "${vc}/bin/Hostx64/x64/link.exe" || {
+            echo "MSVC link.exe not found (VCToolsInstallDir=${VCToolsInstallDir:-unset})" >&2
+            exit 1
+          }
+          echo "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=${vc}/bin/Hostx64/x64/link.exe" >> "$GITHUB_ENV"
+
+      # The BtbN FFmpeg package is 60-100 MB and the mpv header clone never
+      # changes, so keep both (and the cargo registry) across runs.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target/mpv-headers
+            target/ffmpeg
+          key: deps-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: deps-${{ runner.os }}-
+
+      - name: Build (${{ matrix.platform }})
+        shell: bash
+        run: |
+          ./scripts/build-all.sh -p ${{ matrix.platform }} || {
+            echo "=== dist/build.log (tail 200) ===";
+            tail -n 200 dist/build.log || true;
+            echo "=== error-ish lines ===";
+            grep -nE "error|Error|failed|Failed|cannot|not found|panic" dist/build.log | tail -n 60 || true;
+            exit 1;
+          }
+
+      # The unit tests link and load FFmpeg, so they run on the platform whose
+      # build just resolved a dev prefix. `--lib` only: the #[ignore]d tests
+      # need a live STT server and real speech, which CI has neither of.
+      - name: Unit tests
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: |
+          export FFMPEG_DIR="$PWD/target/ffmpeg/linux-x86_64"
+          export LD_LIBRARY_PATH="${FFMPEG_DIR}/lib:${LD_LIBRARY_PATH:-}"
+          export MPV_INCLUDE_DIR="$PWD/target/mpv-headers/include"
+          export BINDGEN_EXTRA_CLANG_ARGS="-I${MPV_INCLUDE_DIR}"
+          export RUSTFLAGS="-A deprecated"
+          cargo test --lib --release
+
+      - name: Upload artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpv_stt_plugin_rs-${{ matrix.platform }}
+          if-no-files-found: error
+          path: |
+            dist/${{ matrix.platform }}/
+            dist/MANIFEST.txt
+            dist/build.log
+
+  android:
+    name: android (arm64-v8a)
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_NDK_HOME: ${{ github.workspace }}/target/android-ndk-r29
+      NDK: ${{ github.workspace }}/target/android-ndk-r29
+    steps:
+      - uses: actions/checkout@v4
+
+      # meson/ninja and the autotools are for the libmpv + FFmpeg source build
+      # that scripts/android-mpv drives; cmake is what opusic-sys (bundled
+      # libopus) uses.
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang make nasm cmake pkgconf autoconf libtool gperf ninja-build python3-pip
+          sudo pip3 install meson
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Download the Android NDK
+        run: |
+          mkdir -p "${{ github.workspace }}/target"
+          curl -fsSL -o /tmp/android-ndk.zip \
+            https://dl.google.com/android/repository/android-ndk-r29-linux.zip
+          # The zip's top-level directory is android-ndk-r29, which already
+          # matches $ANDROID_NDK_HOME — extracting there needs no move.
+          unzip -q /tmp/android-ndk.zip -d "${{ github.workspace }}/target"
+          test -d "$ANDROID_NDK_HOME/toolchains" && test -f "$ANDROID_NDK_HOME/source.properties" \
+            || { echo "unexpected NDK layout at $ANDROID_NDK_HOME"; exit 1; }
+
+      - name: Build (android)
+        shell: bash
+        run: |
+          # Run in a minimal environment: the cross-build's configure/make/meson
+          # steps accumulate environment variables, and every later command
+          # (date, uname, cargo) then fails with "Argument list too long".
+          # scripts/android-mpv re-exports what it needs internally.
+          env -i \
+            PATH="$PATH" HOME="$HOME" TERM=xterm \
+            CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" \
+            ANDROID_NDK_HOME="$ANDROID_NDK_HOME" NDK="$NDK" \
+            ./scripts/build-android.sh -a arm64-v8a || {
+            echo "=== dist/build.log (tail 300) ===";
+            tail -n 300 dist/build.log || true;
+            echo "=== error-ish lines ===";
+            grep -nE "error|Error|failed|Failed|cannot|not found|panic|Argument list" dist/build.log | tail -n 80 || true;
+            exit 1;
+          }
+
+      - name: Upload artifacts
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mpv_stt_plugin_rs-android-arm64-v8a
+          if-no-files-found: error
+          path: |
+            dist/android/
+            dist/build.log
+
+  release:
+    name: release
+    needs: [desktop, android]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      # One zip per platform so each download is self-contained: the plugin,
+      # plus the FFmpeg shared libraries it needs on Linux and Windows.
+      - name: Package
+        run: |
+          cd artifacts
+          for d in */; do
+            name="${d%/}"
+            zip -qr "../${name}.zip" "$name"
+          done
+          cd ..
+          ls -lh ./*.zip
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            ./*.zip

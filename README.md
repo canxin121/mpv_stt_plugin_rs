@@ -26,9 +26,12 @@ mpv_stt_plugin_rs/
 │       ├── mod.rs           # SttRunner / SttBackend 调度
 │       ├── ferrum.rs        # ferrum 协议后端(stt_ferrum)
 │       └── openai.rs        # OpenAI 协议后端(stt_openai)
+├── .github/workflows/build.yml  # CI:push/PR 构建,tag 发 Release
 ├── scripts/
 │   ├── cargo-with-deps.sh   # 宿主构建(自动拉 mpv 头文件 + 设 FFMPEG_DIR)
-│   ├── build-android.sh     # Android 交叉编译
+│   ├── build-all.sh         # 桌面全平台构建(darwin/linux/windows)
+│   ├── build-android.sh     # Android 交叉编译(含 libmpv/FFmpeg 源码构建)
+│   ├── android-mpv/         # Android 的 libmpv + FFmpeg 构建助手(裁剪自 mpv-android)
 │   ├── gen-test-media.sh    # 由 testdata/ 生成容器矩阵(target/testmedia)
 │   └── e2e-media-matrix.sh  # 逐容器真播一遍、断言出字幕(静音运行)
 ├── testdata/ja_all.mp4      # 容器矩阵的源素材(见「测试」)
@@ -86,10 +89,35 @@ STT 侧**没有内置源**:每个源都要写清 `protocol` 和 `server_addr`,
 - macOS: `brew install ffmpeg`(插件链接其 dylib),需 `clang`(bindgen 用,brew 自带)
 - Linux: `sudo apt-get install clang pkg-config` + 预编译 FFmpeg(`FFMPEG_DIR` 指向 dev 前缀)
 - Windows: MSVC 工具链 + 预编译 FFmpeg 共享包
-- Android(交叉): NDK + mpv-android 的 libmpv/libffmpeg 前缀
+- Android(交叉): NDK,libmpv / FFmpeg 由 `scripts/build-android.sh` 现编
 
 **不需要安装 `libmpv-dev`**:`scripts/cargo-with-deps.sh` 会自动 `git clone --depth 1`
 mpv 仓库到 `target/mpv-headers` 并导出 `MPV_INCLUDE_DIR` / `BINDGEN_EXTRA_CLANG_ARGS`。
+
+### 全平台构建
+
+```bash
+./scripts/build-all.sh                       # 当前能建的桌面平台全建一遍
+./scripts/build-all.sh -p darwin-arm64       # 只建一个
+./scripts/build-all.sh -p linux-x86_64,windows-x86_64
+./scripts/build-all.sh -l                    # 列出支持的平台
+```
+
+脚本自己解析每个平台的 FFmpeg 开发前缀(macOS 用 brew;Linux / Windows 下 BtbN 的
+`lgpl-shared` 包,缓存在 `target/ffmpeg/`),所以**不需要预先装 FFmpeg**;FFmpeg 是
+动态链接的,源码一个字节都不编。产物在 `dist/<平台>/`:
+
+| 平台 | 产物 |
+|---|---|
+| `linux-x86_64` | `libmpv_stt_plugin_rs.so` + `runtime/*.so` |
+| `darwin-arm64` / `darwin-x86_64` | `libmpv_stt_plugin_rs.so`(链接 brew 的 dylib) |
+| `windows-x86_64` | `mpv_stt_plugin_rs.dll` + `runtime/*.dll` |
+
+Linux / Windows 的 `runtime/` 是插件运行时需要的 FFmpeg 动态库,要和插件放在一起
+(`LD_LIBRARY_PATH` / DLL 搜索路径)。macOS 直接链接 brew 的绝对路径,没有 `runtime/`。
+
+在**当前机器自己那个平台**上,如果设了 `MPV_STT_PLUGIN_RS_CONFIG`,脚本构建完会顺手
+跑一遍 [e2e 容器矩阵](#容器矩阵);`MPV_STT_PLUGIN_RS_SKIP_E2E=1` 可以关掉。
 
 ### 宿主构建
 
@@ -112,15 +140,29 @@ ls target/release/libmpv_stt_plugin_rs.dylib
 
 ### Android 构建
 
+Android 上没有现成的 libmpv / libavcodec 可以链接,脚本会把它们编出来:
+`scripts/android-mpv/` 是从 mpv-android 的 buildscripts 裁剪来的助手,产出
+`target/android-mpv/prefix/<arch>/usr/local` 下的 libmpv + FFmpeg 前缀,插件链接它。
+所以第一次跑的时间主要花在 FFmpeg 和 mpv 上,需要 NDK、meson、ninja 和一个能交叉
+编译的 pkg-config。
+
 ```bash
-export ANDROID_NDK_HOME=~/Android/Sdk/ndk/26.1.10909125
-export MPV_ANDROID=/path/to/mpv-android     # 提供 libmpv.so / libffmpeg 前缀
-./scripts/build-android.sh -a arm64-v8a
-# 多 ABI:./scripts/build-android.sh --all-abis
-# 单后端:./scripts/build-android.sh -a arm64-v8a -f stt_openai
+export ANDROID_NDK_HOME=~/Android/Sdk/ndk/29.0.14206865   # NDK r29 或更新
+./scripts/build-android.sh                    # arm64-v8a
+./scripts/build-android.sh -a arm64-v8a,x86_64
+./scripts/build-android.sh --all-abis
+./scripts/build-android.sh -f stt_openai      # 单后端
 ```
 
-输出在 `dist/android/<abi>/libmpv_stt_plugin_rs.so`。
+输出在 `dist/android/<abi>/libmpv_stt_plugin_rs.so`。默认只编 64 位:32 位 ABI 会卡在
+上游 ffmpeg-sys-next 的 Vulkan stub 上——它把 `sizeof(VkPhysicalDeviceFeatures2)`
+硬编码成 240,只在 64 位指针下成立,于是 bindgen 直接失败。
+
+### CI 与发布
+
+`.github/workflows/build.yml` 把上面几条串起来:push 到 `master` / 开 PR 时构建三个
+桌面平台加 Android arm64-v8a 作为验证;推 `v*` tag 时额外把这四个平台打成一个
+GitHub Release,每个平台的 zip 是自包含的(插件加它需要的 FFmpeg 动态库)。
 
 ## 安装
 
