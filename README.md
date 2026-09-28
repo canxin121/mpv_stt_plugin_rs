@@ -96,6 +96,13 @@ STT 侧**没有内置源**:每个源都要写清 `protocol` 和 `server_addr`,
 **不需要安装 `libmpv-dev`**:`scripts/cargo-with-deps.sh` 会自动 `git clone --depth 1`
 mpv 仓库到 `target/mpv-headers` 并导出 `MPV_INCLUDE_DIR` / `BINDGEN_EXTRA_CLANG_ARGS`。
 
+`third_party/mpv-client` 是 `mpv-client` 的 fork,靠 `[patch.crates-io]` 生效
+(crates.io 上那份在 MSVC 下编不过,见该目录的提交说明),所以**先拉子模块**:
+
+```bash
+git clone --recurse-submodules <repo>      # 或者已有的仓库里 git submodule update --init
+```
+
 ### 全平台构建
 
 ```bash

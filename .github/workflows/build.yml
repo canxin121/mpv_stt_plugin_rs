@@ -28,7 +28,11 @@ jobs:
             target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     steps:
+      # The mpv-client fork is a submodule and Cargo.toml patches it in as a
+      # path dependency, so it has to be checked out here too.
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       - name: Install system deps (Linux)
         if: runner.os == 'Linux'
@@ -123,6 +127,8 @@ jobs:
       NDK: ${{ github.workspace }}/target/android-ndk-r29
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
 
       # meson/ninja and the autotools are for the libmpv + FFmpeg source build
       # that scripts/android-mpv drives; cmake is what opusic-sys (bundled
