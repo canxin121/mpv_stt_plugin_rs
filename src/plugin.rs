@@ -22,7 +22,7 @@ use crate::config::Config;
 use crate::srt::SrtFile;
 use crate::stt::{SttBackend, SttDeviceNotice, SttRunner};
 use crate::subtitle_manager::SubtitleManager;
-use crate::translate::{AsyncTranslationQueue, TranslationTask, TranslatorConfig};
+use crate::translate::{AsyncTranslationQueue, TranslationOutcome, TranslationTask, TranslatorConfig};
 
 struct TempPaths {
     _dir: TempDir,
@@ -279,6 +279,15 @@ struct PluginState {
     async_translation_queue: Option<AsyncTranslationQueue>,
     subtitle_manager: SubtitleManager,
     translation_cache: HashMap<u32, (String, String)>,
+    /// Cues the translation backend definitively failed on, so they are not
+    /// re-queued on every seek/chunk boundary. Cleared when the session is
+    /// restarted, when the cache is cleared, or when the user toggles
+    /// translation back on (an explicit "try again").
+    failed_translations: HashSet<u32>,
+    /// Whether the current session has already told the user that translation
+    /// stopped working. Keeps a broken backend to one OSD message per session
+    /// instead of one per chunk.
+    translation_failure_reported: bool,
     processed_chunks: HashSet<u64>,
     network_cache: Option<CachePaths>,
 
@@ -324,6 +333,8 @@ impl PluginState {
             async_translation_queue,
             subtitle_manager: SubtitleManager::new(),
             translation_cache: HashMap::new(),
+            failed_translations: HashSet::new(),
+            translation_failure_reported: false,
             processed_chunks: HashSet::new(),
             network_cache: None,
             running: false,
@@ -382,6 +393,24 @@ impl PluginState {
         }
     }
 
+    /// Whether this cue's translation has already been given up on.
+    fn translation_failed(&self, start_ms: u32) -> bool {
+        self.failed_translations.contains(&start_ms)
+    }
+
+    /// Allow every cue to be translated again: the user asked for translation
+    /// explicitly (toggle), or the whole cache was dropped.
+    fn reset_translation_failures(&mut self) {
+        if !self.failed_translations.is_empty() {
+            debug!(
+                "Clearing {} failed-translation record(s)",
+                self.failed_translations.len()
+            );
+        }
+        self.failed_translations.clear();
+        self.translation_failure_reported = false;
+    }
+
     fn enqueue_missing_translations_for_chunk(&mut self, chunk_start_ms: u64) {
         let Some(queue) = self.async_translation_queue.as_ref() else {
             return;
@@ -399,10 +428,16 @@ impl PluginState {
 
         let mut pending_tasks = Vec::new();
         let mut already_translated = 0usize;
+        let mut skipped_failed = 0usize;
 
         for (start_ms, entry) in entries {
             let original = entry.text.trim();
             if original.is_empty() {
+                continue;
+            }
+
+            if self.translation_failed(start_ms) {
+                skipped_failed += 1;
                 continue;
             }
 
@@ -424,6 +459,13 @@ impl PluginState {
                 start_ms,
                 text: entry.text.clone(),
             });
+        }
+
+        if skipped_failed > 0 {
+            trace!(
+                "Skipped {} entries whose translation already failed",
+                skipped_failed
+            );
         }
 
         if !pending_tasks.is_empty() {
@@ -464,6 +506,13 @@ impl PluginState {
                 "disabled"
             }
         );
+        if self.translate_enabled {
+            // Turning translation back on is an explicit retry: forget earlier
+            // give-ups and offer the untranslated cues to the backend again,
+            // which is how the user recovers after starting the gateway.
+            self.reset_translation_failures();
+            self.enqueue_missing_translations_for_chunk(self.current_pos_ms);
+        }
         let msg = if self.translate_enabled {
             "Translate: On"
         } else {
@@ -492,6 +541,7 @@ impl PluginState {
         // Drop in-memory state so a fresh playback re-transcribes from scratch.
         let chunk_entries = self.translation_cache.len();
         self.translation_cache.clear();
+        self.reset_translation_failures();
         self.processed_chunks.clear();
 
         info!(
@@ -979,51 +1029,47 @@ impl PluginState {
                 return false;
             }
 
-            // Detect seek forward (user skipped ahead)
-            if playback_pos_ms > last_ms {
-                debug!(
-                    "User seeked forward from {}ms to {}ms (delta: {}ms)",
-                    last_ms, new_pos, delta_ms
-                );
-                let _ = client.command(&[
-                    "show-text",
-                    &format!("STT: Jumped to {}", Self::format_progress(new_pos)),
-                    "3000",
-                ]);
+            let forward = playback_pos_ms > last_ms;
+            debug!(
+                "User seeked {} from {}ms to {}ms (delta: {}ms)",
+                if forward { "forward" } else { "backward" },
+                last_ms,
+                new_pos,
+                delta_ms
+            );
+            let _ = client.command(&[
+                "show-text",
+                &format!("STT: Seeked to {}", Self::format_progress(new_pos)),
+                "3000",
+            ]);
 
-                // Keep existing subtitles, just update processing cursor.
-                self.current_pos_ms = new_pos;
-                self.cancel_translation_inflight();
-                self.transcription_worker.cancel_inflight();
-                self.pending_transcription = None;
-                if self.is_chunk_processed(new_pos) {
-                    self.enqueue_missing_translations_for_chunk(new_pos);
-                }
-                return true;
-            }
-            // Detect seek backward
-            else {
-                debug!(
-                    "User seeked backward from {}ms to {}ms (delta: {}ms)",
-                    last_ms, new_pos, delta_ms
-                );
-                let _ = client.command(&[
-                    "show-text",
-                    &format!("STT: Seeked back to {}", Self::format_progress(new_pos)),
-                    "3000",
-                ]);
-
-                self.current_pos_ms = new_pos;
-                self.cancel_translation_inflight();
-                self.transcription_worker.cancel_inflight();
-                self.pending_transcription = None;
-                if self.is_chunk_processed(new_pos) {
-                    self.enqueue_missing_translations_for_chunk(new_pos);
-                }
-                return true;
-            }
+            self.current_pos_ms = new_pos;
+            self.handle_seek_to(new_pos, forward);
+            return true;
         }
         false
+    }
+
+    /// Realign the session after a seek to `new_pos` (already chunk-aligned).
+    ///
+    /// Seeking forward keeps the subtitles already generated: they still cover
+    /// the part of the file the user is skipping over, and dropping them would
+    /// leave a hole if the user seeks back. Seeking backward is different — the
+    /// chunks past the seek target were generated for a timeline the user is
+    /// rewinding into, so they are dropped and will be re-derived in order.
+    fn handle_seek_to(&mut self, new_pos: u64, forward: bool) {
+        self.cancel_translation_inflight();
+        self.transcription_worker.cancel_inflight();
+        self.pending_transcription = None;
+
+        if !forward {
+            self.subtitle_manager
+                .remove_after(new_pos.min(u64::from(u32::MAX)) as u32);
+        }
+
+        if self.is_chunk_processed(new_pos) {
+            self.enqueue_missing_translations_for_chunk(new_pos);
+        }
     }
 
     /// Process one chunk from network cache
@@ -1126,6 +1172,12 @@ impl PluginState {
                 already_translated += 1;
                 continue;
             }
+            // Already attempted and given up on (e.g. this session restarted
+            // mid-file, or the seek path re-queued this chunk): the original is
+            // on screen and stays there rather than being retried forever.
+            if self.translation_failed(start_ms) {
+                continue;
+            }
 
             pending_tasks.push(TranslationTask {
                 start_ms,
@@ -1189,19 +1241,33 @@ impl PluginState {
         info!("STT device notice: {}", msg);
     }
 
-    /// Process completed translation results from async queue
+    /// Process completed translation outcomes from the async queue.
+    ///
+    /// Translations are merged into the subtitle text. Give-ups are recorded
+    /// instead, so the cue is neither retried forever nor silently lost: the
+    /// original line stays on screen, and the user is told once that
+    /// translation is not coming. Nothing here can affect the STT session —
+    /// a dead translation backend leaves subtitles working and untranslated.
     fn process_translation_results(&mut self, client: &mut Handle, subtitle_path: Option<&Path>) {
-        if let Some(ref queue) = self.async_translation_queue {
-            let results = queue.try_recv_results();
-            if !results.is_empty() {
-                debug!("Received {} translation results", results.len());
+        let Some(ref queue) = self.async_translation_queue else {
+            return;
+        };
+        let outcomes = queue.try_recv_results();
+        if outcomes.is_empty() {
+            return;
+        }
+        debug!("Received {} translation outcomes", outcomes.len());
 
-                let main_srt = subtitle_path
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
+        let main_srt = subtitle_path
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
 
-                // Update subtitles as each translation completes.
-                for result in results {
+        let mut failed = 0usize;
+        let mut last_reason = String::new();
+
+        for outcome in outcomes {
+            match outcome {
+                TranslationOutcome::Translated(result) => {
                     self.translation_cache.insert(
                         result.start_ms,
                         (result.original.clone(), result.translated.clone()),
@@ -1210,6 +1276,33 @@ impl PluginState {
                         .update_translation(result.start_ms, &result.translated);
                     let _ = self.save_subs(client, &main_srt);
                 }
+                TranslationOutcome::Failed(failure) => {
+                    warn!(
+                        "Giving up on translation at {}ms: {}",
+                        failure.start_ms, failure.reason
+                    );
+                    // Remembering the failure is what keeps it from being
+                    // re-queued on every seek or chunk boundary.
+                    self.failed_translations.insert(failure.start_ms);
+                    failed += 1;
+                    last_reason = failure.reason;
+                }
+            }
+        }
+
+        if failed > 0 {
+            // The reason is worth seeing, but a backend that is down fails
+            // every cue, so say it once per session and keep the count in the
+            // log instead of on screen.
+            if !self.translation_failure_reported {
+                self.translation_failure_reported = true;
+                let msg = format!(
+                    "翻译失败 ({} 条), 仅显示原文: {}",
+                    failed,
+                    crate::translate::short_reason(&last_reason)
+                );
+                let _ = client.command(&["show-text", &msg, "5000"]);
+                info!("{}", msg);
             }
         }
     }
@@ -1250,6 +1343,7 @@ impl PluginState {
         self.paths.cleanup();
         self.subtitle_manager.clear();
         self.translation_cache.clear();
+        self.reset_translation_failures();
         self.processed_chunks.clear();
         self.network_cache = None;
         self.subs_loaded = false;
@@ -1363,6 +1457,8 @@ impl PluginState {
 
         self.subtitle_manager.clear();
         self.translation_cache.clear();
+        // A fresh media/session: earlier give-ups say nothing about this one.
+        self.reset_translation_failures();
         self.processed_chunks.clear();
         self.subtitle_manager.add_from_srt(&srt_file);
 
@@ -1842,6 +1938,42 @@ mod tests {
                 "missing {key}/{command} binding in {section:?}"
             );
         }
+    }
+
+    /// A cue whose translation was given up on must not be offered to the
+    /// backend again, and the user must be able to retry explicitly (toggle /
+    /// clear cache) once the backend is back.
+    #[test]
+    fn failed_translations_are_not_requeued_until_explicitly_reset() {
+        let mut state = PluginState::new(Config::default()).unwrap();
+
+        assert!(!state.translation_failed(1_000));
+        state.failed_translations.insert(1_000);
+        assert!(state.translation_failed(1_000));
+
+        // A give-up is per-cue: its neighbours are still offered.
+        assert!(!state.translation_failed(2_000));
+
+        state.reset_translation_failures();
+        assert!(!state.translation_failed(1_000));
+        assert!(
+            !state.translation_failure_reported,
+            "the next failure should be allowed to speak again"
+        );
+    }
+
+    /// Ending a session (stop / new file / plugin shutdown) starts a clean
+    /// slate, so a stale give-up cannot mute the next media's subtitles.
+    #[test]
+    fn stopping_a_session_clears_translation_failures() {
+        let mut state = PluginState::new(Config::default()).unwrap();
+        state.failed_translations.insert(1_000);
+        state.translation_failure_reported = true;
+
+        state.stop_transcription();
+
+        assert!(state.failed_translations.is_empty());
+        assert!(!state.translation_failure_reported);
     }
 
     #[test]

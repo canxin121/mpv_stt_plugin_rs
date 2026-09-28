@@ -258,6 +258,33 @@ pub struct TranslationResult {
     pub translated: String,
 }
 
+/// A translation that will never arrive: the queue gave up on it after its
+/// retries were exhausted. Reported so the caller can tell the user why new
+/// subtitles are staying untranslated, and so a dead backend is not retried
+/// for every single cue.
+#[derive(Debug, Clone)]
+pub struct TranslationFailure {
+    pub start_ms: u32,
+    pub reason: String,
+}
+
+/// Condense a transport error into something short enough for mpv's OSD, which
+/// renders one line and truncates. Keeps the status code and the server's own
+/// message when there is one, since that is what tells the user which of
+/// gateway / key / upstream is at fault.
+pub fn short_reason(reason: &str) -> String {
+    let reason = reason.trim();
+    if reason.is_empty() {
+        return "未知错误".to_string();
+    }
+    // Strip the error type this crate prepends; the OSD has no room for it.
+    let reason = reason
+        .strip_prefix("Translation failed: ")
+        .unwrap_or(reason)
+        .trim();
+    reason.chars().take(120).collect()
+}
+
 #[derive(Debug, Clone)]
 struct QueuedTask {
     generation: u64,
@@ -267,7 +294,16 @@ struct QueuedTask {
 #[derive(Debug, Clone)]
 struct QueuedResult {
     generation: u64,
-    result: TranslationResult,
+    outcome: TranslationOutcome,
+}
+
+/// What the worker managed to do with one task. `Failed` is not an error the
+/// caller can act on — the original subtitle is already on screen either way —
+/// but it is what lets the plugin stop re-queueing the same cue forever.
+#[derive(Debug, Clone)]
+pub enum TranslationOutcome {
+    Translated(TranslationResult),
+    Failed(TranslationFailure),
 }
 
 /// Async translation queue that processes translations in background
@@ -320,13 +356,15 @@ impl AsyncTranslationQueue {
         let _ = self.task_sender.send(Some(QueuedTask { generation, task }));
     }
 
-    /// Try to get completed translation results (non-blocking)
-    pub fn try_recv_results(&self) -> Vec<TranslationResult> {
+    /// Try to get completed translation outcomes (non-blocking). Translations
+    /// and give-ups alike are returned, because the caller needs to know not to
+    /// queue that cue again.
+    pub fn try_recv_results(&self) -> Vec<TranslationOutcome> {
         let mut results = Vec::new();
         let generation = self.generation.load(Ordering::Acquire);
         while let Ok(queued) = self.result_receiver.try_recv() {
             if queued.generation == generation {
-                results.push(queued.result);
+                results.push(queued.outcome);
             } else {
                 trace!(
                     "Dropping stale translation result from generation {} (current {})",
@@ -469,17 +507,17 @@ impl AsyncTranslationQueue {
 
             let mut futures = stream.buffer_unordered(concurrency);
 
-            while let Some(result) = futures.next().await {
+            while let Some(outcome) = futures.next().await {
                 if shutdown_flag.load(Ordering::Acquire) {
                     break;
                 }
                 if generation.load(Ordering::Relaxed) != task_generation {
                     break;
                 }
-                if let Some(result) = result {
+                if let Some(outcome) = outcome {
                     let queued = QueuedResult {
                         generation: task_generation,
-                        result,
+                        outcome,
                     };
                     if sender.send(queued).is_err() {
                         debug!("Main thread dropped receiver, exiting");
@@ -490,7 +528,13 @@ impl AsyncTranslationQueue {
         });
     }
 
-    /// Translate a single task with retry logic
+    /// Translate a single task with retry logic.
+    ///
+    /// `None` means "no answer, and the caller should not care" — the task was
+    /// cancelled or superseded. A `Failed` outcome is the opposite: the
+    /// translation is not coming, so the caller must stop re-queueing this cue.
+    /// Neither case is an error for the subtitle itself; the original text is
+    /// already on screen and stays there.
     async fn translate_single_task_async(
         task: TranslationTask,
         config: Arc<TranslatorConfig>,
@@ -498,12 +542,16 @@ impl AsyncTranslationQueue {
         generation: Arc<AtomicU64>,
         task_generation: u64,
         client: Arc<reqwest::Client>,
-    ) -> Option<TranslationResult> {
+    ) -> Option<TranslationOutcome> {
         let from_lang = normalize_lang_code(&config.from_lang, true);
         let to_lang = normalize_lang_code(&config.to_lang, false);
 
         let mut attempt = 0usize;
         let mut delay_ms = RETRY_BASE_DELAY_MS;
+        // Why the last attempt failed; reported if every attempt fails. Seeded
+        // so a give-up always has something to show even in the impossible case
+        // where the loop exits without recording one.
+        let mut last_error;
 
         loop {
             // Check shutdown flag
@@ -539,13 +587,14 @@ impl AsyncTranslationQueue {
                     if generation.load(Ordering::Relaxed) != task_generation {
                         return None;
                     }
-                    return Some(TranslationResult {
+                    return Some(TranslationOutcome::Translated(TranslationResult {
                         start_ms: task.start_ms,
                         original: task.text.clone(),
                         translated,
-                    });
+                    }));
                 }
                 Ok(_) => {
+                    last_error = "server returned an empty translation".to_string();
                     warn!(
                         "Translation returned empty for task at {}ms (attempt {})",
                         task.start_ms,
@@ -553,6 +602,7 @@ impl AsyncTranslationQueue {
                     );
                 }
                 Err(e) => {
+                    last_error = e.to_string();
                     warn!(
                         "Translation failed for task at {}ms (attempt {}): {}",
                         task.start_ms,
@@ -564,7 +614,10 @@ impl AsyncTranslationQueue {
 
             attempt += 1;
             if attempt > MAX_TRANSLATE_RETRIES {
-                return None;
+                return Some(TranslationOutcome::Failed(TranslationFailure {
+                    start_ms: task.start_ms,
+                    reason: last_error,
+                }));
             }
 
             tokio::select! {
@@ -1055,6 +1108,63 @@ mod tests {
         assert_eq!(normalize_lang_code("auto", true), "");
         assert_eq!(normalize_lang_code("zh", true), "zh");
         assert_eq!(normalize_lang_code("ja", false), "ja");
+    }
+
+    #[test]
+    fn short_reason_is_osd_sized() {
+        assert_eq!(short_reason(""), "未知错误");
+        // The crate's error prefix is noise on a one-line OSD.
+        assert_eq!(
+            short_reason("Translation failed: Server error (503): upstream not configured"),
+            "Server error (503): upstream not configured"
+        );
+        // A long upstream body cannot push the message off screen.
+        let long = "x".repeat(500);
+        assert_eq!(short_reason(&long).chars().count(), 120);
+    }
+
+    /// A backend that is down must report a give-up, not an error: the cue has
+    /// no translation, but the original text (added before translation was even
+    /// attempted) is untouched. The reason is what the plugin shows the user.
+    #[test]
+    fn failed_translation_is_reported_as_a_give_up() {
+        let server = spawn_stub_deepl(|_head| {
+            (503, r#"{"message":"upstream not configured"}"#.to_string())
+        });
+        let config = TranslatorConfig::new("en".to_string(), "zh".to_string())
+            .with_server_addr(server)
+            .with_timeout_ms(5_000);
+        let queue = AsyncTranslationQueue::new(config);
+        queue.submit(TranslationTask {
+            start_ms: 1_500,
+            text: "hello".to_string(),
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let outcome = loop {
+            if let Some(outcome) = queue.try_recv_results().into_iter().next() {
+                break outcome;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "translation worker never reported an outcome"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        match outcome {
+            TranslationOutcome::Failed(failure) => {
+                assert_eq!(failure.start_ms, 1_500);
+                assert!(
+                    failure.reason.contains("503"),
+                    "reason should carry the status: {}",
+                    failure.reason
+                );
+            }
+            TranslationOutcome::Translated(result) => {
+                panic!("expected a give-up, got a translation: {result:?}")
+            }
+        }
     }
 
     /// End-to-end check against a running subtitle-gateway. Ignored by
