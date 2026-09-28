@@ -11,7 +11,7 @@ use std::sync::{
 use std::thread;
 use std::time::Instant;
 use tempfile::TempDir;
-use tracing::{debug, error, info, Span, trace, warn};
+use tracing::{Span, debug, error, info, trace, warn};
 
 use crate::audio::AudioExtractor;
 use crate::common::MpvSttError;
@@ -20,7 +20,9 @@ use crate::logging::{self, LogSettings};
 use crate::srt::SrtFile;
 use crate::stt::{SttBackend, SttDeviceNotice, SttRunner};
 use crate::subtitle_manager::SubtitleManager;
-use crate::translate::{AsyncTranslationQueue, TranslationOutcome, TranslationTask, TranslatorConfig};
+use crate::translate::{
+    AsyncTranslationQueue, TranslationOutcome, TranslationTask, TranslatorConfig,
+};
 
 struct TempPaths {
     _dir: TempDir,
@@ -407,6 +409,17 @@ impl PluginState {
             .libretranslate
             .as_ref()
             .unwrap_or(&default_libretranslate);
+        let default_google = crate::config::TranslateGoogleConfig::default();
+        let google = config.translate.google.as_ref().unwrap_or(&default_google);
+        let default_edge = crate::config::TranslateEdgeConfig::default();
+        let edge = config.translate.edge.as_ref().unwrap_or(&default_edge);
+        let default_alibaba = crate::config::TranslateAlibabaConfig::default();
+        let alibaba = config
+            .translate
+            .alibaba
+            .as_ref()
+            .unwrap_or(&default_alibaba);
+
         TranslatorConfig::new(
             config.translate.from_lang.clone(),
             config.translate.to_lang.clone(),
@@ -418,6 +431,10 @@ impl PluginState {
         .with_api_key(config.translate.api_key.clone())
         .with_libretranslate_server_addr(libretranslate.server_addr.clone())
         .with_libretranslate_api_key(libretranslate.api_key.clone())
+        .with_google_server_addr(google.server_addr.clone())
+        .with_edge_server_addr(edge.server_addr.clone())
+        .with_edge_api_key(edge.api_key.clone())
+        .with_alibaba_server_addr(alibaba.server_addr.clone())
     }
 
     fn local_chunk_size(&self) -> u64 {
@@ -520,8 +537,7 @@ impl PluginState {
         if !pending_tasks.is_empty() {
             trace!(
                 queued = pending_tasks.len(),
-                already_translated,
-                "re-queueing missing translations"
+                already_translated, "re-queueing missing translations"
             );
             for task in pending_tasks {
                 queue.submit(task);
@@ -815,7 +831,10 @@ impl PluginState {
                 }
             }
 
-            info!(start_ms = self.current_pos_ms, "network stream session ready");
+            info!(
+                start_ms = self.current_pos_ms,
+                "network stream session ready"
+            );
         } else {
             // Local file mode
             debug!("local file detected");
@@ -1075,7 +1094,11 @@ impl PluginState {
                 }
             }
 
-            debug!(start_ms = self.current_pos_ms, remaining_ms = time_left, "scheduling a local chunk");
+            debug!(
+                start_ms = self.current_pos_ms,
+                remaining_ms = time_left,
+                "scheduling a local chunk"
+            );
             self.process_chunk_local(media_path, subtitle_path);
         } else {
             // Finished processing
@@ -1204,7 +1227,10 @@ impl PluginState {
         // Dump cache
         let start_sec = self.current_pos_ms as f64 / 1000.0;
         let end_sec = (self.current_pos_ms + chunk_ms) as f64 / 1000.0;
-        trace!(start_sec, end_sec, "dumping the demuxer cache to a temp file");
+        trace!(
+            start_sec,
+            end_sec, "dumping the demuxer cache to a temp file"
+        );
 
         let dump_result = client.command(&[
             "dump-cache",
@@ -1216,8 +1242,7 @@ impl PluginState {
         if dump_result.is_err() {
             error!(
                 start_sec,
-                end_sec,
-                "mpv refused to dump the demuxer cache; this chunk cannot be transcribed"
+                end_sec, "mpv refused to dump the demuxer cache; this chunk cannot be transcribed"
             );
             return false;
         }
@@ -1296,7 +1321,11 @@ impl PluginState {
         };
         self.subtitle_manager.add_from_srt(&srt_file);
         self.mark_chunk_processed(chunk_start_ms);
-        debug!(entries = srt_file.entries.len(), total = self.subtitle_manager.len(), "subtitles merged");
+        debug!(
+            entries = srt_file.entries.len(),
+            total = self.subtitle_manager.len(),
+            "subtitles merged"
+        );
 
         let mut pending_tasks = Vec::new();
         let mut already_translated = 0usize;
@@ -1339,7 +1368,10 @@ impl PluginState {
                 for task in pending_tasks {
                     queue.submit(task);
                 }
-                debug!(queued, already_translated, skipped_failed, "submitted cues for translation");
+                debug!(
+                    queued,
+                    already_translated, skipped_failed, "submitted cues for translation"
+                );
             }
         } else if !self.translate_enabled && !pending_tasks.is_empty() {
             debug!(
@@ -1357,7 +1389,6 @@ impl PluginState {
         debug!(next_ms = self.current_pos_ms, "chunk merged");
         true
     }
-
 
     fn show_device_notice(&mut self, _client: &mut Handle, device_notice: Option<SttDeviceNotice>) {
         let Some(notice) = device_notice else {
@@ -1874,7 +1905,10 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                 // init returns before the event loop that drains the queue.
                 let _ = client.command(&[
                     "show-text",
-                    &format!("STT plugin initialization failed: {}", logging::osd_line(&err.to_string())),
+                    &format!(
+                        "STT plugin initialization failed: {}",
+                        logging::osd_line(&err.to_string())
+                    ),
                     "8000",
                 ]);
                 return -1;

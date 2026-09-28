@@ -34,25 +34,39 @@ impl std::fmt::Display for BackendKind {
     }
 }
 
-/// Which translation protocol to use at runtime. Both protocols are compiled
-/// in (no feature exclusivity); this key selects the active one. Mirrors
+/// Which translation backend to use at runtime. Every backend is compiled in
+/// (no feature exclusivity); this key selects the active one. Mirrors
 /// `BackendKind` for the STT backends.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum TranslateBackendKind {
+    /// Try the built-in free sources in order, first success wins.
+    Auto,
+    /// Built-in free source: Google's web translate endpoint.
+    Google,
+    /// Built-in free source: Microsoft Edge's translate endpoint.
+    Edge,
+    /// Built-in free source: translate.alibaba.com.
+    Alibaba,
+    /// External DeepL-compatible service.
     DeepL,
+    /// External LibreTranslate-compatible service.
     LibreTranslate,
 }
 
 impl Default for TranslateBackendKind {
     fn default() -> Self {
-        TranslateBackendKind::DeepL
+        TranslateBackendKind::Auto
     }
 }
 
 impl std::fmt::Display for TranslateBackendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let label = match self {
+            TranslateBackendKind::Auto => "auto",
+            TranslateBackendKind::Google => "google",
+            TranslateBackendKind::Edge => "edge",
+            TranslateBackendKind::Alibaba => "alibaba",
             TranslateBackendKind::DeepL => "deepl",
             TranslateBackendKind::LibreTranslate => "libretranslate",
         };
@@ -253,8 +267,9 @@ pub struct TranslateConfig {
     pub from_lang: String,
     pub to_lang: String,
     pub concurrency: usize,
-    /// Runtime protocol selector: which of the compiled translation protocols
-    /// is active (`deepl` | `libretranslate`).
+    /// Runtime backend selector: which of the compiled translation backends is
+    /// active (`auto` | `google` | `edge` | `alibaba` | `deepl` |
+    /// `libretranslate`). `auto` walks the built-in free sources in order.
     pub backend: TranslateBackendKind,
     /// DeepL-compatible translation service base URL (e.g. the subtitle-gateway
     /// gateway at its default port 8000, or an upstream DeepL-compatible API).
@@ -263,6 +278,12 @@ pub struct TranslateConfig {
     pub api_key: String,
     /// LibreTranslate backend (only read when `backend = "libretranslate"`).
     pub libretranslate: Option<TranslateLibreTranslateConfig>,
+    /// Built-in free source: Google (read when `backend` is `google` or `auto`).
+    pub google: Option<TranslateGoogleConfig>,
+    /// Built-in free source: Microsoft Edge (`edge` or `auto`).
+    pub edge: Option<TranslateEdgeConfig>,
+    /// Built-in free source: Alibaba (`alibaba` or `auto`).
+    pub alibaba: Option<TranslateAlibabaConfig>,
 }
 
 impl Default for TranslateConfig {
@@ -275,6 +296,9 @@ impl Default for TranslateConfig {
             server_addr: "http://127.0.0.1:8000".to_string(),
             api_key: String::new(),
             libretranslate: Some(TranslateLibreTranslateConfig::default()),
+            google: Some(TranslateGoogleConfig::default()),
+            edge: Some(TranslateEdgeConfig::default()),
+            alibaba: Some(TranslateAlibabaConfig::default()),
         }
     }
 }
@@ -291,6 +315,65 @@ impl Default for TranslateLibreTranslateConfig {
     fn default() -> Self {
         Self {
             server_addr: "http://127.0.0.1:8000".to_string(),
+            api_key: String::new(),
+        }
+    }
+}
+
+/// Built-in free source. The endpoint is baked into the `Default`, so the
+/// `[translate.google]` section normally stays unwritten; it exists to point
+/// the source at a different host.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslateGoogleConfig {
+    /// Base URL of Google's web translate endpoint.
+    pub server_addr: String,
+    /// Reserved; not sent on the query string.
+    pub api_key: String,
+}
+
+impl Default for TranslateGoogleConfig {
+    fn default() -> Self {
+        Self {
+            server_addr: "https://clients5.google.com".to_string(),
+            api_key: String::new(),
+        }
+    }
+}
+
+/// Built-in free source. Microsoft's endpoint also accepts an API key, which
+/// switches the request onto the official channel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslateEdgeConfig {
+    /// Base URL of Microsoft Edge's translate endpoint.
+    pub server_addr: String,
+    /// Optional key; when set the request carries it.
+    pub api_key: String,
+}
+
+impl Default for TranslateEdgeConfig {
+    fn default() -> Self {
+        Self {
+            server_addr: "https://edge.microsoft.com".to_string(),
+            api_key: String::new(),
+        }
+    }
+}
+
+/// Built-in free source. The endpoint is baked into the `Default`, so the
+/// `[translate.alibaba]` section normally stays unwritten.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranslateAlibabaConfig {
+    /// Base URL of translate.alibaba.com (the token and translate calls hang
+    /// off it).
+    pub server_addr: String,
+    /// Reserved; not sent on the request.
+    pub api_key: String,
+}
+
+impl Default for TranslateAlibabaConfig {
+    fn default() -> Self {
+        Self {
+            server_addr: "https://translate.alibaba.com".to_string(),
             api_key: String::new(),
         }
     }

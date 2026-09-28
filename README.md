@@ -1,7 +1,8 @@
 # mpv_stt_plugin_rs
 
-MPV 实时字幕插件(Rust 原生 C 插件)。插件是**纯远程客户端**:音频抽取后送到远程
-STT 服务转写,再送远程翻译服务翻译。不内置任何本地推理引擎、不直连 Google 网页接口。
+MPV 实时字幕插件(Rust 原生 C 插件)。插件**不跑任何本地推理**:音频抽取后送到远程
+STT 服务转写,再送翻译服务翻译。翻译既可以接自建/外部服务,也可以**零配置直接用内置的
+免费源**(Google / 微软 Edge / 阿里的网页接口,见下文)。
 
 ## 架构(单 crate,多 mod)
 
@@ -20,7 +21,7 @@ mpv_stt_plugin_rs/
 │   ├── ffi.rs               # C 导出(翻译 / 音频 / SRT)
 │   ├── process.rs           # 子进程管理
 │   ├── subtitle_manager.rs  # 字幕管理
-│   ├── translate.rs         # 远程翻译客户端(DeepL 兼容 + LibreTranslate)
+│   ├── translate.rs         # 翻译客户端(内置免费源 + DeepL 兼容 + LibreTranslate)
 │   └── stt/
 │       ├── mod.rs           # SttRunner / SttBackend 调度
 │       ├── ferrum.rs        # ferrum 协议后端(stt_ferrum)
@@ -52,12 +53,18 @@ mpv_stt_plugin_rs/
 
 ### 翻译后端
 
-翻译同样走**远程接口**,两种协议**同时编译、运行时选择**(`config.translate.backend`):
+所有后端**同时编译、运行时选择**(`config.translate.backend`)。三个内置免费源不需要
+任何配置或 key,`auto`(默认)按 `google → edge → alibaba` 顺序回退,第一个成功为止:
 
 | backend | 配置字段 | 协议 |
 |---|---|---|
-| `deepl`(默认) | `[translate]` 平铺 `server_addr`/`api_key` | `POST {server}/v1/translate`,key 走 `Authorization: DeepL-Auth-Key`,target 大写 |
+| `auto`(默认) | — | 依次试下面三个内置源,第一个成功为止 |
+| `google` / `edge` / `alibaba` | `[translate.google]` / `[translate.edge]` / `[translate.alibaba]` | 只用这一个内置源(失败不换源);host 已内置,通常整节都不用写 |
+| `deepl` | `[translate]` 平铺 `server_addr`/`api_key` | `POST {server}/v1/translate`,key 走 `Authorization: DeepL-Auth-Key`,target 大写 |
 | `libretranslate` | `[translate.libretranslate]` | `POST {server}/translate`,key 走 body `api_key`,target 小写,`auto` 可显式/省略 |
+
+内置源是这些站点**网页前端自己用的接口**,不保证长期可用、也不保证稳定:
+它们的形状一旦变了,日志里会出现带 HTTP 状态和响应体摘要的 `warn`,而不是静默给出空译文。
 
 ## 编译
 
@@ -146,8 +153,9 @@ IINA 的 `input.conf`:
 
 **翻译失败不影响字幕本身。** 识别结果先落地并显示,翻译只是在其后追加一行:
 
-- 翻译服务不可用(网关没起、key 不对、上游 503…)时,原文照常显示、照常写盘,
-  只是没有译文;屏幕上提示一次失败原因,不会每块都弹。
+- 翻译服务不可用(内置源被限速、网关没起、key 不对、上游 503…)时,原文照常显示、
+  照常写盘,只是没有译文;屏幕上提示一次失败原因,不会每块都弹。
+  `backend = "auto"` 会先自己换一个内置源试,三个都不行才提示。
 - 失败的那几条不再重复投递(否则每次 seek 都会重试一遍),恢复服务后按
   `Ctrl+Shift+T` 关再开(或 `Ctrl+Shift+C` 清缓存)即会重新翻译已有字幕。
 - 翻译相关的问题永远不会结束转写会话,`Ctrl+Shift+S` 的开关状态不受影响。
@@ -208,7 +216,7 @@ ferrum 协议的服务端由 [subtitle-gateway](https://github.com/canxin121/sub
 
 ```toml
 [translate]
-backend = "deepl"             # deepl(默认) | libretranslate
+backend = "auto"              # auto(默认) | google | edge | alibaba | deepl | libretranslate
 from_lang = "ja"              # 内容语言(建议显式指定,避免 auto 把日文误判成中文)
 to_lang = "zh"
 concurrency = 4
@@ -218,6 +226,19 @@ api_key = ""                            # 网关 key(DeepL-Auth-Key)
 [translate.libretranslate]
 server_addr = "http://127.0.0.1:8000"
 api_key = ""
+
+# 三个内置免费源:host 已内置,整节不写就是下面这些值
+[translate.google]
+server_addr = "https://clients5.google.com"
+api_key = ""                  # 预留,当前查询串里不带
+
+[translate.edge]
+server_addr = "https://edge.microsoft.com"
+api_key = ""                  # 填了就走微软官方通道
+
+[translate.alibaba]
+server_addr = "https://translate.alibaba.com"
+api_key = ""                  # 预留
 ```
 
 `deepl` 协议期望 `POST {server}/v1/translate`(`server_addr` 写基址 `https://api-free.deepl.com`,
@@ -225,32 +246,38 @@ api_key = ""
 `{"text": [...], "target_lang": "ZH", "source_lang": "JA"}`(source_lang 省略 = auto),
 响应 `{"translations": [{"text": "..."}]}`。
 
-### 免费/自建翻译服务
+### 内置免费源
 
-两个协议都是普通 HTTP,所以换服务商就是改 `server_addr`/`api_key`/`from_lang`/`to_lang`,
-不需要改代码 —— 前提是对方讲的是这两种形状之一。下面按"改配置能不能接上"分两组
-(2026-09 实测核对,服务端随时可能变)。
+`backend = "auto"`(默认)就能直接翻:三个网页接口都在插件里用 Rust 实现,不需要外部进程、
+不需要注册、不需要 key。它是插件里唯一"连出去"的地方,发出去的只有待译的字幕文本。
 
-**改配置就能接上的**
+| backend | 端点 | 批量 | 说明 |
+|---|---|---|---|
+| `google`(回退第 1) | `GET clients5.google.com/translate_a/t` | 原生多 `q` | 质量与速度均衡;限速按出口 IP 算,重度使用会吃到 |
+| `edge`(回退第 2) | `POST edge.microsoft.com/translate/translatetext` | 原生 JSON 数组 | 实测最稳定、几乎不限速;带 `api_key` 即走微软官方通道 |
+| `alibaba`(回退第 3) | `POST translate.alibaba.com` | 无 | 每条字幕一次 token + 一次请求,链路最重,故排最后 |
+
+选中单个源时**失败不换源**(不会悄悄降级到质量更差的引擎还让你以为用的是它);
+只有 `auto` 会按上表顺序回退,全失败才走"翻译放弃"提示。
+
+三者都是站点前端自己用的接口,`to_lang` 都能直接写 `zh`(阿里只认它自己的码集,
+写 `zh-Hans` 会被拒,所以插件只发语言主标签)。
+
+### 外部翻译服务
+
+改 `server_addr`/`api_key`/`from_lang`/`to_lang` 即可,不需要改代码 —— 前提是对方讲的是
+DeepL 或 LibreTranslate 这两种形状之一(2026-09 实测核对,服务端随时可能变)。
 
 | 服务 | 怎么连 | 说明 |
 |---|---|---|
 | [subtitle-gateway](https://github.com/canxin121/subtitle-gateway) | `backend = "deepl"`,`server_addr = "http://127.0.0.1:8000"` | 本仓库配套网关,ASR 与翻译同一端点 |
 | [DeepL API Free](https://www.deepl.com/en/signup?cta=checkout&is_api=true&productId=api-developer) | `backend = "deepl"`,`server_addr = "https://api-free.deepl.com"`,`api_key = "<xxx:fx>"` | 免费档叫 **API Developer**:100 万字符/月、1 个 key;免费 key 带 `:fx` 后缀,所以 endpoint 是 `api-free` 而不是 `api`;日译中质量最好;国内可直连 |
 | [LibreTranslate](https://github.com/LibreTranslate/LibreTranslate) | `backend = "libretranslate"`,`server_addr = "http://127.0.0.1:5000"` | 自建:不限量、不出内网。`pip install libretranslate` 或官方 Docker 镜像;默认监听 `127.0.0.1:5000`;AGPL-3.0;Argos 引擎,日译中绕英语 |
-| 公共 LibreTranslate 镜像 | `backend = "libretranslate"`,`server_addr = "https://translate.hostux.net"` | 无需 key,但**必须显式写 `from_lang`**(镜像不接受省略 `source`);`to_lang` 只能写 `zh` 或 `zh-Hans`,写 `zh-CN` 会 400;Argos 引擎,质量明显低于 DeepL |
+| 公共 LibreTranslate 镜像 | `backend = "libretranslate"`,`server_addr = "https://translate.hostux.net"` | 无需 key,但**必须显式写 `from_lang`**(镜像不接受省略 `source`);`to_lang` 只能写 `zh` 或 `zh-Hans`,写 `zh-CN` 会 400;Argos 引擎,质量明显低于内置源 |
 
-**要加协议变体才能接的**
-
-请求形状既不是 DeepL 的 `{"text":[...],"target_lang":"ZH"}`,也不是 LibreTranslate 的
-`{"q":"...","source":"ja","target":"zh"}`,光改 `server_addr` 连不上 —— 得在
-`src/translate.rs` 里补一套 URL / body / 响应解析。
-
-| 服务 | 形状 | 额度与注意 |
-|---|---|---|
-| [MTranServer](https://github.com/xxnuo/MTranServer) | `POST /translate`,`{"from","to","text"}` → `{"result"}`,另带 `/translate/batch` | 单文件二进制,无需显卡;Bergamot 引擎,日译中绕英语 |
-| Google Cloud Translation(基础版 v2) | `POST /language/translate/v2`,`{"q":[...],"target":"zh"}` → `data.translations[]` | 50 万字符/月免费,但**必须绑定信用卡**才能开通 |
-| Azure Translator(F0) | `POST /translate?api-version=3.0&to=zh-Hans`,key 走 `Ocp-Apim-Subscription-Key` | 200 万字符/月免费,同样**必须绑卡**;且按小时限速(约 3.3 万字符/分钟) |
+需要绑定信用卡才能开通、或整条链路要额外跑一个服务端(Google Cloud / Azure Translator /
+[MTranServer](https://github.com/xxnuo/MTranServer))的,请求形状既不是 DeepL 也不是
+LibreTranslate,光改 `server_addr` 接不上 —— 内置源已经覆盖了这几家的免费档。
 
 已失效、不要再配的:**`libretranslate.com` 官方站**(已无免费 key,最低 $14/月)、
 **Lingva / SimplyTranslate 公共实例**(要么被 Cloudflare 拦,要么返回空译文)、
@@ -288,7 +315,8 @@ demuxer_max_bytes = 0         # 可选;网络流缓存上限
 ### 级别
 
 - **error** —— 用户要的事做不成、只能收摊:分片失败终止会话、字幕落盘失败、worker 不可用、FFI 调用失败。
-- **warn** —— 降级但还能继续:重试、翻译放弃、空结果、缓存文件读写失败、manifest 损坏后重新转写。
+- **warn** —— 降级但还能继续:重试、翻译放弃、某个内置免费源失败后换下一个、空结果、
+  缓存文件读写失败、manifest 损坏后重新转写。
 - **info** —— 每个会话/每次操作一条的里程碑:生效配置、插件加载、进入本地/网络模式、字幕路径、缓存命中、设备提示、翻译后端不响应。
 - **debug** —— 每块/每请求的生命周期:调度、提交、HTTP 结果摘要、seek 判定、mpv 事件、后端选择。
 - **trace** —— 热循环里的空转与逐条判定:等缓存、等播放追上、look-ahead 上限、迟到结果丢弃、单条文本翻译。

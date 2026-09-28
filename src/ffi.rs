@@ -1,11 +1,11 @@
 use crate::audio::AudioExtractor;
 use crate::config::TranslateBackendKind;
 use crate::translate::{Translator, TranslatorConfig};
-use tracing::{debug, error};
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::sync::OnceLock;
+use tracing::{debug, error};
 
 // Global state for configuration
 static AUDIO_EXTRACTOR: OnceLock<Mutex<AudioExtractor>> = OnceLock::new();
@@ -50,7 +50,8 @@ pub extern "C" fn translator_init(from_lang: *const c_char, to_lang: *const c_ch
             server = "default",
             "translator initialized via FFI"
         );
-        let config = TranslatorConfig::new(from_lang, to_lang);
+        let config =
+            TranslatorConfig::new(from_lang, to_lang).with_backend(TranslateBackendKind::DeepL);
         let translator = Translator::new(config);
         *translator_state().lock() = Some(translator);
         0
@@ -81,6 +82,7 @@ pub extern "C" fn translator_init_remote(
             "translator initialized via FFI"
         );
         let config = TranslatorConfig::new(from_lang, to_lang)
+            .with_backend(TranslateBackendKind::DeepL)
             .with_server_addr(server_addr)
             .with_api_key(api_key);
         let translator = Translator::new(config);
