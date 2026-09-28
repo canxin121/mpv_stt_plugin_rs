@@ -236,7 +236,7 @@ api_key = ""
 | 服务 | 怎么连 | 说明 |
 |---|---|---|
 | [subtitle-gateway](https://github.com/canxin121/subtitle-gateway) | `backend = "deepl"`,`server_addr = "http://127.0.0.1:8000"` | 本仓库配套网关,ASR 与翻译同一端点 |
-| [DeepL API Free](https://www.deepl.com/en/signup?isApi=true) | `backend = "deepl"`,`server_addr = "https://api-free.deepl.com"`,`api_key = "<xxx:fx>"` | 50 万字符/月,免费 key 带 `:fx` 后缀;日译中质量最好;需注册 |
+| [DeepL API Free](https://www.deepl.com/en/signup?cta=checkout&is_api=true&productId=api-developer) | `backend = "deepl"`,`server_addr = "https://api-free.deepl.com"`,`api_key = "<xxx:fx>"` | 免费档叫 **API Developer**:100 万字符/月、1 个 key;免费 key 带 `:fx` 后缀,所以 endpoint 是 `api-free` 而不是 `api`;日译中质量最好;国内可直连 |
 | [LibreTranslate](https://github.com/LibreTranslate/LibreTranslate) | `backend = "libretranslate"`,`server_addr = "http://127.0.0.1:5000"` | 自建:不限量、不出内网。`pip install libretranslate` 或官方 Docker 镜像;默认监听 `127.0.0.1:5000`;AGPL-3.0;Argos 引擎,日译中绕英语 |
 | 公共 LibreTranslate 镜像 | `backend = "libretranslate"`,`server_addr = "https://translate.hostux.net"` | 无需 key,但**必须显式写 `from_lang`**(镜像不接受省略 `source`);`to_lang` 只能写 `zh` 或 `zh-Hans`,写 `zh-CN` 会 400;Argos 引擎,质量明显低于 DeepL |
 
