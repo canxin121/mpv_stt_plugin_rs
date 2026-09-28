@@ -1,4 +1,3 @@
-use log::{debug, error, info, trace, warn};
 use mpv_client::{Event, Handle, mpv_handle};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -12,13 +11,12 @@ use std::sync::{
 use std::thread;
 use std::time::Instant;
 use tempfile::TempDir;
-
-#[cfg(target_os = "android")]
-use std::ffi::CString;
+use tracing::{debug, error, info, Span, trace, warn};
 
 use crate::audio::AudioExtractor;
 use crate::common::MpvSttError;
 use crate::config::Config;
+use crate::logging::{self, LogSettings};
 use crate::srt::SrtFile;
 use crate::stt::{SttBackend, SttDeviceNotice, SttRunner};
 use crate::subtitle_manager::SubtitleManager;
@@ -132,6 +130,12 @@ struct TranscriptionJob {
     duration_ms: u64,
     wav_path: PathBuf,
     output_prefix: PathBuf,
+    /// The chunk span the job was created in. Carried across the thread
+    /// boundary and entered on the worker, so extraction and STT records attach
+    /// to the chunk they belong to instead of floating free. `Span` is
+    /// `Send + Sync`; note the span is *entered*, never *held* (a held `Entered`
+    /// guard would not be `Send`).
+    span: Span,
 }
 
 struct TranscriptionWorkerResult {
@@ -162,9 +166,20 @@ impl TranscriptionWorker {
             .name("mpv-stt-transcription".to_string())
             .spawn(move || {
                 while let Ok(Some(job)) = job_receiver.recv() {
+                    // Everything below runs inside the chunk span, so the
+                    // extractor and the STT backend log against the chunk that
+                    // caused them — even though this is a different thread from
+                    // the one that created the span.
+                    let _chunk = job.span.clone().entered();
                     if worker_generation.load(Ordering::Acquire) != job.generation {
+                        trace!("Superseded chunk never started");
                         continue;
                     }
+                    debug!(
+                        media = %job.media_path,
+                        start_ms = job.audio_start_ms,
+                        "transcription job started"
+                    );
 
                     let result = worker_audio
                         .extract_audio_segment(
@@ -211,6 +226,7 @@ impl TranscriptionWorker {
         duration_ms: u64,
         wav_path: PathBuf,
         output_prefix: PathBuf,
+        span: Span,
     ) -> Option<u64> {
         let generation = self.generation.load(Ordering::Acquire);
         let job = TranscriptionJob {
@@ -220,6 +236,7 @@ impl TranscriptionWorker {
             duration_ms,
             wav_path,
             output_prefix,
+            span,
         };
         self.job_sender.send(Some(job)).ok().map(|()| generation)
     }
@@ -231,11 +248,17 @@ impl TranscriptionWorker {
                 return Some(result);
             }
             trace!(
-                "Dropping stale transcription result from generation {} (current {})",
-                result.generation, current
+                stale_gen = result.generation,
+                current_gen = current,
+                "dropping a stale transcription result"
             );
         }
         None
+    }
+
+    /// Current generation: the id every job and result of this attempt carries.
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn cancel_inflight(&self) {
@@ -269,6 +292,10 @@ struct PendingTranscription {
     start_ms: u64,
     duration_ms: u64,
     subtitle_path: Option<PathBuf>,
+    /// The chunk span this job was submitted in; re-entered when the result
+    /// lands so the merge, translation hand-off and SRT write are logged as part
+    /// of the same chunk.
+    span: Span,
 }
 
 struct PluginState {
@@ -303,6 +330,22 @@ struct PluginState {
     pending_auto_start: bool, // Delayed auto-start after file loads
     file_loaded: bool,        // Track if file is ready
     transcription_complete: bool,
+
+    /// Monotonic id for the current media session, used only for log
+    /// correlation. `0` means no session has started yet.
+    session_id: u64,
+    /// Chunks submitted in the current session, so a chunk can be referred to
+    /// by number as well as by timestamp.
+    chunk_seq: u64,
+    /// Span covering the current session. Held (not only entered) so events
+    /// recorded from this state stay attached to it.
+    session_span: Option<Span>,
+    /// When the current session's transcription started, for the completion
+    /// summary.
+    session_started: Option<Instant>,
+    /// Total chunk failures in the current session, reported when it ends.
+    session_failures: u64,
+    cached_subtitle_path: Option<PathBuf>,
 }
 
 impl PluginState {
@@ -348,6 +391,12 @@ impl PluginState {
             pending_auto_start: false,
             file_loaded: false,
             transcription_complete: false,
+            session_id: 0,
+            chunk_seq: 0,
+            session_span: None,
+            session_started: None,
+            session_failures: 0,
+            cached_subtitle_path: None,
         })
     }
 
@@ -403,8 +452,8 @@ impl PluginState {
     fn reset_translation_failures(&mut self) {
         if !self.failed_translations.is_empty() {
             debug!(
-                "Clearing {} failed-translation record(s)",
-                self.failed_translations.len()
+                cues = self.failed_translations.len(),
+                "clearing the failed-translation records; every cue may be retried"
             );
         }
         self.failed_translations.clear();
@@ -463,16 +512,16 @@ impl PluginState {
 
         if skipped_failed > 0 {
             trace!(
-                "Skipped {} entries whose translation already failed",
-                skipped_failed
+                skipped_failed,
+                "not re-queueing cues whose translation already failed"
             );
         }
 
         if !pending_tasks.is_empty() {
             trace!(
-                "Re-queueing {} missing translations (already translated: {})",
-                pending_tasks.len(),
-                already_translated
+                queued = pending_tasks.len(),
+                already_translated,
+                "re-queueing missing translations"
             );
             for task in pending_tasks {
                 queue.submit(task);
@@ -482,29 +531,29 @@ impl PluginState {
 
     fn toggle_stt(&mut self, client: &mut Handle) {
         if self.running {
-            info!("Disabling STT");
-            let _ = client.command(&["show-text", "STT: Off"]);
+            info!(display = %logging::osd_line("STT: Off"), "disabling STT");
             self.stop_transcription();
         } else {
-            info!("Enabling STT");
+            info!(display = %logging::osd_line("STT: On"), "enabling STT");
             if self.mode.is_some() {
                 self.stop_transcription();
             }
             self.running = true;
-            let _ = client.command(&["show-text", "STT: On"]);
             self.start_transcription(client);
         }
     }
 
-    fn toggle_translate(&mut self, client: &mut Handle) {
+    fn toggle_translate(&mut self, _client: &mut Handle) {
         self.translate_enabled = !self.translate_enabled;
+        let msg = if self.translate_enabled {
+            "Translate: On"
+        } else {
+            "Translate: Off (new subtitles stay as original)"
+        };
         info!(
-            "Translation {}",
-            if self.translate_enabled {
-                "enabled"
-            } else {
-                "disabled"
-            }
+            enabled = self.translate_enabled,
+            display = %logging::osd_line(msg),
+            "translation toggled"
         );
         if self.translate_enabled {
             // Turning translation back on is an explicit retry: forget earlier
@@ -513,12 +562,6 @@ impl PluginState {
             self.reset_translation_failures();
             self.enqueue_missing_translations_for_chunk(self.current_pos_ms);
         }
-        let msg = if self.translate_enabled {
-            "Translate: On"
-        } else {
-            "Translate: Off (new subtitles stay as original)"
-        };
-        let _ = client.command(&["show-text", msg, "3000"]);
     }
 
     /// Delete the current media's on-disk subtitle/translation cache and drop
@@ -532,7 +575,12 @@ impl PluginState {
                     if p.exists() {
                         match std::fs::remove_file(p) {
                             Ok(()) => removed += 1,
-                            Err(e) => error!("Failed to remove cache file {}: {}", p.display(), e),
+                            Err(e) => error!(
+                                error = %e,
+                                cause = %logging::err_chain(&e),
+                                path = %p.display(),
+                                "cannot remove a cache file"
+                            ),
                         }
                     }
                 }
@@ -545,14 +593,13 @@ impl PluginState {
         self.processed_chunks.clear();
 
         info!(
-            "Subtitle cache cleared (removed {} files, dropped {} cached translations)",
-            removed, chunk_entries
+            removed_files = removed,
+            dropped_translations = chunk_entries,
+            display = %logging::osd_line(&format!(
+                "字幕缓存已清除: 删除 {removed} 个文件, 内存缓存 {chunk_entries} 条"
+            )),
+            "cleared the subtitle cache"
         );
-        let msg = format!(
-            "字幕缓存已清除: 删除 {} 个文件, 内存缓存 {} 条",
-            removed, chunk_entries
-        );
-        let _ = client.command(&["show-text", &msg, "3000"]);
     }
 
     fn schedule_transcription(
@@ -563,26 +610,51 @@ impl PluginState {
         subtitle_path: Option<PathBuf>,
     ) -> bool {
         if self.pending_transcription.is_some() {
+            trace!(
+                start_ms = audio_start_ms,
+                "chunk not submitted: the previous one is still running"
+            );
             return false;
         }
 
         let output_prefix = PathBuf::from(format!("{}_append", self.paths.tmp_sub.display()));
+        // The chunk span is created here, on the event thread, and travels with
+        // the job so the worker's extractor/STT logs land inside it.
+        let span = logging::chunk_span(
+            self.session_id,
+            self.chunk_seq,
+            audio_start_ms,
+            duration_ms,
+            self.transcription_worker.generation(),
+        );
         let Some(generation) = self.transcription_worker.submit(
             media_path,
             audio_start_ms,
             duration_ms,
             self.paths.tmp_wav.clone(),
             output_prefix,
+            span.clone(),
         ) else {
-            error!("Transcription worker is unavailable");
+            error!(
+                display = %logging::osd_line("the transcription worker is unavailable; restart playback"),
+                "transcription worker is unavailable; the plugin cannot process audio"
+            );
             return false;
         };
+        self.chunk_seq += 1;
 
+        debug!(
+            start_ms = audio_start_ms,
+            dur_ms = duration_ms,
+            gen = generation,
+            "chunk submitted"
+        );
         self.pending_transcription = Some(PendingTranscription {
             generation,
             start_ms: self.current_pos_ms,
             duration_ms,
             subtitle_path,
+            span,
         });
         true
     }
@@ -598,10 +670,15 @@ impl PluginState {
             return;
         }
 
+        // Re-enter the chunk span for the second half of the round trip: the
+        // merge, translation hand-off and SRT write belong to the same chunk as
+        // the extraction and STT that produced them.
+        let _chunk = pending.span.clone().entered();
+
         match worker_result.result {
             Ok(()) => {
                 if self.check_seek(client) {
-                    debug!("Seek detected after transcription; dropping stale result");
+                    debug!("seek detected while the chunk was in flight; dropping its result");
                     self.paths.cleanup_intermediate_subs();
                     return;
                 }
@@ -629,41 +706,72 @@ impl PluginState {
                 }
             }
             Err(MpvSttError::SttCancelled | MpvSttError::AudioExtractionCancelled) => {
-                debug!("Transcription job cancelled");
+                debug!("chunk cancelled");
                 self.paths.cleanup_intermediate_subs();
             }
             Err(err) => {
-                error!("Transcription job failed: {err}");
-                let msg = format!("STT failed: {err}");
-                let _ = client.command(&["show-text", &msg, "4000"]);
+                self.session_failures += 1;
+                // The OSD gets the short form, the log keeps the cause chain.
+                error!(
+                    error = %err,
+                    cause = %logging::err_chain(&err),
+                    display = %logging::osd_line(&format!("STT failed: {err}")),
+                    "chunk failed; ending the session"
+                );
                 self.stop_transcription();
             }
         }
     }
 
     fn start_transcription(&mut self, client: &mut Handle) {
-        debug!("Starting transcription");
+        // A new session: new log identity, fresh counters. Everything logged
+        // from here until the session ends carries this span and id.
+        self.session_id += 1;
+        self.chunk_seq = 0;
+        self.session_failures = 0;
+        self.session_started = Some(Instant::now());
         self.transcription_complete = false;
+
         // Get current position
         let time_pos: f64 = client.get_property("time-pos").unwrap_or(0.0);
         self.current_pos_ms = (time_pos * 1000.0) as u64;
         self.last_playback_pos_ms = Some(self.current_pos_ms);
-        trace!("Current playback position: {}ms", self.current_pos_ms);
 
         // Check if network stream - use multiple detection methods
         let is_network = self.detect_network_stream(client);
 
+        let media = client
+            .get_property::<String>("path")
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        let duration_ms = client
+            .get_property::<f64>("duration")
+            .map(|d| (d * 1000.0) as u64)
+            .unwrap_or(0);
+        let mode = if is_network { "network" } else { "local" };
+        let session_span =
+            logging::session_span(self.session_id, &media, duration_ms, mode).entered();
+        self.session_span = Some(session_span.clone());
+
+        info!(
+            start_ms = self.current_pos_ms,
+            chunk_ms = self.chunk_dur,
+            translate = self.translate_enabled,
+            "transcription session started"
+        );
+
         if is_network {
             // Network stream mode
-            debug!("Detected network stream, entering network mode");
-            let _ = client.command(&["show-text", "STT: Starting network stream transcription..."]);
+            debug!(
+                display = %logging::osd_line("STT: Starting network stream transcription..."),
+                "network stream detected"
+            );
 
             // Enable caching
             let _ = client.set_property("cache", true);
 
             // Set demuxer max bytes if configured (for better lookahead caching)
             if let Some(max_bytes) = self.config.network.demuxer_max_bytes {
-                debug!("Setting demuxer-max-bytes to {} bytes", max_bytes);
+                debug!(bytes = max_bytes, "setting demuxer-max-bytes");
                 let _ = client.set_property("demuxer-max-bytes", max_bytes);
             }
 
@@ -678,9 +786,10 @@ impl PluginState {
                         if let Some(parent) = cache_paths.subtitle_path.parent() {
                             if let Err(err) = fs::create_dir_all(parent) {
                                 warn!(
-                                    "Failed to create cache directory {}: {}",
-                                    parent.display(),
-                                    err
+                                    error = %err,
+                                    cause = %logging::err_chain(&err),
+                                    dir = %parent.display(),
+                                    "cannot create the subtitle cache directory"
                                 );
                             }
                         }
@@ -695,10 +804,7 @@ impl PluginState {
                                     cache_paths.subtitle_path.to_str().unwrap(),
                                 ]);
                                 self.subs_loaded = true;
-                                info!(
-                                    "Loaded cached subtitles from {}",
-                                    cache_paths.subtitle_path.display()
-                                );
+                                self.cached_subtitle_path = Some(cache_paths.subtitle_path.clone());
                             }
                         }
                         self.network_cache = Some(cache_paths);
@@ -706,19 +812,15 @@ impl PluginState {
                 }
             }
 
-            info!(
-                "Network stream mode active, current_pos: {}ms",
-                self.current_pos_ms
-            );
+            info!(start_ms = self.current_pos_ms, "network stream session ready");
         } else {
             // Local file mode
-            debug!("Detected local file, entering local mode");
+            debug!("local file detected");
             let media_path: Result<String, _> = client.get_property("path");
             let duration: Result<f64, _> = client.get_property("duration");
 
             if let (Ok(path), Ok(dur)) = (media_path, duration) {
                 let file_length_ms = (dur * 1000.0) as u64;
-                trace!("Media file: {}, duration: {}ms", path, file_length_ms);
 
                 // Calculate subtitle path next to the video file when possible.
                 // SAF content:// URIs are not writable as filesystem paths.
@@ -728,9 +830,12 @@ impl PluginState {
                 } else {
                     self.paths.tmp_sub.with_extension("srt")
                 };
-                info!("Subtitle will be saved to: {}", subtitle_path.display());
 
-                let _ = client.command(&["show-text", "STT: Starting local file transcription..."]);
+                info!(
+                    display = %logging::osd_line("STT: Starting local file transcription..."),
+                    path = %path,
+                    "starting local file transcription"
+                );
 
                 // Start from beginning if configured
                 let chunk_size = self.local_chunk_size();
@@ -747,7 +852,7 @@ impl PluginState {
                     if self.load_cached_subs(&subtitle_path, None, self.local_chunk_size()) {
                         let _ = client.command(&["sub-add", subtitle_path.to_str().unwrap()]);
                         self.subs_loaded = true;
-                        info!("Loaded cached subtitles from {}", subtitle_path.display());
+                        self.cached_subtitle_path = Some(subtitle_path.clone());
                     }
                 }
 
@@ -764,18 +869,18 @@ impl PluginState {
                 }
 
                 info!(
-                    "Local file mode: {}, length: {}ms, start: {}ms",
-                    path, file_length_ms, self.current_pos_ms
+                    file_length_ms,
+                    start_ms = self.current_pos_ms,
+                    subtitle_path = %subtitle_path.display(),
+                    "local file session ready"
                 );
             } else {
                 self.running = false;
                 self.mode = None;
-                warn!("Cannot start STT: no playable media path/duration is available");
-                let _ = client.command(&[
-                    "show-text",
-                    "STT: Please open a playable media file first",
-                    "4000",
-                ]);
+                warn!(
+                    display = %logging::osd_line("STT: Please open a playable media file first"),
+                    "cannot start STT: mpv reports no playable media path/duration"
+                );
             }
         }
     }
@@ -845,7 +950,7 @@ impl PluginState {
         // Get cache end time
         let cache_end_sec: Option<f64> = client.get_property("demuxer-cache-time").ok();
         if cache_end_sec.is_none() {
-            trace!("Cache not ready yet");
+            trace!("demuxer cache has not reported a time yet");
             return; // Cache not ready yet
         }
         let cache_end_ms = (cache_end_sec.unwrap() * 1000.0) as u64;
@@ -854,9 +959,9 @@ impl PluginState {
 
         if available_ms < chunk_ms {
             trace!(
-                "Waiting for more cache: need {}ms, have {}ms",
-                self.current_pos_ms + chunk_ms,
-                cache_end_ms
+                needed_ms = self.current_pos_ms + chunk_ms,
+                cached_ms = cache_end_ms,
+                "waiting for the demuxer cache to grow"
             );
             return;
         }
@@ -889,8 +994,9 @@ impl PluginState {
             let ahead_end_ms = chunk_end_ms.saturating_sub(playback_pos_ms);
             if ahead_end_ms > lookahead_limit_ms {
                 trace!(
-                    "Look-ahead limit reached: chunk end {}ms ahead (limit {}ms); waiting",
-                    ahead_end_ms, lookahead_limit_ms
+                    ahead_ms = ahead_end_ms,
+                    limit_ms = lookahead_limit_ms,
+                    "look-ahead limit reached; waiting for playback to catch up"
                 );
                 return;
             }
@@ -898,13 +1004,14 @@ impl PluginState {
 
         if chunk_end_ms > cache_end_ms {
             trace!(
-                "Waiting for more cache: need {}ms, have {}ms",
-                chunk_end_ms, cache_end_ms
+                needed_ms = chunk_end_ms,
+                cached_ms = cache_end_ms,
+                "waiting for the demuxer cache to grow"
             );
             return;
         }
 
-        debug!("Scheduling network chunk at {}ms", self.current_pos_ms);
+        debug!(start_ms = self.current_pos_ms, "scheduling a network chunk");
         self.process_chunk(client, chunk_ms, subtitle_path.as_deref());
     }
 
@@ -957,28 +1064,38 @@ impl PluginState {
                 let ahead_end_ms = chunk_end_ms.saturating_sub(playback_pos_ms);
                 if ahead_end_ms > lookahead_limit_ms {
                     trace!(
-                        "Look-ahead limit reached: chunk end {}ms ahead (limit {}ms); waiting",
-                        ahead_end_ms, lookahead_limit_ms
+                        ahead_ms = ahead_end_ms,
+                        limit_ms = lookahead_limit_ms,
+                        "look-ahead limit reached; waiting for playback to catch up"
                     );
                     return;
                 }
             }
 
-            debug!(
-                "Scheduling local chunk at {}ms, remaining: {}ms",
-                self.current_pos_ms, time_left
-            );
+            debug!(start_ms = self.current_pos_ms, remaining_ms = time_left, "scheduling a local chunk");
             self.process_chunk_local(media_path, subtitle_path);
         } else {
             // Finished processing
             if !self.transcription_complete {
-                info!("Finished processing local file");
-                let msg = if self.config.playback.save_srt {
+                let elapsed_ms = self
+                    .session_started
+                    .map(|started| started.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                let on_screen = if self.config.playback.save_srt {
                     format!("STT: Saved subtitles to {}", subtitle_path.display())
                 } else {
                     "STT: Transcription complete".to_string()
                 };
-                let _ = client.command(&["show-text", &msg, "5000"]);
+                info!(
+                    chunks = self.chunk_seq,
+                    subtitles = self.subtitle_manager.len(),
+                    translations = self.translation_cache.len(),
+                    failures = self.session_failures,
+                    elapsed_ms,
+                    path = %subtitle_path.display(),
+                    display = %logging::osd_line(&on_screen),
+                    "finished transcribing the local file"
+                );
                 self.running = false;
                 self.transcription_complete = true;
             }
@@ -1023,20 +1140,22 @@ impl PluginState {
             let new_pos = playback_pos_ms - (playback_pos_ms % chunk_size);
             if new_pos == self.current_pos_ms {
                 debug!(
-                    "Seek landed within current chunk ({}ms); keeping active tasks",
-                    new_pos
+                    new_pos,
+                    "seek landed inside the chunk in flight; keeping its tasks"
                 );
                 return false;
             }
 
             let forward = playback_pos_ms > last_ms;
             debug!(
-                "User seeked {} from {}ms to {}ms (delta: {}ms)",
-                if forward { "forward" } else { "backward" },
-                last_ms,
-                new_pos,
-                delta_ms
+                direction = if forward { "forward" } else { "backward" },
+                from_ms = last_ms,
+                to_ms = new_pos,
+                delta_ms,
+                "seeked"
             );
+            // Drawn directly: the seek overlay is transient feedback for an
+            // action the user just took, not a diagnostic worth queueing.
             let _ = client.command(&[
                 "show-text",
                 &format!("STT: Seeked to {}", Self::format_progress(new_pos)),
@@ -1082,7 +1201,7 @@ impl PluginState {
         // Dump cache
         let start_sec = self.current_pos_ms as f64 / 1000.0;
         let end_sec = (self.current_pos_ms + chunk_ms) as f64 / 1000.0;
-        trace!("Dumping cache from {}s to {}s", start_sec, end_sec);
+        trace!(start_sec, end_sec, "dumping the demuxer cache to a temp file");
 
         let dump_result = client.command(&[
             "dump-cache",
@@ -1092,7 +1211,11 @@ impl PluginState {
         ]);
 
         if dump_result.is_err() {
-            error!("dump-cache failed");
+            error!(
+                start_sec,
+                end_sec,
+                "mpv refused to dump the demuxer cache; this chunk cannot be transcribed"
+            );
             return false;
         }
 
@@ -1135,10 +1258,7 @@ impl PluginState {
 
         if let Ok(meta) = std::fs::metadata(&append_srt) {
             if meta.len() == 0 {
-                info!(
-                    "Chunk starting at {}ms produced no subtitles; skipping merge",
-                    chunk_start_ms
-                );
+                info!("chunk produced no subtitles; marking it done without merging");
                 self.mark_chunk_processed(chunk_start_ms);
                 self.paths.cleanup_intermediate_subs();
                 return true;
@@ -1147,20 +1267,37 @@ impl PluginState {
 
         if let Err(e) = crate::srt::offset_srt_file(&append_srt, &offset_srt, chunk_start_ms as i64)
         {
-            error!("SRT offset failed: {}", e);
+            error!(
+                error = %e,
+                cause = %logging::err_chain(&e),
+                offset_ms = chunk_start_ms,
+                "cannot shift the chunk's subtitles onto the media timeline"
+            );
             return false;
         }
 
-        // Add original subtitles first so recognition updates immediately
+        // Add original subtitles first so recognition updates immediately.
+        // Everything past this point is additive: the original text is already
+        // in the manager and on disk, so a later failure cannot lose it.
         let srt_file = match SrtFile::parse(&offset_srt) {
             Ok(srt) => srt,
-            Err(_) => return false,
+            Err(e) => {
+                error!(
+                    error = %e,
+                    cause = %logging::err_chain(&e),
+                    path = %offset_srt,
+                    "cannot parse the chunk's subtitles; original text stays on screen"
+                );
+                return false;
+            }
         };
         self.subtitle_manager.add_from_srt(&srt_file);
         self.mark_chunk_processed(chunk_start_ms);
+        debug!(entries = srt_file.entries.len(), total = self.subtitle_manager.len(), "subtitles merged");
 
         let mut pending_tasks = Vec::new();
         let mut already_translated = 0usize;
+        let mut skipped_failed = 0usize;
 
         for entry in &srt_file.entries {
             let original = entry.text.trim();
@@ -1176,6 +1313,7 @@ impl PluginState {
             // mid-file, or the seek path re-queued this chunk): the original is
             // on screen and stays there rather than being retried forever.
             if self.translation_failed(start_ms) {
+                skipped_failed += 1;
                 continue;
             }
 
@@ -1189,39 +1327,36 @@ impl PluginState {
             return false;
         }
 
-        // Translate using async translation queue (Ctrl+Shift+t toggles translate_enabled)
+        // Translate using async translation queue (Ctrl+Shift+t toggles translate_enabled).
+        // Purely additive: the originals are already saved above, so nothing
+        // here can take them away.
         if self.translate_enabled && !pending_tasks.is_empty() {
             if let Some(ref queue) = self.async_translation_queue {
-                trace!("Submitting subtitles to async translation queue");
+                let queued = pending_tasks.len();
                 for task in pending_tasks {
                     queue.submit(task);
                 }
-                debug!(
-                    "Submitted {} entries to async translation (already translated: {})",
-                    srt_file.entries.len(),
-                    already_translated
-                );
+                debug!(queued, already_translated, skipped_failed, "submitted cues for translation");
             }
-        } else if already_translated > 0 {
+        } else if !self.translate_enabled && !pending_tasks.is_empty() {
             debug!(
-                "All {} entries already had translations",
-                already_translated
+                cues = pending_tasks.len(),
+                "translation is off; keeping the original text"
             );
+        } else if already_translated > 0 {
+            debug!(already_translated, "every cue already had a translation");
         }
 
         // Keep only the main subtitle file on disk during playback to reduce clutter.
         // The `_append*` files are per-chunk intermediates and will be regenerated each chunk.
         self.paths.cleanup_intermediate_subs();
 
-        debug!(
-            "Processed chunk at {}ms, total subs: {}",
-            self.current_pos_ms,
-            self.subtitle_manager.len()
-        );
+        debug!(next_ms = self.current_pos_ms, "chunk merged");
         true
     }
 
-    fn show_device_notice(&mut self, client: &mut Handle, device_notice: Option<SttDeviceNotice>) {
+
+    fn show_device_notice(&mut self, _client: &mut Handle, device_notice: Option<SttDeviceNotice>) {
         let Some(notice) = device_notice else {
             return;
         };
@@ -1237,8 +1372,14 @@ impl PluginState {
             ));
         }
 
-        let _ = client.command(&["show-text", &msg, "3000"]);
-        info!("STT device notice: {}", msg);
+        info!(
+            requested = %notice.requested,
+            effective = %notice.effective,
+            gpu_device = notice.gpu_device,
+            reason = %notice.reason,
+            display = %logging::osd_line(&msg),
+            "STT device notice"
+        );
     }
 
     /// Process completed translation outcomes from the async queue.
@@ -1256,12 +1397,12 @@ impl PluginState {
         if outcomes.is_empty() {
             return;
         }
-        debug!("Received {} translation outcomes", outcomes.len());
 
         let main_srt = subtitle_path
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
 
+        let mut translated = 0usize;
         let mut failed = 0usize;
         let mut last_reason = String::new();
 
@@ -1275,11 +1416,14 @@ impl PluginState {
                     self.subtitle_manager
                         .update_translation(result.start_ms, &result.translated);
                     let _ = self.save_subs(client, &main_srt);
+                    translated += 1;
                 }
                 TranslationOutcome::Failed(failure) => {
                     warn!(
-                        "Giving up on translation at {}ms: {}",
-                        failure.start_ms, failure.reason
+                        start_ms = failure.start_ms,
+                        cause = %failure.cause,
+                        reason = %failure.reason,
+                        "giving up on this cue's translation; the original stays on screen"
                     );
                     // Remembering the failure is what keeps it from being
                     // re-queued on every seek or chunk boundary.
@@ -1289,6 +1433,7 @@ impl PluginState {
                 }
             }
         }
+        trace!(translated, failed, "translation outcomes applied");
 
         if failed > 0 {
             // The reason is worth seeing, but a backend that is down fails
@@ -1296,13 +1441,14 @@ impl PluginState {
             // log instead of on screen.
             if !self.translation_failure_reported {
                 self.translation_failure_reported = true;
-                let msg = format!(
-                    "翻译失败 ({} 条), 仅显示原文: {}",
+                info!(
                     failed,
-                    crate::translate::short_reason(&last_reason)
+                    reason = %last_reason,
+                    display = %logging::osd_line(&format!(
+                        "翻译失败 ({failed} 条), 仅显示原文: {last_reason}"
+                    )),
+                    "translation backend is not answering"
                 );
-                let _ = client.command(&["show-text", &msg, "5000"]);
-                info!("{}", msg);
             }
         }
     }
@@ -1313,12 +1459,21 @@ impl PluginState {
     }
 
     fn save_subs(&mut self, client: &mut Handle, main_srt: &Path) -> bool {
+        let entries = self.subtitle_manager.len();
         if let Err(e) = self.subtitle_manager.save_to_file(main_srt) {
-            error!("Failed to save subtitles: {}", e);
+            error!(
+                error = %e,
+                cause = %logging::err_chain(&e),
+                path = %main_srt.display(),
+                entries,
+                "cannot write the subtitle file"
+            );
             return false;
         }
         if self.subs_loaded {
             let _ = client.command(&["sub-reload"]);
+        } else {
+            trace!(path = %main_srt.display(), "subtitle file written (not yet loaded into mpv)");
         }
         self.save_cache_manifest_if_needed();
         true
@@ -1328,7 +1483,28 @@ impl PluginState {
     /// alive. This path is used by the toggle, EndFile, completed media and
     /// recoverable STT errors, so it must remain restartable.
     fn stop_transcription(&mut self) {
-        debug!("Stopping current transcription and cleaning up session state");
+        // Report inside the session span before dropping it, so the summary
+        // carries the session id and media it belongs to.
+        if let Some(span) = self.session_span.take() {
+            let _session = span.entered();
+            let elapsed_ms = self
+                .session_started
+                .take()
+                .map(|started| started.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            info!(
+                chunks = self.chunk_seq,
+                subtitles = self.subtitle_manager.len(),
+                translations = self.translation_cache.len(),
+                failures = self.session_failures,
+                elapsed_ms,
+                "transcription session ended"
+            );
+        }
+        self.session_started = None;
+        self.chunk_seq = 0;
+        self.session_failures = 0;
+        self.cached_subtitle_path = None;
 
         self.running = false;
         self.transcription_worker.cancel_inflight();
@@ -1362,11 +1538,13 @@ impl PluginState {
         }
 
         self.shutting_down = true;
+        info!("shutting down");
         self.stop_transcription();
         self.transcription_worker.shutdown();
         if let Some(mut queue) = self.async_translation_queue.take() {
             queue.shutdown();
         }
+        info!("shutdown complete");
     }
 
     fn format_progress(ms: u64) -> String {
@@ -1447,9 +1625,10 @@ impl PluginState {
             Ok(srt) => srt,
             Err(err) => {
                 warn!(
-                    "Failed to parse cached subtitles {}: {}",
-                    srt_path.display(),
-                    err
+                    error = %err,
+                    cause = %logging::err_chain(&err),
+                    path = %srt_path.display(),
+                    "cannot parse the cached subtitles; transcribing from scratch"
                 );
                 return false;
             }
@@ -1485,12 +1664,38 @@ impl PluginState {
             }
         }
 
+        debug!(
+            path = %srt_path.display(),
+            entries = srt_file.entries.len(),
+            translations = self.translation_cache.len(),
+            "reused cached subtitles"
+        );
         true
     }
 
     fn load_cache_manifest(&self, path: &Path) -> Option<CacheManifest> {
-        let content = fs::read_to_string(path).ok()?;
-        serde_json::from_str(&content).ok()
+        let content = match fs::read_to_string(path) {
+            Ok(content) => content,
+            Err(err) => {
+                debug!(
+                    error = %err,
+                    path = %path.display(),
+                    "no usable cache manifest; deriving progress from the subtitles"
+                );
+                return None;
+            }
+        };
+        match serde_json::from_str(&content) {
+            Ok(manifest) => Some(manifest),
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    path = %path.display(),
+                    "cache manifest is unreadable; deriving progress from the subtitles"
+                );
+                None
+            }
+        }
     }
 
     fn save_cache_manifest_if_needed(&self) {
@@ -1520,16 +1725,23 @@ impl PluginState {
         let content = match serde_json::to_string(&manifest) {
             Ok(data) => data,
             Err(err) => {
-                warn!("Failed to serialize cache manifest: {}", err);
+                warn!(error = %err, "cannot serialize the cache manifest");
                 return;
             }
         };
 
         if let Err(err) = fs::write(&cache.manifest_path, content) {
             warn!(
-                "Failed to write cache manifest {}: {}",
-                cache.manifest_path.display(),
-                err
+                error = %err,
+                path = %cache.manifest_path.display(),
+                "cannot write the cache manifest; the next run will re-transcribe"
+            );
+        } else {
+            debug!(
+                chunks = manifest.processed_chunks.len(),
+                translations = manifest.translations.len(),
+                path = %cache.manifest_path.display(),
+                "saved the cache manifest"
             );
         }
     }
@@ -1538,32 +1750,32 @@ impl PluginState {
     fn detect_network_stream(&self, client: &mut Handle) -> bool {
         // Method 1: Check path/filename for http/https URLs
         if let Ok(path) = client.get_property::<String>("path") {
-            debug!("Checking path for network stream: {}", path);
+            trace!(path, "checking whether the media is a network stream");
             if path.starts_with("http://") || path.starts_with("https://") {
-                debug!("Detected network stream by URL prefix");
+                trace!(signal = "url-scheme", "network stream detected");
                 return true;
             }
         }
 
         // Method 2: Check stream-open-filename
         if let Ok(filename) = client.get_property::<String>("stream-open-filename") {
-            debug!("Checking stream-open-filename: {}", filename);
+            trace!(filename, "checking stream-open-filename");
             if filename.starts_with("http://") || filename.starts_with("https://") {
-                debug!("Detected network stream by stream-open-filename");
+                trace!(signal = "stream-open-filename", "network stream detected");
                 return true;
             }
         }
 
         // Method 3: Check demuxer-via-network property
         if let Ok(via_network) = client.get_property::<String>("demuxer-via-network") {
-            debug!("demuxer-via-network: {}", via_network);
+            trace!(via_network, "checking demuxer-via-network");
             if via_network == "yes" {
-                debug!("Detected network stream by demuxer-via-network");
+                trace!(signal = "demuxer-via-network", "network stream detected");
                 return true;
             }
         }
 
-        debug!("Not detected as network stream, treating as local file");
+        trace!("no network stream signal; treating the media as a local file");
         false
     }
 
@@ -1601,80 +1813,65 @@ impl Drop for PluginState {
 /// MPV C plugin entry point
 #[unsafe(no_mangle)]
 pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_int {
-    #[cfg(target_os = "android")]
-    init_panic_logger();
-
     let result = std::panic::catch_unwind(|| {
-        init_logger();
-
-        let client = Handle::from_ptr(handle);
-
-        info!("mpv_stt_plugin_rs Rust plugin initializing...");
-
-        // Print welcome message
-        let _ = client.command(&["show-text", "mpv_stt_plugin_rs Rust plugin loaded!", "3000"]);
-        info!("Plugin loaded, client name: {}", client.name());
-
-        // Initialize plugin state with configuration
+        // Config first: the logging setup itself is configured by `[log]`, so it
+        // cannot come before the config is read.
         let env_cfg_path = Config::config_path_from_env();
         let default_cfg_path = Config::default_config_path();
         let config = Config::load();
 
-        info!(
-            "Config source: env MPV_STT_PLUGIN_RS_CONFIG={:?}, default={:?}",
-            env_cfg_path.as_ref().map(|p| p.display().to_string()),
-            default_cfg_path.as_ref().map(|p| p.display().to_string())
+        let log_settings = LogSettings::from_config(
+            &config.log,
+            config
+                .log_dir(env_cfg_path.as_ref().or(default_cfg_path.as_ref()))
+                .as_deref(),
         );
-        // Deliberately log only non-secret fields. The full Config debug value
-        // contains API/encryption/auth keys and must never be written to IINA's
-        // logs.
+        let _log_guard = logging::init(&log_settings);
+        logging::install_panic_hook();
+
+        let client = Handle::from_ptr(handle);
+
+        // The effective configuration, field by field. Never the whole
+        // `Config`: it carries API keys, encryption keys and auth secrets.
         info!(
-            "Effective config: stt.backend={}, stt.model={}, stt.language={}, translate.backend={}, translate.languages={}->{}, chunks={}ms/{}ms, auto_start={}, save_srt={}",
-            config.stt.backend,
-            match config.stt.backend {
-                crate::config::BackendKind::Ferrum => config
-                    .stt
-                    .ferrum
-                    .as_ref()
-                    .map(|cfg| cfg.model.as_str())
-                    .unwrap_or("<missing>"),
-                crate::config::BackendKind::OpenAi => config
-                    .stt
-                    .openai
-                    .as_ref()
-                    .map(|cfg| cfg.model.as_str())
-                    .unwrap_or("<missing>"),
-            },
-            match config.stt.backend {
-                crate::config::BackendKind::Ferrum => config
-                    .stt
-                    .ferrum
-                    .as_ref()
-                    .and_then(|cfg| cfg.language.as_deref())
-                    .unwrap_or("auto"),
-                crate::config::BackendKind::OpenAi => config
-                    .stt
-                    .openai
-                    .as_ref()
-                    .and_then(|cfg| cfg.language.as_deref())
-                    .unwrap_or("auto"),
-            },
-            config.translate.backend,
-            config.translate.from_lang,
-            config.translate.to_lang,
-            config.chunk.local_ms,
-            config.chunk.network_ms,
-            config.playback.auto_start,
-            config.playback.save_srt,
+            backend = %config.stt.backend,
+            translate_backend = %config.translate.backend,
+            translate = %format!("{}->{}", config.translate.from_lang, config.translate.to_lang),
+            local_chunk_ms = config.chunk.local_ms,
+            network_chunk_ms = config.chunk.network_ms,
+            auto_start = config.playback.auto_start,
+            save_srt = config.playback.save_srt,
+            log_filter = %log_settings.filter,
+            log_format = %log_settings.format,
+            log_file = %log_settings
+                .file
+                .as_ref()
+                .map(|f| f.dir.join(&f.stem).display().to_string())
+                .unwrap_or_else(|| "off".to_string()),
+            log_osd = log_settings.osd,
+            "effective configuration"
+        );
+
+        // Print welcome message
+        info!(
+            client = client.name(),
+            display = %logging::osd_line("mpv_stt_plugin_rs Rust plugin loaded!"),
+            "plugin loaded"
         );
         let auto_start = config.playback.auto_start;
         let mut state = match PluginState::new(config) {
             Ok(state) => state,
             Err(err) => {
-                error!("Failed to initialize STT plugin: {err}");
+                error!(
+                    error = %err,
+                    cause = %logging::err_chain(&err),
+                    "cannot initialize the plugin"
+                );
+                // Drawn directly rather than through the OSD queue: a failed
+                // init returns before the event loop that drains the queue.
                 let _ = client.command(&[
                     "show-text",
-                    &format!("STT plugin initialization failed: {err}"),
+                    &format!("STT plugin initialization failed: {}", logging::osd_line(&err.to_string())),
                     "8000",
                 ]);
                 return -1;
@@ -1694,29 +1891,31 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
 
         if let Err(err) = client.command(&["define-section", &section_name, &key_bindings, "force"])
         {
-            error!("Failed to define input section {section_name}: {err}");
-            let _ = client.command(&[
-                "show-text",
-                "STT plugin: failed to register shortcuts (see log)",
-                "5000",
-            ]);
+            error!(
+                error = %err,
+                section = %section_name,
+                display = %logging::osd_line("STT plugin: failed to register shortcuts (see log)"),
+                "cannot define the input section"
+            );
         } else if let Err(err) = client.command(&["enable-section", &section_name]) {
-            error!("Failed to enable input section {section_name}: {err}");
-            let _ = client.command(&[
-                "show-text",
-                "STT plugin: failed to enable shortcuts (see log)",
-                "5000",
-            ]);
+            error!(
+                error = %err,
+                section = %section_name,
+                display = %logging::osd_line("STT plugin: failed to enable shortcuts (see log)"),
+                "cannot enable the input section"
+            );
         } else {
             info!(
-                "Registered forced shortcuts for client {} (target {}): Ctrl+Shift+S/T/C",
-                client_name, client_target
+                client = %client_name,
+                target = %client_target,
+                keys = "Ctrl+Shift+S/T/C",
+                "registered the forced shortcut section"
             );
         }
 
         // Set auto-start flag (will start after file loads)
         if auto_start {
-            info!("Auto-start enabled, waiting for file to load...");
+            info!("auto-start enabled; waiting for a file to load");
             state.pending_auto_start = true;
         }
 
@@ -1724,7 +1923,7 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
         // try to start immediately instead of waiting for the next FileLoaded event.
         if auto_start && !state.running {
             if client.get_property::<f64>("duration").is_ok() {
-                debug!("Auto-start: media already loaded, starting immediately");
+                debug!("auto-start: media already loaded, starting now");
                 state.file_loaded = true;
                 state.pending_auto_start = false;
                 state.running = true;
@@ -1735,11 +1934,15 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
         // Main event loop with short timeout for continuous processing
         loop {
             // Use 0.1 second timeout to allow continuous processing
-            match client.wait_event(0.1) {
+            let event = client.wait_event(0.1);
+            // Anything `warn` and above raised since the last iteration goes to
+            // the OSD here: non-blocking, and it cannot delay an event.
+            drain_osd(client);
+            match event {
                 Event::Shutdown => {
-                    info!("Shutting down...");
+                    info!("shutting down");
                     state.shutdown();
-                    info!("Shutdown complete");
+                    info!("shutdown complete");
                     return 0;
                 }
                 Event::ClientMessage(msg) => {
@@ -1750,15 +1953,15 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                     if let Some(command) = ControlCommand::from_client_message(&args) {
                         match command {
                             ControlCommand::ToggleStt => {
-                                debug!("Toggling STT...");
+                                debug!("toggling STT");
                                 state.toggle_stt(client);
                             }
                             ControlCommand::ToggleTranslate => {
-                                debug!("Toggling translation...");
+                                debug!("toggling translation");
                                 state.toggle_translate(client);
                             }
                             ControlCommand::ClearCache => {
-                                debug!("Clearing subtitle cache...");
+                                debug!("clearing the subtitle cache");
                                 state.clear_cache(client);
                             }
                         }
@@ -1768,7 +1971,7 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                     if state.shutting_down {
                         continue;
                     }
-                    debug!("StartFile event received");
+                    debug!("mpv start-file");
                     // Be defensive if a frontend switches files without an
                     // EndFile event reaching this client.
                     if state.running || state.mode.is_some() {
@@ -1781,12 +1984,12 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                     if state.shutting_down {
                         continue;
                     }
-                    debug!("File loaded event received");
+                    debug!("mpv file-loaded");
                     state.file_loaded = true;
 
                     // Trigger auto-start if pending
                     if state.pending_auto_start && !state.running {
-                        info!("Auto-starting STT after file load");
+                        info!("auto-starting STT after file load");
                         state.pending_auto_start = false;
                         state.running = true;
                         state.start_transcription(client);
@@ -1796,11 +1999,11 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                     if state.shutting_down {
                         continue;
                     }
-                    debug!("Playback restart event received");
+                    debug!("mpv playback-restart");
 
                     // Also trigger auto-start on playback restart (backup mechanism)
                     if state.pending_auto_start && !state.running && state.file_loaded {
-                        info!("Auto-starting STT after playback restart");
+                        info!("auto-starting STT after playback restart");
                         state.pending_auto_start = false;
                         state.running = true;
                         state.start_transcription(client);
@@ -1832,72 +2035,35 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
         }
     });
 
-    if let Err(err) = result {
-        #[cfg(target_os = "android")]
-        log_android_error(&format!("mpv_open_cplugin panicked: {:?}", err));
-        #[cfg(not(target_os = "android"))]
-        eprintln!("mpv_open_cplugin panicked: {:?}", err);
+    if let Err(payload) = result {
+        report_escaped_panic(payload.as_ref());
         return -1;
     }
 
     0
 }
 
-#[cfg(target_os = "android")]
-fn init_panic_logger() {
-    std::panic::set_hook(Box::new(|info| {
-        log_android_error(&format!("panic: {}", info));
-    }));
-}
-
-#[cfg(target_os = "android")]
-fn log_android_error(message: &str) {
-    const ANDROID_LOG_ERROR: libc::c_int = 6;
-    let tag = CString::new("mpv_stt_plugin_rs").unwrap_or_default();
-    let msg = CString::new(message).unwrap_or_default();
-    unsafe {
-        __android_log_write(ANDROID_LOG_ERROR, tag.as_ptr(), msg.as_ptr());
+/// Draw the log records queued for the OSD since the last call.
+///
+/// Drained from the event loop rather than from the logging path so a burst of
+/// failures can never block the thread that has to keep answering mpv.
+fn drain_osd(client: &mut Handle) {
+    let notices = logging::take_osd_notices();
+    for line in logging::format_osd_notices(&notices) {
+        let _ = client.command(&["show-text", &line, "4000"]);
     }
 }
 
-#[cfg(target_os = "android")]
-unsafe extern "C" {
-    fn __android_log_write(
-        prio: libc::c_int,
-        tag: *const libc::c_char,
-        text: *const libc::c_char,
-    ) -> libc::c_int;
-}
-
-fn init_logger() {
-    // Set MPV_STT_PLUGIN_RS_LOG environment variable to control log level (e.g., MPV_STT_PLUGIN_RS_LOG=debug)
-    #[cfg(target_os = "android")]
-    {
-        use log::LevelFilter;
-
-        let level = std::env::var("MPV_STT_PLUGIN_RS_LOG")
-            .ok()
-            .and_then(|s| {
-                s.parse::<LevelFilter>()
-                    .or_else(|_| s.to_lowercase().parse())
-                    .ok()
-            })
-            .unwrap_or(LevelFilter::Info);
-
-        let config = android_logger::Config::default()
-            .with_tag("mpv_stt_plugin_rs")
-            .with_max_level(level);
-        let _ = android_logger::init_once(config);
-    }
-
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = env_logger::Builder::from_env(
-            env_logger::Env::new().filter_or("MPV_STT_PLUGIN_RS_LOG", "info"),
-        )
-        .format_timestamp_millis()
-        .try_init();
-    }
+/// Record a panic that escaped the event loop. The hook installed by
+/// `logging::install_panic_hook` normally catches these first and already sent
+/// them to every sink; this is the last resort for a panic raised outside it.
+fn report_escaped_panic(payload: &(dyn std::any::Any + Send)) {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string());
+    error!(target: logging::TARGET_INTERNAL, "event loop aborted by panic: {detail}");
 }
 
 #[cfg(test)]
@@ -2043,6 +2209,7 @@ mod tests {
                 100,
                 output_wav,
                 output_prefix,
+                logging::chunk_span(1, 0, 0, 100, 0),
             )
             .expect("failed to submit transcription job");
         request_seen_rx

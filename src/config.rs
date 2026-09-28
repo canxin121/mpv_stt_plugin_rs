@@ -3,10 +3,10 @@ use figment::{
     Figment,
     providers::{Env, Format, Serialized, Toml},
 };
-use log::warn;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
+use tracing::warn;
 
 /// Which remote STT backend to use at runtime. The plugin is a pure remote
 /// client: both backends are compiled in, and this key selects the active one
@@ -105,6 +105,7 @@ pub struct Config {
     pub playback: PlaybackConfig,
     pub prefetch: PrefetchConfig,
     pub network: NetworkConfig,
+    pub log: LogConfig,
 }
 
 impl Default for Config {
@@ -117,6 +118,47 @@ impl Default for Config {
             playback: PlaybackConfig::default(),
             prefetch: PrefetchConfig::default(),
             network: NetworkConfig::default(),
+            log: LogConfig::default(),
+        }
+    }
+}
+
+/// Logging configuration. Every key has a usable default, so an existing config
+/// file keeps working without a `[log]` section.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogConfig {
+    /// `EnvFilter` directives, e.g. `info` or
+    /// `mpv_stt_plugin_rs::stt=trace,warn`. The `MPV_STT_PLUGIN_RS_LOG`
+    /// environment variable overrides this.
+    pub level: String,
+    /// Directives for the log file when it should differ from `level`; the
+    /// file defaults to `debug` so a GUI-launched player leaves enough behind
+    /// to diagnose a failure after the fact. Empty = same as `level`.
+    pub file_level: String,
+    /// `auto` = `<config dir>/mpv_stt_plugin_rs.log`, `""` = no file, or an
+    /// explicit path.
+    pub file: String,
+    /// Rotated files to keep (daily rotation).
+    pub file_max_files: usize,
+    /// `compact` (one line per event) | `full` (event plus span open/close with
+    /// timings) | `json`.
+    pub format: String,
+    /// Colorize: `""` = only when the sink is a terminal, else `true`/`false`.
+    pub ansi: String,
+    /// Draw `warn` and above on mpv's OSD.
+    pub osd: bool,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            level: "info".to_string(),
+            file_level: "debug".to_string(),
+            file: "auto".to_string(),
+            file_max_files: 5,
+            format: "compact".to_string(),
+            ansi: String::new(),
+            osd: true,
         }
     }
 }
@@ -331,6 +373,17 @@ impl Default for NetworkConfig {
     }
 }
 
+/// Whether an `MPV_STT_PLUGIN_RS_*` key (prefix already stripped) names a
+/// config field.
+///
+/// `MPV_STT_PLUGIN_RS_LOG` is the exception: it holds an `EnvFilter` directive
+/// string that `logging::LogSettings` reads straight from the environment.
+/// Letting the config provider see it would put `mpv_stt_plugin_rs::stt=trace`
+/// into `log.level`, where it is not a level at all.
+fn is_config_env_key(key: &str) -> bool {
+    !key.eq_ignore_ascii_case("log")
+}
+
 impl Config {
     pub fn default_config_path() -> Option<PathBuf> {
         let base = BaseDirs::new()?;
@@ -351,16 +404,62 @@ impl Config {
             figment = figment.merge(Toml::file(path));
         }
 
-        // Env should take precedence over file/defaults.
-        figment = figment.merge(Env::prefixed("MPV_STT_PLUGIN_RS_"));
+        // Env overrides, with `_` mapping to a nesting level so
+        // `MPV_STT_PLUGIN_RS_LOG_FILE=off` sets `log.file`. (Flat keys such as
+        // `MPV_STT_PLUGIN_RS_...` for the top-level sections still resolve, since
+        // Figment tries the unsplit key first.)
+        //
+        // `MPV_STT_PLUGIN_RS_LOG` is the log filter, not a config key: it is read
+        // directly by `logging::LogSettings`, and letting the splitter see it
+        // would turn the filter text into `log.level`.
+        figment = figment.merge(
+            Env::prefixed("MPV_STT_PLUGIN_RS_")
+                // `filter` runs before `split`, so this sees the key with the
+                // prefix already removed (`LOG`, not `log.level`).
+                .filter(|key| is_config_env_key(key.as_str()))
+                .split("_"),
+        );
 
         match figment.extract::<Config>() {
             Ok(cfg) => cfg,
             Err(err) => {
                 // Logging might not be initialized yet; fall back silently.
-                warn!("Failed to load config, using defaults: {err}");
+                warn!(error = %err, "failed to load config, using defaults");
                 Config::default()
             }
         }
+    }
+
+    /// Directory `log.file = "auto"` writes into: next to the config file, so a
+    /// user who overrides the config path also moves the log. `None` when no
+    /// config directory is resolvable.
+    pub fn log_dir(&self, config_path: Option<&PathBuf>) -> Option<PathBuf> {
+        if let Some(path) = config_path {
+            return path.parent().map(PathBuf::from);
+        }
+        Self::default_config_path().and_then(|p| p.parent().map(PathBuf::from))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `MPV_STT_PLUGIN_RS_LOG` is the `EnvFilter` directive string, read by
+    /// `logging::LogSettings`. It must not also land in `log.level`, or the
+    /// filter text (`mpv_stt_plugin_rs::stt=trace,warn`) would be parsed as a
+    /// level and the documented override would apply to nothing.
+    #[test]
+    fn the_log_filter_env_var_is_not_a_config_key() {
+        // `Env::lowercase` means the provider hands over `LOG` for
+        // `MPV_STT_PLUGIN_RS_LOG`.
+        assert!(!is_config_env_key("LOG"));
+        assert!(!is_config_env_key("log"));
+
+        // Every sibling key still resolves. The splitter turns `LOG_FILE` into
+        // `log.file`, which is the nesting level the `[log]` section expects.
+        assert!(is_config_env_key("LOG_FILE"));
+        assert!(is_config_env_key("LOG_LEVEL"));
+        assert_eq!("LOG_FILE".replace('_', ".").to_lowercase(), "log.file");
     }
 }

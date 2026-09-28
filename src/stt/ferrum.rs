@@ -3,7 +3,7 @@ use crate::common::{MpvSttError, Result};
 use crate::crypto::{AuthToken, EncryptionKey};
 use crate::srt::SrtFile;
 use libc;
-use log::{debug, trace};
+use tracing::{debug, trace, warn};
 use opusic_sys as opus;
 use reqwest::Client;
 use reqwest::header::{HeaderMap, HeaderValue};
@@ -90,25 +90,29 @@ impl FerrumBackend {
             .ok_or_else(|| MpvSttError::InvalidPath("Invalid audio path".to_string()))?;
 
         trace!(
-            "Ferrum STT: {} (duration: {}ms, model: {}, language: {})",
-            audio_str,
+            server = %self.server_url,
+            model = %self.config.model,
+            language = self.config.language.as_deref().unwrap_or("auto"),
+            audio = audio_str,
             duration_ms,
-            self.config.model,
-            self.config.language.as_deref().unwrap_or("auto")
+            "transcribing a chunk over the ferrum protocol"
         );
 
         let run_generation = self.cancel_generation.load(Ordering::Relaxed);
 
         let audio_data = self.compress_audio(&audio_path)?;
         if audio_data.is_empty() {
-            return Err(MpvSttError::SttFailed("Audio data is empty".to_string()));
+            return Err(MpvSttError::MalformedResponse {
+                server: "local WAV".to_string(),
+                context: format!("{audio_str} compressed to nothing"),
+            });
         }
 
         let request_id = self.generate_request_id();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| MpvSttError::SttFailed(format!("Async runtime build failed: {e}")))?;
+            .map_err(|e| MpvSttError::SttFailed(format!("cannot build the async runtime: {e}")))?;
         let srt_data = runtime.block_on(self.send_request_with_retry(
             request_id,
             &audio_data,
@@ -121,7 +125,11 @@ impl FerrumBackend {
         }
 
         if srt_data.iter().all(|b| b.is_ascii_whitespace()) {
-            debug!("Remote HTTP STT returned empty subtitles; skipping SRT parse");
+            debug!(
+                server = %self.server_url,
+                duration_ms,
+                "the server returned no subtitles for this chunk"
+            );
             let output_path = PathBuf::from(output_prefix.as_ref()).with_extension("srt");
             SrtFile::new().save(&output_path)?;
             return Ok(());
@@ -131,7 +139,12 @@ impl FerrumBackend {
         let output_path = PathBuf::from(output_prefix.as_ref()).with_extension("srt");
         srt_file.save(&output_path)?;
 
-        debug!("Remote HTTP STT completed successfully");
+        debug!(
+            entries = srt_file.entries.len(),
+            duration_ms,
+            path = %output_path.display(),
+            "chunk transcribed"
+        );
         Ok(())
     }
 
@@ -163,9 +176,15 @@ impl FerrumBackend {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    last_error = Some(e);
                     if attempt + 1 < max_attempts {
-                        debug!("HTTP request attempt {} failed, retrying...", attempt + 1);
+                        warn!(
+                            attempt = attempt + 1,
+                            of = max_attempts,
+                            error = %e,
+                            cause = %crate::logging::err_chain(&e),
+                            "transcription request failed; retrying"
+                        );
+                        last_error = Some(e);
                         tokio::select! {
                             () = tokio::time::sleep(Duration::from_millis(500)) => {}
                             () = Self::wait_for_cancellation(
@@ -173,6 +192,8 @@ impl FerrumBackend {
                                 run_generation,
                             ) => return Err(MpvSttError::SttCancelled),
                         }
+                    } else {
+                        last_error = Some(e);
                     }
                 }
             }
@@ -200,18 +221,30 @@ impl FerrumBackend {
         let mut headers = HeaderMap::new();
         headers.insert(
             HEADER_REQUEST_ID,
-            HeaderValue::from_str(&request_id.to_string())
-                .map_err(|e| MpvSttError::SttFailed(format!("Header error: {}", e)))?,
+            HeaderValue::from_str(&request_id.to_string()).map_err(|e| {
+                MpvSttError::MalformedResponse {
+                    server: "local request".to_string(),
+                    context: format!("cannot encode the {HEADER_REQUEST_ID} header: {e}"),
+                }
+            })?,
         );
         headers.insert(
             HEADER_DURATION_MS,
-            HeaderValue::from_str(&duration_ms.to_string())
-                .map_err(|e| MpvSttError::SttFailed(format!("Header error: {}", e)))?,
+            HeaderValue::from_str(&duration_ms.to_string()).map_err(|e| {
+                MpvSttError::MalformedResponse {
+                    server: "local request".to_string(),
+                    context: format!("cannot encode the {HEADER_DURATION_MS} header: {e}"),
+                }
+            })?,
         );
         headers.insert(
             HEADER_AUTH_TOKEN,
-            HeaderValue::from_str(&hex::encode(self.auth_token.as_bytes()))
-                .map_err(|e| MpvSttError::SttFailed(format!("Header error: {}", e)))?,
+            HeaderValue::from_str(&hex::encode(self.auth_token.as_bytes())).map_err(|e| {
+                MpvSttError::MalformedResponse {
+                    server: "local request".to_string(),
+                    context: format!("cannot encode the {HEADER_AUTH_TOKEN} header: {e}"),
+                }
+            })?,
         );
         let compression = if self.config.use_opus {
             COMPRESSION_OPUS
@@ -224,14 +257,20 @@ impl FerrumBackend {
         }
         headers.insert(
             HEADER_MODEL,
-            HeaderValue::from_str(&self.config.model)
-                .map_err(|e| MpvSttError::SttFailed(format!("Header error: {}", e)))?,
+            HeaderValue::from_str(&self.config.model).map_err(|e| {
+                MpvSttError::MalformedResponse {
+                    server: "local request".to_string(),
+                    context: format!("cannot encode the {HEADER_MODEL} header: {e}"),
+                }
+            })?,
         );
         if let Some(lang) = self.config.language.as_ref() {
             headers.insert(
                 HEADER_LANGUAGE,
-                HeaderValue::from_str(lang)
-                    .map_err(|e| MpvSttError::SttFailed(format!("Header error: {}", e)))?,
+                HeaderValue::from_str(lang).map_err(|e| MpvSttError::MalformedResponse {
+                    server: "local request".to_string(),
+                    context: format!("cannot encode the {HEADER_LANGUAGE} header: {e}"),
+                })?,
             );
         }
 
@@ -241,28 +280,33 @@ impl FerrumBackend {
             .post(format!("{}/transcribe", self.server_url))
             .headers(headers)
             .body(payload);
+        let endpoint = format!("{}/transcribe", self.server_url);
         let request_future = async {
-            let response = request
-                .send()
-                .await
-                .map_err(|e| MpvSttError::SttFailed(format!("HTTP send failed: {}", e)))?;
+            let response = request.send().await.map_err(|e| MpvSttError::TranslationRequest {
+                url: endpoint.clone(),
+                source: e,
+            })?;
             let status = response.status();
             if !status.is_success() {
                 let text = response
                     .text()
                     .await
                     .unwrap_or_else(|_| "unknown error".to_string());
-                return Err(MpvSttError::SttFailed(format!(
-                    "Server error ({}): {}",
-                    status, text
-                )));
+                return Err(MpvSttError::HttpStatus {
+                    server: endpoint.clone(),
+                    status: status.as_u16(),
+                    body: crate::logging::one_line(&text, 300),
+                });
             }
 
             let response_headers = response.headers().clone();
             let data = response
                 .bytes()
                 .await
-                .map_err(|e| MpvSttError::SttFailed(format!("HTTP body read failed: {}", e)))?
+                .map_err(|e| MpvSttError::MalformedResponse {
+                    server: endpoint.clone(),
+                    context: format!("cannot read the response body: {e}"),
+                })?
                 .to_vec();
             Ok((response_headers, data))
         };
@@ -292,21 +336,21 @@ impl FerrumBackend {
         let server_non_infer_ms = server_worker_ms.saturating_sub(server_infer_ms);
 
         debug!(
-            "Ferrum req {} duration_ms={} model={} wall={}ms net≈{}ms srv_queue={}ms srv_worker={}ms \
-             srv_infer={}ms srv_non_infer={}ms bytes_out={}B bytes_in={}B srv_bytes_out={}B resp_raw={}B",
             request_id,
+            server = %self.server_url,
+            model = %self.config.model,
             duration_ms,
-            self.config.model,
             wall_ms,
             network_ms,
             server_queue_ms,
             server_worker_ms,
             server_infer_ms,
             server_non_infer_ms,
-            payload_len,
-            server_bytes_in,
+            bytes_out = payload_len,
+            bytes_in = server_bytes_in,
             server_bytes_out,
-            raw_resp_len
+            response_bytes = raw_resp_len,
+            "transcription response received"
         );
 
         Ok(data)

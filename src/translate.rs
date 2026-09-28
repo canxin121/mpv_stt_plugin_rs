@@ -2,7 +2,7 @@ use crate::common::{MpvSttError, Result};
 use crate::config::TranslateBackendKind;
 use crate::srt::SrtFile;
 use futures::stream::StreamExt;
-use log::{debug, trace, warn};
+use tracing::{debug, trace, warn};
 use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{
@@ -116,10 +116,10 @@ impl Translator {
         }
 
         trace!(
-            "Translating text ({} -> {}): {}",
-            self.config.from_lang,
-            self.config.to_lang,
-            text.chars().take(50).collect::<String>()
+            from = %self.config.from_lang,
+            to = %self.config.to_lang,
+            chars = text.chars().count(),
+            "translating text"
         );
 
         self.translate_remote(text)
@@ -165,31 +165,32 @@ impl Translator {
                             return Ok(translated);
                         }
                         Ok(_) => warn!(
-                            "Translation returned empty for '{}' (attempt {})",
-                            text.chars().take(40).collect::<String>(),
-                            attempt + 1
+                            attempt = attempt + 1,
+                            chars = text.chars().count(),
+                            "the translation server returned nothing for this text"
                         ),
                         Err(e) => {
                             warn!(
-                                "Translation failed for '{}' (attempt {}): {}",
-                                text.chars().take(40).collect::<String>(),
-                                attempt + 1,
-                                e
+                                attempt = attempt + 1,
+                                error = %e,
+                                cause = %crate::logging::err_chain(&e),
+                                "translation request failed"
                             );
                             last_error = Some(e);
                         }
                     }
                 }
                 Err(e) => {
-                    let err = MpvSttError::TranslationFailed(format!(
-                        "Translation request failed: {}",
-                        e
-                    ));
+                    let url = match self.config.backend {
+                        TranslateBackendKind::DeepL => deepl_url(&self.config),
+                        TranslateBackendKind::LibreTranslate => libre_url(&self.config),
+                    };
+                    let err = MpvSttError::TranslationRequest { url, source: e };
                     warn!(
-                        "Translation request failed for '{}' (attempt {}): {}",
-                        text.chars().take(40).collect::<String>(),
-                        attempt + 1,
-                        e
+                        attempt = attempt + 1,
+                        error = %err,
+                        cause = %crate::logging::err_chain(&err),
+                        "cannot reach the translation server"
                     );
                     last_error = Some(err);
                 }
@@ -209,11 +210,12 @@ impl Translator {
 
     /// Translate an SRT file and create a bilingual version
     pub fn translate_srt_file<P: AsRef<Path>>(&self, input_path: P, output_path: P) -> Result<()> {
-        debug!("Translating SRT file with {} entries", {
-            let temp_srt = SrtFile::parse(&input_path)?;
-            temp_srt.entries.len()
-        });
         let mut srt = SrtFile::parse(&input_path)?;
+        debug!(
+            entries = srt.entries.len(),
+            path = %input_path.as_ref().display(),
+            "translating an SRT file"
+        );
         let mut translations = Vec::new();
 
         for entry in &srt.entries {
@@ -225,15 +227,25 @@ impl Translator {
                     translations.push(String::new());
                 }
                 Err(e) => {
-                    warn!("Translation warning: {}", e);
+                    warn!(
+                        error = %e,
+                        cause = %crate::logging::err_chain(&e),
+                        "leaving one cue untranslated"
+                    );
                     translations.push(String::new());
                 }
             }
         }
 
         srt.merge_bilingual(&translations);
-        srt.save(output_path)?;
-        debug!("SRT translation completed");
+        let translated = translations.iter().filter(|t| !t.is_empty()).count();
+        srt.save(&output_path)?;
+        debug!(
+            entries = srt.entries.len(),
+            translated,
+            path = %output_path.as_ref().display(),
+            "translated an SRT file"
+        );
         Ok(())
     }
 
@@ -265,7 +277,10 @@ pub struct TranslationResult {
 #[derive(Debug, Clone)]
 pub struct TranslationFailure {
     pub start_ms: u32,
+    /// One-line reason, short enough for the OSD.
     pub reason: String,
+    /// Full root-cause chain, for the log file.
+    pub cause: String,
 }
 
 /// Condense a transport error into something short enough for mpv's OSD, which
@@ -277,11 +292,6 @@ pub fn short_reason(reason: &str) -> String {
     if reason.is_empty() {
         return "未知错误".to_string();
     }
-    // Strip the error type this crate prepends; the OSD has no room for it.
-    let reason = reason
-        .strip_prefix("Translation failed: ")
-        .unwrap_or(reason)
-        .trim();
     reason.chars().take(120).collect()
 }
 
@@ -367,8 +377,9 @@ impl AsyncTranslationQueue {
                 results.push(queued.outcome);
             } else {
                 trace!(
-                    "Dropping stale translation result from generation {} (current {})",
-                    queued.generation, generation
+                    stale_gen = queued.generation,
+                    gen = generation,
+                    "dropping a translation result from a superseded generation"
                 );
             }
         }
@@ -392,7 +403,7 @@ impl AsyncTranslationQueue {
         loop {
             // Check shutdown flag
             if shutdown_flag.load(Ordering::Acquire) {
-                debug!("Translation worker thread shutting down due to shutdown flag");
+                debug!("translation worker stopping: shutdown requested");
                 return;
             }
 
@@ -400,7 +411,7 @@ impl AsyncTranslationQueue {
             let first_task = match task_receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(Some(task)) => task,
                 Ok(None) => {
-                    debug!("Translation worker thread exiting (received shutdown signal)");
+                    debug!("translation worker exiting: shutdown signal");
                     return;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -408,7 +419,7 @@ impl AsyncTranslationQueue {
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    debug!("Translation worker thread exiting (channel disconnected)");
+                    debug!("translation worker exiting: channel closed");
                     return;
                 }
             };
@@ -431,7 +442,7 @@ impl AsyncTranslationQueue {
             }
 
             let task_count = tasks.len();
-            debug!("Processing {} translation tasks", task_count);
+            debug!(tasks = task_count, "translating a batch");
 
             // Build one shared async client per batch (connection pool reused
             // across the concurrent requests).
@@ -441,7 +452,11 @@ impl AsyncTranslationQueue {
             let client = match client {
                 Ok(client) => client,
                 Err(e) => {
-                    warn!("Failed to build translation HTTP client: {}", e);
+                    warn!(
+                        error = %e,
+                        cause = %crate::logging::err_chain(&e),
+                        "cannot build the translation HTTP client; dropping this batch"
+                    );
                     continue;
                 }
             };
@@ -457,7 +472,7 @@ impl AsyncTranslationQueue {
                 &client,
             );
 
-            debug!("Completed batch of {} translations", task_count);
+            debug!(tasks = task_count, "translation batch finished");
         }
     }
 
@@ -477,8 +492,9 @@ impl AsyncTranslationQueue {
         }
 
         debug!(
-            "Translating {} active tasks using single-thread tokio runtime",
-            tasks.len()
+            tasks = tasks.len(),
+            concurrency = config.concurrency.max(1),
+            "dispatching translations"
         );
 
         let active_tasks: Vec<TranslationTask> = tasks.to_vec();
@@ -520,7 +536,7 @@ impl AsyncTranslationQueue {
                         outcome,
                     };
                     if sender.send(queued).is_err() {
-                        debug!("Main thread dropped receiver, exiting");
+                        debug!("translation results have no receiver; stopping the batch");
                         break;
                     }
                 }
@@ -596,18 +612,19 @@ impl AsyncTranslationQueue {
                 Ok(_) => {
                     last_error = "server returned an empty translation".to_string();
                     warn!(
-                        "Translation returned empty for task at {}ms (attempt {})",
-                        task.start_ms,
-                        attempt + 1
+                        start_ms = task.start_ms,
+                        attempt = attempt + 1,
+                        "the translation server returned nothing for this cue"
                     );
                 }
                 Err(e) => {
-                    last_error = e.to_string();
+                    last_error = crate::logging::err_chain(&e);
                     warn!(
-                        "Translation failed for task at {}ms (attempt {}): {}",
-                        task.start_ms,
-                        attempt + 1,
-                        e
+                        start_ms = task.start_ms,
+                        attempt = attempt + 1,
+                        error = %e,
+                        cause = %last_error,
+                        "translation request failed"
                     );
                 }
             }
@@ -616,7 +633,8 @@ impl AsyncTranslationQueue {
             if attempt > MAX_TRANSLATE_RETRIES {
                 return Some(TranslationOutcome::Failed(TranslationFailure {
                     start_ms: task.start_ms,
-                    reason: last_error,
+                    reason: short_reason(&last_error),
+                    cause: last_error,
                 }));
             }
 
@@ -654,15 +672,15 @@ impl AsyncTranslationQueue {
             return;
         }
 
-        debug!("Shutting down async translation queue");
+        debug!("shutting down the translation queue");
         self.shutdown_flag.store(true, Ordering::Release);
         self.generation.fetch_add(1, Ordering::AcqRel);
         let _ = self.task_sender.send(None);
 
         if let Some(handle) = self.worker_handle.take() {
             match handle.join() {
-                Ok(_) => debug!("Translation worker thread shut down successfully"),
-                Err(_) => warn!("Translation worker thread panicked during shutdown"),
+                Ok(_) => debug!("translation worker stopped"),
+                Err(_) => warn!("translation worker panicked while stopping"),
             }
         }
     }
@@ -676,7 +694,7 @@ impl AsyncTranslationQueue {
 impl Drop for AsyncTranslationQueue {
     fn drop(&mut self) {
         if self.worker_handle.is_some() {
-            debug!("AsyncTranslationQueue dropped, shutting down worker");
+            debug!("translation queue dropped; stopping its worker");
             self.shutdown();
         }
     }
@@ -731,16 +749,23 @@ fn deepl_handle_response(
     let message = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
-        .unwrap_or_else(|| format!("HTTP {}", status));
-    Err(MpvSttError::TranslationFailed(format!(
-        "Translation upstream error ({}): {}",
-        status, message
-    )))
+        .unwrap_or_else(|| crate::logging::one_line(body, 200));
+    Err(MpvSttError::HttpStatus {
+        server: "DeepL-compatible translation server".to_string(),
+        status: status.as_u16(),
+        body: message,
+    })
 }
 
 fn parse_deepl_response(body: &str, text: &str) -> Result<String> {
-    let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| MpvSttError::TranslationFailed(format!("Invalid translation response: {}", e)))?;
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| MpvSttError::MalformedResponse {
+            server: "DeepL-compatible translation server".to_string(),
+            context: format!(
+                "{e}; body starts with {:?}",
+                crate::logging::one_line(body, 200)
+            ),
+        })?;
     value
         .get("translations")
         .and_then(|t| t.as_array())
@@ -748,11 +773,13 @@ fn parse_deepl_response(body: &str, text: &str) -> Result<String> {
         .and_then(|first| first.get("text"))
         .and_then(|t| t.as_str())
         .map(String::from)
-        .ok_or_else(|| {
-            MpvSttError::TranslationFailed(format!(
-                "No translation text in response for '{}'",
-                text.chars().take(50).collect::<String>()
-            ))
+        .ok_or_else(|| MpvSttError::MalformedResponse {
+            server: "DeepL-compatible translation server".to_string(),
+            context: format!(
+                "no translations[0].text for a {} character input; body starts with {:?}",
+                text.chars().count(),
+                crate::logging::one_line(body, 200)
+            ),
         })
 }
 
@@ -764,13 +791,14 @@ async fn deepl_translate_async(
     to_lang: &str,
     text: &str,
 ) -> Result<String> {
+    let url = deepl_url(config);
     let response = client
-        .post(deepl_url(config))
+        .post(url.clone())
         .headers(deepl_headers(config))
         .json(&deepl_body(from_lang, to_lang, text))
         .send()
         .await
-        .map_err(|e| MpvSttError::TranslationFailed(format!("Translation request failed: {}", e)))?;
+        .map_err(|e| MpvSttError::TranslationRequest { url, source: e })?;
 
     let status = response.status();
     let body = response
@@ -823,16 +851,23 @@ fn libre_handle_response(
     let message = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(String::from))
-        .unwrap_or_else(|| format!("HTTP {}", status));
-    Err(MpvSttError::TranslationFailed(format!(
-        "Translation upstream error ({}): {}",
-        status, message
-    )))
+        .unwrap_or_else(|| crate::logging::one_line(body, 200));
+    Err(MpvSttError::HttpStatus {
+        server: "LibreTranslate server".to_string(),
+        status: status.as_u16(),
+        body: message,
+    })
 }
 
 fn parse_libre_response(body: &str, text: &str) -> Result<String> {
-    let value: serde_json::Value = serde_json::from_str(body)
-        .map_err(|e| MpvSttError::TranslationFailed(format!("Invalid translation response: {}", e)))?;
+    let value: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| MpvSttError::MalformedResponse {
+            server: "LibreTranslate server".to_string(),
+            context: format!(
+                "{e}; body starts with {:?}",
+                crate::logging::one_line(body, 200)
+            ),
+        })?;
     // Single-q form first; array form handled defensively (client sends single q).
     if let Some(t) = value.get("translatedText").and_then(|t| t.as_str()) {
         return Ok(t.to_string());
@@ -844,11 +879,13 @@ fn parse_libre_response(body: &str, text: &str) -> Result<String> {
         .and_then(|first| first.get("translatedText"))
         .and_then(|t| t.as_str())
         .map(String::from)
-        .ok_or_else(|| {
-            MpvSttError::TranslationFailed(format!(
-                "No translation text in response for '{}'",
-                text.chars().take(50).collect::<String>()
-            ))
+        .ok_or_else(|| MpvSttError::MalformedResponse {
+            server: "LibreTranslate server".to_string(),
+            context: format!(
+                "no translatedText for a {} character input; body starts with {:?}",
+                text.chars().count(),
+                crate::logging::one_line(body, 200)
+            ),
         })
 }
 
@@ -860,12 +897,13 @@ async fn libre_translate_async(
     to_lang: &str,
     text: &str,
 ) -> Result<String> {
+    let url = libre_url(config);
     let response = client
-        .post(libre_url(config))
+        .post(url.clone())
         .json(&libre_body(from_lang, to_lang, text, &config.libretranslate_api_key))
         .send()
         .await
-        .map_err(|e| MpvSttError::TranslationFailed(format!("Translation request failed: {}", e)))?;
+        .map_err(|e| MpvSttError::TranslationRequest { url, source: e })?;
 
     let status = response.status();
     let body = response
@@ -1113,11 +1151,7 @@ mod tests {
     #[test]
     fn short_reason_is_osd_sized() {
         assert_eq!(short_reason(""), "未知错误");
-        // The crate's error prefix is noise on a one-line OSD.
-        assert_eq!(
-            short_reason("Translation failed: Server error (503): upstream not configured"),
-            "Server error (503): upstream not configured"
-        );
+        assert_eq!(short_reason("  upstream not configured  "), "upstream not configured");
         // A long upstream body cannot push the message off screen.
         let long = "x".repeat(500);
         assert_eq!(short_reason(&long).chars().count(), 120);

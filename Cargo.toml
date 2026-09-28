@@ -21,9 +21,20 @@ aes-gcm = "0.10.3"
 sha2 = "0.10.9"
 rand = "0.9.2"
 
-# Logging
-log = "0.4.29"
-env_logger = "0.11.8"
+# Logging. `tracing` is the only logging facade the plugin talks to; the
+# subscriber is assembled in `logging.rs`. `tracing-log` is deliberately NOT
+# installed, so records from third-party crates that still use `log`
+# (reqwest/hyper/tokio) are dropped instead of flooding the file sink.
+tracing = { version = "0.1.44", features = ["attributes"] }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
+    "std",
+    "fmt",
+    "ansi",
+    "env-filter",
+    "registry",
+    "json",
+] }
+tracing-error = "0.2.1"
 
 # Async runtime (translate.rs uses tokio::spawn + channels)
 tokio = { version = "1.48.0", features = ["rt", "net", "time", "macros"] }
@@ -50,7 +61,6 @@ parking_lot = "0.12.5"
 mpv-client = "1.1.0"
 
 libc = "0.2.178"
-android_logger = "0.15.1"
 
 # stt_ferrum feature: Opus compression + AES encryption support
 hex = { version = "0.4", optional = true }
@@ -82,10 +92,14 @@ cc = "1.1.31"
 ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg", rev = "3751e2800d5d2f0215d69031285aadebac5db8fc", features = [
     "software-resampling",
 ] }
+tracing-appender = "0.2.5"
 
 # Android: dynamically link libffmpeg from the prebuilt prefix (FFMPEG_DIR).
 [target.'cfg(target_os = "android")'.dependencies]
 ffmpeg-next = { git = "https://github.com/canxin121/rust-ffmpeg", rev = "3751e2800d5d2f0215d69031285aadebac5db8fc" }
+# logcat layer. It brings in android_log-sys (`#[link(name = "log")]`), so the
+# crate needs no hand-written `__android_log_write` extern.
+tracing-android = "0.2.0"
 
 [features]
 # Pure remote client: both backends are compiled in, the active one is picked
@@ -98,4 +112,7 @@ stt_openai = []
 opt-level = 3
 lto = true
 codegen-units = 1
+# Keep file/line tables for the panic hook's backtrace while still stripping
+# full symbols. Without this a crash log names functions but no source lines.
+debug = "line-tables-only"
 strip = true

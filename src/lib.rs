@@ -3,6 +3,7 @@ pub mod common;
 pub mod config;
 pub mod crypto;
 pub mod ffi;
+pub mod logging;
 pub mod plugin;
 pub mod process;
 pub mod stt;
@@ -12,10 +13,12 @@ pub mod translate;
 
 pub use audio::AudioExtractor;
 pub use config::{
-    BackendKind, Config, InferenceDevice, TranslateBackendKind, TranslateLibreTranslateConfig,
+    BackendKind, Config, InferenceDevice, LogConfig, TranslateBackendKind,
+    TranslateLibreTranslateConfig,
 };
 pub use crate::common::{MpvSttError, Result};
 pub use crate::crypto::{AuthToken, EncryptionKey};
+pub use crate::logging::{LogFormat, LogSettings, install_panic_hook};
 pub use crate::srt::{SrtFile, SubtitleEntry};
 #[cfg(feature = "stt_ferrum")]
 pub use stt::SttFerrumConfig;

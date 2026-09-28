@@ -4,7 +4,7 @@ use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::util::mathematics::rescale;
 use ffmpeg::util::mathematics::rescale::Rescale;
 use ffmpeg_next as ffmpeg;
-use log::{debug, trace};
+use tracing::{debug, trace};
 use std::path::Path;
 use std::sync::{
     Arc, OnceLock,
@@ -133,11 +133,11 @@ impl AudioExtractor {
             .ok_or_else(|| MpvSttError::InvalidPath("Invalid output path".to_string()))?;
 
         trace!(
-            "Extracting audio: {}ms-{}ms from {} -> {}",
             start_ms,
-            start_ms + duration_ms,
-            input_str,
-            output_str
+            end_ms = start_ms + duration_ms,
+            input = input_str,
+            output = output_str,
+            "extracting audio with ffmpeg"
         );
 
         let cancel_generation = Arc::clone(&self.cancel_generation);
@@ -157,7 +157,7 @@ impl AudioExtractor {
         if start_ms > 0 {
             let position = (start_ms as i64).rescale((1, 1000), rescale::TIME_BASE);
             if let Err(err) = ictx.seek(position, ..position) {
-                trace!("ffmpeg seek failed, falling back to decode+skip: {err}");
+                trace!(error = %err, "ffmpeg seek failed; decoding from the start and skipping");
             } else {
                 seeked = true;
             }
@@ -351,7 +351,7 @@ impl AudioExtractor {
             ));
         }
 
-        debug!("Audio extraction completed successfully");
+        debug!(frames = written_frames, "audio extraction finished");
         Ok(())
     }
 
@@ -372,7 +372,7 @@ impl AudioExtractor {
         check_timeout(start_time, self.ffprobe_timeout, "ffprobe")?;
 
         let has_audio = ictx.streams().best(ffmpeg::media::Type::Audio).is_some();
-        trace!("validate_audio({}): {}", path_str, has_audio);
+        trace!(path = path_str, has_audio, "checked whether the file carries audio");
         Ok(has_audio)
     }
 }

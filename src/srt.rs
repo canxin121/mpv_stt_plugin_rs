@@ -1,4 +1,4 @@
-use log::{debug, trace};
+use tracing::{debug, trace};
 use crate::common::{MpvSttError, Result};
 use srtlib::{Subtitle, Subtitles};
 use std::fmt;
@@ -59,7 +59,7 @@ impl SrtFile {
     }
 
     pub fn parse<P: AsRef<Path>>(path: P) -> Result<Self> {
-        trace!("Parsing SRT file: {}", path.as_ref().display());
+        trace!(path = %path.as_ref().display(), "parsing an SRT file");
         let subs = Subtitles::parse_from_file(path.as_ref(), None)
             .map_err(|e| MpvSttError::InvalidSrt(e.to_string()))?;
 
@@ -69,7 +69,7 @@ impl SrtFile {
             .map(SubtitleEntry::from_srtlib)
             .collect();
 
-        debug!("Parsed SRT file with {} entries", entries.len());
+        debug!(entries = entries.len(), "parsed an SRT file");
         Ok(Self { entries })
     }
 
@@ -87,10 +87,10 @@ impl SrtFile {
     }
 
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        trace!("Saving SRT file to: {}", path.as_ref().display());
+        trace!(path = %path.as_ref().display(), "writing an SRT file");
         let content = self.to_string();
         fs::write(path, content)?;
-        debug!("Saved SRT file with {} entries", self.entries.len());
+        debug!(entries = self.entries.len(), "wrote an SRT file");
         Ok(())
     }
 
@@ -124,7 +124,7 @@ pub fn offset_srt_file<P: AsRef<Path>>(
     output_path: P,
     offset_ms: i64,
 ) -> Result<()> {
-    trace!("Offsetting SRT timestamps by {}ms", offset_ms);
+    trace!(offset_ms, "shifting SRT timestamps");
     let mut subs = Subtitles::parse_from_file(input_path.as_ref(), None)
         .map_err(|e| MpvSttError::InvalidSrt(e.to_string()))?;
 

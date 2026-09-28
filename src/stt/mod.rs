@@ -1,4 +1,5 @@
 use crate::common::Result;
+use tracing::debug;
 use crate::config::SttConfig;
 use std::path::Path;
 use std::sync::{Arc, atomic::AtomicU64};
@@ -71,6 +72,15 @@ impl SttRunner {
                             "Missing [stt.ferrum] configuration".to_string(),
                         )
                     })?;
+                    debug!(
+                        backend = "ferrum",
+                        server = %ferrum_cfg.server_addr,
+                        model = %ferrum_cfg.model,
+                        language = ferrum_cfg.language.as_deref().unwrap_or("auto"),
+                        opus = ferrum_cfg.use_opus,
+                        encrypted = ferrum_cfg.enable_encryption,
+                        "selected the STT backend"
+                    );
                     Ok(SttRunner::Ferrum(ferrum::FerrumBackend::new(
                         ferrum_cfg.clone(),
                     )?))
@@ -91,6 +101,14 @@ impl SttRunner {
                             "Missing [stt.openai] configuration".to_string(),
                         )
                     })?;
+                    debug!(
+                        backend = "openai",
+                        server = %openai_cfg.server_addr,
+                        model = %openai_cfg.model,
+                        language = openai_cfg.language.as_deref().unwrap_or("auto"),
+                        authenticated = openai_cfg.api_key.is_some(),
+                        "selected the STT backend"
+                    );
                     Ok(SttRunner::OpenAi(openai::OpenAiBackend::new(
                         openai_cfg.clone(),
                     )?))

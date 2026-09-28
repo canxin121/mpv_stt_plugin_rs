@@ -1,7 +1,7 @@
 use super::{BackendKind, SttBackend, SttDeviceNotice};
 use crate::common::{MpvSttError, Result};
 use crate::srt::{SrtFile, SubtitleEntry, Timestamp};
-use log::{debug, trace};
+use tracing::{debug, trace, warn};
 use reqwest::Client;
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
@@ -74,25 +74,35 @@ impl OpenAiBackend {
             .ok_or_else(|| MpvSttError::InvalidPath("Invalid audio path".to_string()))?;
 
         trace!(
-            "Remote OpenAI STT: {} (duration: {}ms, model: {})",
-            audio_str, duration_ms, self.model
+            server = %self.server_url,
+            model = %self.model,
+            audio = audio_str,
+            duration_ms,
+            "transcribing a chunk over the OpenAI protocol"
         );
 
         let run_generation = self.cancel_generation.load(Ordering::Relaxed);
 
         // The audio extractor always produces 16 kHz mono 16-bit PCM WAV; the
         // OpenAI endpoint accepts it as-is (the server resamples if needed).
-        let audio_data = std::fs::read(audio_path)
-            .map_err(|e| MpvSttError::SttFailed(format!("Failed to read WAV bytes: {}", e)))?;
+        let audio_data = std::fs::read(&audio_path).map_err(|e| {
+            MpvSttError::MalformedResponse {
+                server: "local WAV".to_string(),
+                context: format!("cannot read {audio_str}: {e}"),
+            }
+        })?;
         if audio_data.is_empty() {
-            return Err(MpvSttError::SttFailed("Audio data is empty".to_string()));
+            return Err(MpvSttError::MalformedResponse {
+                server: "local WAV".to_string(),
+                context: format!("{audio_str} is empty"),
+            });
         }
 
         let request_id = self.generate_request_id();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|e| MpvSttError::SttFailed(format!("Async runtime build failed: {e}")))?;
+            .map_err(|e| MpvSttError::SttFailed(format!("cannot build the async runtime: {e}")))?;
         let json = runtime.block_on(self.send_with_retry(
             request_id,
             &audio_data,
@@ -126,16 +136,24 @@ impl OpenAiBackend {
         if srt.entries.is_empty() {
             // An empty SRT still replaces a real subtitle file upstream, so
             // report failure and leave the caller's file untouched.
+            warn!(
+                server = %self.server_url,
+                model = %self.model,
+                duration_ms,
+                "the transcription server returned no text for this chunk"
+            );
             return Err(MpvSttError::SttFailed(
-                "Server returned no transcription text".to_string(),
+                "the transcription server returned no text".to_string(),
             ));
         }
 
         srt.save(&output_path)?;
         debug!(
-            "Remote OpenAI STT completed: {} segments from chunk ({}ms)",
-            segments.len(),
-            duration_ms
+            segments = segments.len(),
+            entries = srt.entries.len(),
+            duration_ms,
+            path = %output_path.display(),
+            "chunk transcribed"
         );
         Ok(())
     }
@@ -168,9 +186,15 @@ impl OpenAiBackend {
             {
                 Ok(result) => return Ok(result),
                 Err(e) => {
-                    last_error = Some(e);
                     if attempt + 1 < max_attempts {
-                        debug!("OpenAI request attempt {} failed, retrying...", attempt + 1);
+                        warn!(
+                            attempt = attempt + 1,
+                            of = max_attempts,
+                            error = %e,
+                            cause = %crate::logging::err_chain(&e),
+                            "transcription request failed; retrying"
+                        );
+                        last_error = Some(e);
                         tokio::select! {
                             () = tokio::time::sleep(Duration::from_millis(500)) => {}
                             () = Self::wait_for_cancellation(
@@ -178,6 +202,8 @@ impl OpenAiBackend {
                                 run_generation,
                             ) => return Err(MpvSttError::SttCancelled),
                         }
+                    } else {
+                        last_error = Some(e);
                     }
                 }
             }
@@ -197,7 +223,10 @@ impl OpenAiBackend {
         let file_part = Part::bytes(audio.to_vec())
             .file_name("chunk.wav")
             .mime_str("audio/wav")
-            .map_err(|e| MpvSttError::SttFailed(format!("MIME error: {}", e)))?;
+            .map_err(|e| MpvSttError::MalformedResponse {
+                server: "local WAV".to_string(),
+                context: format!("cannot label the upload as audio/wav: {e}"),
+            })?;
 
         let mut form = Form::new()
             .part("file", file_part)
@@ -218,28 +247,33 @@ impl OpenAiBackend {
         if let Some(key) = self.api_key.as_ref() {
             request = request.bearer_auth(key);
         }
+        let endpoint = format!("{}/v1/audio/transcriptions", self.server_url);
         let request_future = async {
-            let response = request
-                .send()
-                .await
-                .map_err(|e| MpvSttError::SttFailed(format!("HTTP send failed: {}", e)))?;
+            let response = request.send().await.map_err(|e| {
+                MpvSttError::TranslationRequest {
+                    url: endpoint.clone(),
+                    source: e,
+                }
+            })?;
             let status = response.status();
             if !status.is_success() {
                 let text = response
                     .text()
                     .await
                     .unwrap_or_else(|_| "unknown error".to_string());
-                return Err(MpvSttError::SttFailed(format!(
-                    "Server error ({}): {}",
-                    status, text
-                )));
+                return Err(MpvSttError::HttpStatus {
+                    server: endpoint.clone(),
+                    status: status.as_u16(),
+                    body: crate::logging::one_line(&text, 300),
+                });
             }
 
-            response
-                .bytes()
-                .await
-                .map(|bytes| bytes.to_vec())
-                .map_err(|e| MpvSttError::SttFailed(format!("HTTP body read failed: {}", e)))
+            response.bytes().await.map(|bytes| bytes.to_vec()).map_err(|e| {
+                MpvSttError::MalformedResponse {
+                    server: endpoint.clone(),
+                    context: format!("cannot read the response body: {e}"),
+                }
+            })
         };
         let data = tokio::select! {
             result = request_future => result?,
@@ -250,12 +284,13 @@ impl OpenAiBackend {
         };
 
         debug!(
-            "OpenAI req {} duration_ms={} wall={}ms model={} resp_bytes={}",
             request_id,
+            server = %self.server_url,
+            model = %self.model,
             duration_ms,
-            wall_start.elapsed().as_millis() as u64,
-            self.model,
-            data.len()
+            bytes = data.len(),
+            wall_ms = wall_start.elapsed().as_millis() as u64,
+            "transcription response received"
         );
 
         Ok(data)
@@ -304,16 +339,14 @@ struct TranscriptionResponse {
 /// no entries, which the caller reports as a failure rather than writing an
 /// empty SRT over the user's existing subtitles.
 fn parse_transcription(json: &[u8], chunk_ms: u64) -> Result<Vec<Segment>> {
-    let resp: TranscriptionResponse = serde_json::from_slice(json).map_err(|e| {
-        MpvSttError::SttFailed(format!(
-            "Failed to parse OpenAI response: {} (body: {})",
-            e,
-            String::from_utf8_lossy(json)
-                .chars()
-                .take(200)
-                .collect::<String>()
-        ))
-    })?;
+    let resp: TranscriptionResponse =
+        serde_json::from_slice(json).map_err(|e| MpvSttError::MalformedResponse {
+            server: "transcription response".to_string(),
+            context: format!(
+                "{e}; body starts with {:?}",
+                crate::logging::one_line(&String::from_utf8_lossy(json), 200)
+            ),
+        })?;
 
     if resp.segments.iter().any(|s| !s.text.trim().is_empty()) {
         return Ok(resp.segments);

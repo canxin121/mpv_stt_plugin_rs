@@ -1,7 +1,7 @@
 use crate::audio::AudioExtractor;
 use crate::config::TranslateBackendKind;
 use crate::translate::{Translator, TranslatorConfig};
-use log::{debug, error};
+use tracing::{debug, error};
 use parking_lot::Mutex;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -43,10 +43,16 @@ pub extern "C" fn translator_init(from_lang: *const c_char, to_lang: *const c_ch
         let from_lang = c_str_to_string(from_lang).unwrap_or_else(|| "auto".to_string());
         let to_lang = c_str_to_string(to_lang).unwrap_or_else(|| "en".to_string());
 
+        debug!(
+            from_lang = %from_lang,
+            to_lang = %to_lang,
+            backend = "deepl",
+            server = "default",
+            "translator initialized via FFI"
+        );
         let config = TranslatorConfig::new(from_lang, to_lang);
         let translator = Translator::new(config);
         *translator_state().lock() = Some(translator);
-        debug!("Translator initialized via FFI (default remote DeepL-compatible server)");
         0
     }
 }
@@ -67,12 +73,18 @@ pub extern "C" fn translator_init_remote(
             c_str_to_string(server_addr).unwrap_or_else(|| "http://127.0.0.1:8000".to_string());
         let api_key = c_str_to_string(api_key).unwrap_or_default();
 
+        debug!(
+            from_lang = %from_lang,
+            to_lang = %to_lang,
+            backend = "deepl",
+            server = %server_addr,
+            "translator initialized via FFI"
+        );
         let config = TranslatorConfig::new(from_lang, to_lang)
             .with_server_addr(server_addr)
             .with_api_key(api_key);
         let translator = Translator::new(config);
         *translator_state().lock() = Some(translator);
-        debug!("Translator initialized via FFI (remote DeepL-compatible server)");
         0
     }
 }
@@ -94,13 +106,19 @@ pub extern "C" fn translator_init_libretranslate(
             c_str_to_string(server_addr).unwrap_or_else(|| "http://127.0.0.1:8000".to_string());
         let api_key = c_str_to_string(api_key).unwrap_or_default();
 
+        debug!(
+            from_lang = %from_lang,
+            to_lang = %to_lang,
+            backend = "libretranslate",
+            server = %server_addr,
+            "translator initialized via FFI"
+        );
         let config = TranslatorConfig::new(from_lang, to_lang)
             .with_backend(TranslateBackendKind::LibreTranslate)
             .with_libretranslate_server_addr(server_addr)
             .with_libretranslate_api_key(api_key);
         let translator = Translator::new(config);
         *translator_state().lock() = Some(translator);
-        debug!("Translator initialized via FFI (remote LibreTranslate server)");
         0
     }
 }
@@ -128,7 +146,15 @@ pub extern "C" fn extract_audio(
         match extractor.extract_audio_segment(&input, &output, start_ms, duration_ms) {
             Ok(_) => 0,
             Err(e) => {
-                error!("Audio extraction error: {}", e);
+                error!(
+                    error = %e,
+                    cause = %crate::logging::err_chain(&e),
+                    start_ms,
+                    duration_ms,
+                    input,
+                    output,
+                    "extract_audio failed"
+                );
                 -1
             }
         }
@@ -153,7 +179,12 @@ pub extern "C" fn translate_text(text: *const c_char) -> *mut c_char {
         match translator.translate(&text_str) {
             Ok(result) => string_to_c_str(result),
             Err(e) => {
-                error!("Translation error: {}", e);
+                error!(
+                    error = %e,
+                    cause = %crate::logging::err_chain(&e),
+                    chars = text_str.chars().count(),
+                    "translate_text failed"
+                );
                 std::ptr::null_mut()
             }
         }
@@ -178,7 +209,7 @@ pub extern "C" fn translate_srt(input_path: *const c_char, output_path: *const c
         let translator = match translator_guard.as_ref() {
             Some(t) => t,
             None => {
-                error!("Translator not initialized");
+                error!("translate_srt called before the translator was initialized");
                 return -1;
             }
         };
@@ -186,7 +217,13 @@ pub extern "C" fn translate_srt(input_path: *const c_char, output_path: *const c
         match translator.translate_srt_file(&input, &output) {
             Ok(_) => 0,
             Err(e) => {
-                error!("SRT translation error: {}", e);
+                error!(
+                    error = %e,
+                    cause = %crate::logging::err_chain(&e),
+                    input,
+                    output,
+                    "translate_srt failed"
+                );
                 -1
             }
         }
@@ -214,7 +251,14 @@ pub extern "C" fn offset_srt(
         match crate::srt::offset_srt_file(&input, &output, offset_ms) {
             Ok(_) => 0,
             Err(e) => {
-                error!("SRT offset error: {}", e);
+                error!(
+                    error = %e,
+                    cause = %crate::logging::err_chain(&e),
+                    input,
+                    output,
+                    offset_ms,
+                    "offset_srt failed"
+                );
                 -1
             }
         }

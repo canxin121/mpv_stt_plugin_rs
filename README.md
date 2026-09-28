@@ -168,7 +168,9 @@ Ctrl+Shift+C script-message-to <client> clear-cache
 - Linux: `~/.config/mpv/mpv_stt_plugin_rs.toml`
 
 可用环境变量 `MPV_STT_PLUGIN_RS_CONFIG=/path/to/file.toml` 覆盖路径;任何键都可用
-`MPV_STT_PLUGIN_RS_<键>` 形式的环境变量覆盖。
+`MPV_STT_PLUGIN_RS_<键>` 形式的环境变量覆盖(键里的 `.` 写成 `_`,如 `MPV_STT_PLUGIN_RS_LOG_FILE=off`)。
+
+`MPV_STT_PLUGIN_RS_LOG` 是个例外:它不是配置键,而是日志过滤指令,详见[日志](#日志)。
 
 ### STT
 
@@ -240,6 +242,67 @@ lookahead_chunks = 2
 [network]
 demuxer_max_bytes = 0         # 可选;网络流缓存上限
 ```
+
+## 日志
+
+日志走 `tracing`,装配点只有 `src/logging.rs`。三个通道同时收到同一条记录:
+
+| 通道 | 用途 | 格式 |
+|---|---|---|
+| stderr | 终端里手敲 `mpv` 时盯着看 | compact 单行,仅 TTY 上色 |
+| 文件 | 从 Finder 启动 IINA 时唯一能事后翻的记录(`stderr` 会被丢弃) | 默认 compact,可换 full/json,带轮转 |
+| mpv OSD | 出错时不用翻日志就能看见 | 只画 `info` 及以上、且带 `display` 字段的记录 |
+
+### 级别
+
+- **error** —— 用户要的事做不成、只能收摊:分片失败终止会话、字幕落盘失败、worker 不可用、FFI 调用失败。
+- **warn** —— 降级但还能继续:重试、翻译放弃、空结果、缓存文件读写失败、manifest 损坏后重新转写。
+- **info** —— 每个会话/每次操作一条的里程碑:生效配置、插件加载、进入本地/网络模式、字幕路径、缓存命中、设备提示、翻译后端不响应。
+- **debug** —— 每块/每请求的生命周期:调度、提交、HTTP 结果摘要、seek 判定、mpv 事件、后端选择。
+- **trace** —— 热循环里的空转与逐条判定:等缓存、等播放追上、look-ahead 上限、迟到结果丢弃、单条文本翻译。
+
+### 上下文与字段
+
+一次媒体会话是一个 `session` span(`session` 自增 id、`media`、`duration_ms`、`mode`),每块音频是它下面的
+`chunk` span(`seq`、`start_ms`、`dur_ms`、`gen`)。所以一块音频从调度、抽音频、HTTP 请求到字幕落地,
+跨线程也带着同一份身份:
+
+```
+DEBUG session{session=1 media=…}:chunk{session=1 seq=0 start_ms=0 dur_ms=15000 gen=0}: mpv_stt_plugin_rs::stt::openai: chunk transcribed segments=2 entries=2
+```
+
+`start_ms` / `dur_ms` / `entries` / `bytes` / `status` / `wall_ms` / `gen` 都是字段而非句子的一部分,
+方便 `grep`、聚合和事后按值过滤。`format = "full"` 时每个 span 还会单独打一行开/闭,带
+`time.busy` / `time.idle`(由 `tracing` 计时,不用手写 `Instant::now()`)。
+
+### 配置
+
+```toml
+[log]
+level = "info"            # EnvFilter 语法;裸级别(如 "debug")= 本插件,不含依赖
+format = "compact"        # compact(默认) | full | json
+file = "auto"             # "auto" = 与配置文件同目录的 mpv_stt_plugin_rs.log;"" 关闭
+file_level = "debug"      # 文件里保留到哪一级(比终端更详细,便于事后排查)
+file_max_files = 5        # 轮转保留份数(按天)
+ansi = ""                 # "" = 自动;true/false 强制
+osd = true                # 是否把带 display 字段的记录送到 mpv OSD
+```
+
+- **默认写文件**:这正是"GUI 里看不到日志"的解药。文件按天轮转,保留 `file_max_files` 份,
+  写不进去(只读目录)时只打印一行提示并跳过,不影响终端与 OSD。`file = ""` 一行关掉。
+- **环境变量优先**:`MPV_STT_PLUGIN_RS_LOG` 覆盖 `log.level`,且对三个通道一律生效(包括文件),
+  所以 `MPV_STT_PLUGIN_RS_LOG=debug mpv …` 一个词就能整体开到 debug。它同时接受 target 语法,
+  例如只打开某个子系统:`MPV_STT_PLUGIN_RS_LOG="mpv_stt_plugin_rs::stt=trace,warn"`。
+- **依赖的日志默认丢弃**:裸级别只作用于 `mpv_stt_plugin_rs`。`debug` 是"本插件verbose",不是
+  "把进程里链接进来的所有库都打开" —— 否则 hyper 的逐连接日志会把插件自己的行埋掉。要看 HTTP 层
+  得显式点名:`MPV_STT_PLUGIN_RS_LOG="hyper_util=trace"`。
+- **只记非敏感字段**:生效配置摘要是逐字段手写的;`Config` 里有 api_key / encryption_key / auth_secret,
+  任何时候都不会被整体打印。
+
+OSD 那一行由记录里的 `display` 字段决定,而不是日志消息本身:日志说开发者看的话
+(`chunk failed; ending the session`),屏幕说用户看的话(`STT failed: …`)。没有 `display` 字段的
+`warn` 是过程噪音(正在重试、缓存写失败),只进日志不进屏幕;连续重复的会合并成 `(xN)`,
+一次最多画 3 条,不会跟进度文字抢屏。
 
 ## 测试
 

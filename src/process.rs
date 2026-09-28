@@ -1,4 +1,6 @@
 use crate::common::{MpvSttError, Result};
+use std::fmt::Write as _;
+use tracing::{debug, trace};
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 use wait_timeout::ChildExt;
@@ -12,6 +14,7 @@ pub fn run_capture_output(mut cmd: Command, label: &str, timeout: Duration) -> R
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
+    trace!(command = %describe(&cmd, label), "spawning a child process");
     let mut child = cmd.spawn().map_err(|e| {
         MpvSttError::ProcessFailed(format!(
             "Failed to spawn {}: {}",
@@ -27,8 +30,15 @@ pub fn run_capture_output(mut cmd: Command, label: &str, timeout: Duration) -> R
             e
         ))
     })? {
-        Some(_) => {
+        Some(status) => {
             let output = child.wait_with_output()?;
+            debug!(
+                label,
+                status = %status,
+                stdout_bytes = output.stdout.len(),
+                stderr_bytes = output.stderr.len(),
+                "child process finished"
+            );
             Ok(output)
         }
         None => {
@@ -41,6 +51,16 @@ pub fn run_capture_output(mut cmd: Command, label: &str, timeout: Duration) -> R
             )))
         }
     }
+}
+
+/// The command line, minus the program's own arguments only where they would
+/// carry a secret: nothing here is a key today, so the whole line is safe.
+fn describe(cmd: &Command, label: &str) -> String {
+    let mut text = format!("{label}: {}", cmd.get_program().to_string_lossy());
+    for arg in cmd.get_args() {
+        let _ = write!(text, " {}", arg.to_string_lossy());
+    }
+    text
 }
 
 pub fn run_capture_output_with_stdin(
@@ -61,6 +81,11 @@ pub fn run_capture_output_with_stdin(
         ))
     })?;
 
+    trace!(
+        command = %describe(&cmd, label),
+        stdin_bytes = stdin_bytes.len(),
+        "spawning a child process"
+    );
     if let Some(mut stdin) = child.stdin.take() {
         use std::io::Write;
         stdin.write_all(stdin_bytes)?;
@@ -73,8 +98,15 @@ pub fn run_capture_output_with_stdin(
             e
         ))
     })? {
-        Some(_) => {
+        Some(status) => {
             let output = child.wait_with_output()?;
+            debug!(
+                label,
+                status = %status,
+                stdout_bytes = output.stdout.len(),
+                stderr_bytes = output.stderr.len(),
+                "child process finished"
+            );
             Ok(output)
         }
         None => {
