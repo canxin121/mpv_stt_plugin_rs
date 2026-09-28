@@ -1,29 +1,63 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::Path;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=MPV_LIB_DIR");
     println!("cargo:rerun-if-env-changed=MPV_PREFIX");
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STT_REMOTE_UDP");
 
-    if env::var("CARGO_FEATURE_STT_REMOTE_UDP").is_ok() {
-        println!("cargo:rerun-if-changed=src/opusenc_shim.c");
-        cc::Build::new()
-            .file("src/opusenc_shim.c")
-            .compile("opusenc_shim");
+    // HTTP path uses audiopus; no extra C shim needed. Ensure libopus search path is known.
+    if let Ok(root) = env::var("DEP_AUDIOPUS_SYS_ROOT") {
+        let lib_path = Path::new(&root).join("lib");
+        let lib64_path = Path::new(&root).join("lib64");
+
+        // audiopus_sys always emits -L{root}/lib; when only lib64 exists, provide a shim.
+        if !lib_path.exists() && lib64_path.exists() {
+            #[cfg(unix)]
+            {
+                let _ = std::os::unix::fs::symlink(&lib64_path, &lib_path);
+            }
+            #[cfg(windows)]
+            {
+                let _ = std::os::windows::fs::symlink_dir(&lib64_path, &lib_path);
+            }
+        }
+
+        let mut found = false;
+        for sub in ["lib64", "lib"] {
+            let path = format!("{root}/{sub}");
+            if std::path::Path::new(&path).exists() {
+                println!("cargo:rustc-link-search=native={path}");
+                found = true;
+            }
+        }
+        if found {
+            // Link statically to avoid relying on system-wide libopus.
+            println!("cargo:rustc-link-lib=static=opus");
+        }
     }
 
     let target = env::var("TARGET").unwrap_or_default();
-    if !target.contains("android") {
+    if target.contains("android") {
+        // On Android we ship libmpv from the prebuilt prefix.
+        // If the prefix is missing, fail fast instead of producing a broken .so.
+        let mpv_prefix = env::var("MPV_PREFIX").unwrap_or_default();
+        let mpv_lib_dir = env::var("MPV_LIB_DIR").unwrap_or_else(|_| format!("{mpv_prefix}/lib"));
+        println!("cargo:rustc-link-search=native={mpv_lib_dir}");
+        println!("cargo:rustc-link-lib=mpv");
         return;
     }
 
-    if let Ok(prefix) = env::var("MPV_PREFIX") {
-        let lib_dir = PathBuf::from(prefix).join("lib");
-        println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    } else if let Ok(lib_dir) = env::var("MPV_LIB_DIR") {
-        println!("cargo:rustc-link-search=native={}", lib_dir);
+    // Desktop mpv cplugin: the mpv C API symbols (_mpv_command, _mpv_get_property, ...)
+    // are provided by the host mpv process at load time, so the dylib must link with
+    // unresolved symbols allowed. On macOS this is `-undefined dynamic_lookup`.
+    if target.contains("apple") {
+        println!("cargo:rustc-link-arg=-undefined");
+        println!("cargo:rustc-link-arg=dynamic_lookup");
     }
 
-    println!("cargo:rustc-link-lib=mpv");
+    // Windows mirrors the macOS behaviour: mpv provides the symbols at load time,
+    // so force the linker to accept unresolved externals in the .dll.
+    if target.contains("windows") {
+        println!("cargo:rustc-link-arg=/FORCE:UNRESOLVED");
+    }
 }

@@ -24,7 +24,7 @@ Options:
 
 Env:
   MPV_STT_PLUGIN_RS_BUILD_ABIS=arm64-v8a,armeabi-v7a|all
-  MPV_STT_PLUGIN_RS_FEATURES=stt_local_cpu
+  MPV_STT_PLUGIN_RS_FEATURES=stt_ferrum,stt_openai
   MPV_STT_PLUGIN_RS_NO_DEFAULT_FEATURES=1
   MPV_STT_PLUGIN_RS_ALL_FEATURES=1
 EOF
@@ -142,20 +142,8 @@ if [[ -n "${ALL_FEATURES:-}" && -n "${FEATURES:-}" ]]; then
 fi
 
 if [[ -n "${NO_DEFAULT_FEATURES:-}" && -z "${FEATURES:-}" && -z "${ALL_FEATURES:-}" ]]; then
-  echo "No backend selected. Use --features stt_local_cpu or omit --no-default-features." >&2
+  echo "No backend selected. Use --features stt_ferrum / stt_openai, or omit --no-default-features." >&2
   exit 1
-fi
-
-if [[ -n "${ALL_FEATURES:-}" ]]; then
-  echo "Android does not support stt_local_cuda; --all-features is not supported (backends are mutually exclusive)." >&2
-  exit 1
-fi
-
-if [[ -n "${FEATURES:-}" ]]; then
-  if [[ "$FEATURES" =~ (^|,)(stt_local_cuda)(,|$) ]]; then
-    echo "Android does not support the stt_local_cuda backend; requested features: $FEATURES" >&2
-    exit 1
-  fi
 fi
 
 if [[ ! -d "$NDK" ]]; then

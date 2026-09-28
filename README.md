@@ -1,167 +1,239 @@
-# mpv_stt_plugin_rs - Pure Rust MPV Plugin
+# mpv_stt_plugin_rs
 
-MPV 实时字幕生成插件，使用 Rust 实现为原生 MPV C 插件。
+MPV 实时字幕插件(Rust 原生 C 插件)。插件是**纯远程客户端**:音频抽取后送到远程
+STT 服务转写,再送远程翻译服务翻译。不内置任何本地推理引擎、不直连 Google 网页接口。
+
+## 架构(单 crate,多 mod)
+
+```
+mpv_stt_plugin_rs/
+├── Cargo.toml               # 单 crate (mpv_stt_plugin_rs, cdylib+rlib)
+├── build.rs                 # 链接处理(macOS dynamic_lookup / Windows FORCE:UNRESOLVED / Android -lmpv)
+├── src/
+│   ├── lib.rs               # mod 声明 + re-export
+│   ├── common.rs            # 错误类型 / Result
+│   ├── crypto.rs            # AES-256-GCM / AuthToken(ferrum 协议)
+│   ├── srt.rs               # SRT 字幕解析/偏移
+│   ├── audio.rs             # FFmpeg 音频抽取(链接预编译 FFmpeg)
+│   ├── config.rs            # 配置 + 后端选择
+│   ├── plugin.rs            # mpv cplugin 入口(mpv_open_cplugin)、worker、缓存
+│   ├── ffi.rs               # C 导出(翻译 / 音频 / SRT)
+│   ├── process.rs           # 子进程管理
+│   ├── subtitle_manager.rs  # 字幕管理
+│   ├── translate.rs         # 远程翻译客户端(DeepL 兼容 + LibreTranslate)
+│   └── stt/
+│       ├── mod.rs           # SttRunner / SttBackend 调度
+│       ├── ferrum.rs        # ferrum 协议后端(stt_ferrum)
+│       └── openai.rs        # OpenAI 协议后端(stt_openai)
+├── scripts/
+│   ├── cargo-with-deps.sh   # 宿主构建(自动拉 mpv 头文件 + 设 FFMPEG_DIR)
+│   └── build-android.sh     # Android 交叉编译
+└── toolchains/android*.cmake
+```
+
+### STT 后端
+
+两个远程 STT 后端**同时编译、运行时选择**(`config.stt.backend`):
+
+| Cargo feature | 配置字段 | 协议 |
+|---|---|---|
+| `stt_ferrum` | `[stt.ferrum]` | 自定义 ferrum 协议:raw-body POST `/transcribe`,支持 Opus 压缩 / AES-256-GCM 加密 / 鉴权 / 模型选择(`x-model`)/ 语言提示(`x-language`) |
+| `stt_openai` | `[stt.openai]` | 标准 OpenAI `POST /v1/audio/transcriptions`(multipart),任何兼容服务端可用(如 Groq) |
+
+两个 feature 默认同时开启;需要单后端专用构建时用 `--no-default-features --features stt_openai`。
+
+### 翻译后端
+
+翻译同样走**远程接口**,两种协议**同时编译、运行时选择**(`config.translate.backend`):
+
+| backend | 配置字段 | 协议 |
+|---|---|---|
+| `deepl`(默认) | `[translate]` 平铺 `server_addr`/`api_key` | `POST {server}/v1/translate`,key 走 `Authorization: DeepL-Auth-Key`,target 大写 |
+| `libretranslate` | `[translate.libretranslate]` | `POST {server}/translate`,key 走 body `api_key`,target 小写,`auto` 可显式/省略 |
+
+## 编译
+
+### 系统依赖
+
+日志平台**动态链接**预编译 FFmpeg(不从源码编译):
+
+- macOS: `brew install ffmpeg`(插件链接其 dylib),需 `clang`(bindgen 用,brew 自带)
+- Linux: `sudo apt-get install clang pkg-config` + 预编译 FFmpeg(`FFMPEG_DIR` 指向 dev 前缀)
+- Windows: MSVC 工具链 + 预编译 FFmpeg 共享包
+- Android(交叉): NDK + mpv-android 的 libmpv/libffmpeg 前缀
+
+**不需要安装 `libmpv-dev`**:`scripts/cargo-with-deps.sh` 会自动 `git clone --depth 1`
+mpv 仓库到 `target/mpv-headers` 并导出 `MPV_INCLUDE_DIR` / `BINDGEN_EXTRA_CLANG_ARGS`。
+
+### 宿主构建
+
+```bash
+./scripts/cargo-with-deps.sh build --release
+./scripts/cargo-with-deps.sh test          # 离线单测
+```
+
+脚本会自动准备 mpv 头文件,并在 macOS 上把 `FFMPEG_DIR` 设为 `brew --prefix ffmpeg`;
+其他平台需自行 `export FFMPEG_DIR=/path/to/ffmpeg-dev-prefix`。
+
+产物(Cargo 原名,以 macOS 为例):
+
+```bash
+ls target/release/libmpv_stt_plugin_rs.dylib
+```
+
+> macOS 上若 mpv 头文件不在 `/opt/homebrew/include`,需
+> `BINDGEN_EXTRA_CLANG_ARGS="-I/opt/homebrew/include" cargo build`。
+
+### Android 构建
+
+```bash
+export ANDROID_NDK_HOME=~/Android/Sdk/ndk/26.1.10909125
+export MPV_ANDROID=/path/to/mpv-android     # 提供 libmpv.so / libffmpeg 前缀
+./scripts/build-android.sh -a arm64-v8a
+# 多 ABI:./scripts/build-android.sh --all-abis
+# 单后端:./scripts/build-android.sh -a arm64-v8a -f stt_openai
+```
+
+输出在 `dist/android/<abi>/libmpv_stt_plugin_rs.so`。
 
 ## 安装
 
-1. **构建插件**
-   ```bash
-   cd ~/.config/mpv/scripts/mpv_stt_plugin_rs
-   # 推荐：自动拉取 mpv 头文件并设置环境变量
-   ./scripts/cargo-with-mpv.sh build --release
-
-   # 若脚本无法访问 GitHub，可手动设置：
-   # export MPV_INCLUDE_DIR="/path/to/mpv/include"  # 需包含 mpv/client.h
-   # cargo build --release
-   ```
-
-2. **安装插件**
-   ```bash
-   cp target/release/libmpv_stt_plugin_rs.so ~/.config/mpv/scripts/
-   ```
-
-3. **配置键绑定**
-
-   添加以下内容到 `~/.config/mpv/input.conf`：
-   ```
-   Ctrl+. script-message toggle-stt
-   ```
-
-   或使用其他按键，例如 `F8`。
-
-4. **配置 Whisper 和翻译设置**
-
-   现在支持运行时配置文件（无需改代码/重新编译）：
-
-   - 默认配置文件路径：`~/.config/mpv/mpv_stt_plugin_rs.toml`
-   - 也可以用环境变量指定：`MPV_STT_PLUGIN_RS_CONFIG=/path/to/mpv_stt_plugin_rs.toml`
-
-   示例（TOML，带注释说明）：
-```toml
-[stt.local_whisper]
-model_path = "/path/to/ggml-base.bin"
-threads = 8              # CPU 线程数
-language = "en"
-gpu_device = 0           # 仅 cuda 版有效
-flash_attn = false       # 仅 cuda 版有效
-timeout_ms = 120000
-
-[stt.remote_udp]
-server_addr = "127.0.0.1:9000"
-timeout_ms = 120000
-max_retry = 3
-enable_encryption = false
-encryption_key = ""
-auth_secret = ""
-
-[translate]
-from_lang = "en"
-to_lang = "zh"
-concurrency = 4
-
-[chunk]
-local_ms = 15000    # 本地文件模式：每次转写的媒体片段长度
-network_ms = 15000  # 网络流模式：每次转写的媒体片段长度
-
-[timeout]
-ffmpeg_ms = 30000
-ffprobe_ms = 10000
-stt_ms = 120000
-translate_ms = 30000
-
-[playback]
-show_progress = true   # 在 mpv OSD 显示进度
-save_srt = true        # 保存 SRT 到文件
-auto_start = false     # 自动启动（默认关闭）
-
-[prefetch]
-lookahead_chunks = 2           # 预读块数：提前处理的片段数量
-
-[network]
-# 网络流缓存（可选，单位字节）
-demuxer_max_bytes = 536870912
+```bash
+cp target/release/libmpv_stt_plugin_rs.dylib ~/.config/mpv/scripts/libmpv_stt_plugin_rs.so
 ```
 
-   CUDA 支持说明（纯编译期选择，无运行时回退）：
-   - 编译时开启：`cargo build --release --features stt_local_cuda`
-   - 运行时需确保系统能找到 CUDA 运行库（例如配置 `LD_LIBRARY_PATH` 或系统动态链接器路径）
+> mpv 按**文件名后缀**选择 C 插件后端,非 Windows 平台只认 `.so`,所以 macOS 上也要
+> 把 Mach-O 产物改名成 `.so`。
 
-   STT 后端编译选项（Linux 可用，Android 支持 `stt_local_cpu` / `stt_remote_udp`，不支持 CUDA）：
-   - `stt_local_cpu`：本地 whisper.cpp CPU 后端
-   - `stt_local_cuda`：本地 whisper.cpp CUDA 后端
-   - `stt_remote_udp`：远端 UDP STT 服务端
-
-   示例：
-   - `cargo build --release`（默认 `stt_local_cpu`）
-   - `cargo build --release --no-default-features --features stt_local_cuda`
-   - `cargo build --release --no-default-features --features stt_remote_udp`
-
-
-## Android 构建
-
-### 一键构建（全部 ABI）
-脚本位置：`scripts/build-android-all.sh`
+macOS 更新正在被 IINA/mpv 加载的动态库时,不要直接覆盖原文件。先完全退出 IINA,
+再通过临时文件原子替换,避免系统把映射中的 Mach-O 判定为签名页失效:
 
 ```bash
-cd ~/.config/mpv/scripts/mpv_stt_plugin_rs
-./scripts/build-android-all.sh
+mkdir -p ~/.config/mpv/scripts
+cp target/release/libmpv_stt_plugin_rs.dylib \
+  ~/.config/mpv/scripts/.libmpv_stt_plugin_rs.so.new
+mv ~/.config/mpv/scripts/.libmpv_stt_plugin_rs.so.new \
+  ~/.config/mpv/scripts/libmpv_stt_plugin_rs.so
 ```
 
-产物输出：
+替换后重新启动 IINA。
+
+## 快捷键
+
+插件加载后会直接向当前 mpv/IINA 播放器实例注册以下强绑定,不需要再修改
+IINA 的 `input.conf`:
+
+| 快捷键 | 功能 |
+|---|---|
+| `Ctrl+Shift+S` | 开启/停止实时字幕;停止后可再次开启 |
+| `Ctrl+Shift+T` | 开启/停止新字幕的自动翻译 |
+| `Ctrl+Shift+C` | 清除当前媒体的字幕与翻译缓存 |
+
+音频抽取和远程 STT 在独立 worker 中执行,不会占用 mpv/IINA 的事件线程。即使
+服务端正在推理或失去响应,上述快捷键、切换文件和退出仍会立即处理;停止、seek 或
+退出会取消旧请求,并用任务代次隔离迟到结果,避免旧视频字幕写进新会话。
+
+关闭一个视频、停止一次字幕或一次远程请求失败只会结束当前转写会话,不会终止整个
+插件;后续打开视频或再次按 `Ctrl+Shift+S` 会创建新会话。
+
+也可以在 `input.conf` 里用消息路由(把 `<client>` 换成插件实例名):
+
 ```
-dist/android/arm64-v8a/libmpv_stt_plugin_rs.so
-dist/android/armeabi-v7a/libmpv_stt_plugin_rs.so
-dist/android/x86/libmpv_stt_plugin_rs.so
-dist/android/x86_64/libmpv_stt_plugin_rs.so
+Ctrl+Shift+S script-message-to <client> toggle-stt
+Ctrl+Shift+T script-message-to <client> toggle-translate
+Ctrl+Shift+C script-message-to <client> clear-cache
 ```
 
-### 依赖说明（Android 动态链接）
-每个 ABI 的 `libmpv_stt_plugin_rs.so` 依赖以下动态库：
+## 配置
 
-需要随包（放进 APK 的 `jniLibs/<abi>/` 或等效位置）：
-- `libmpv.so`
-- `libavcodec.so`
-- `libavdevice.so`
-- `libavformat.so`
-- `libavutil.so`
-- `libswresample.so`
-- `libc++_shared.so`
+配置文件为 `mpv_stt_plugin_rs.toml`,默认路径:
 
-系统自带（无需拷贝）：
-- `libc.so`
-- `libm.so`
-- `libdl.so`
+- macOS: `~/Library/Application Support/mpv/mpv_stt_plugin_rs.toml`
+- Linux: `~/.config/mpv/mpv_stt_plugin_rs.toml`
 
-> 说明：**一个 `.so` 无法同时运行在所有 ABI 上**，必须按 ABI 分别编译与打包。
+可用环境变量 `MPV_STT_PLUGIN_RS_CONFIG=/path/to/file.toml` 覆盖路径;任何键都可用
+`MPV_STT_PLUGIN_RS_<键>` 形式的环境变量覆盖。
 
-### 中间产物 / 依赖库获取位置（Android）
+### STT
 
-这些依赖由 `mpv-android/buildscripts` 构建并安装到 prefix 目录：
+```toml
+[stt]
+backend = "openai"           # openai(默认) | ferrum
 
-- 目录模板：
-  - `mpv-android/buildscripts/prefix/<arch>/usr/local/lib/`
-  - `<arch>` 为：`arm64` / `armv7l` / `x86` / `x86_64`
+[stt.openai]
+server_addr = "https://api.groq.com/openai"   # 任意 OpenAI 兼容 /v1/audio/transcriptions
+api_key = "..."              # 可选;设置后发 Authorization: Bearer {key}
+model = "whisper-large-v3"   # multipart form 里的 model
+language = "ja"              # 可选语言提示(ja/zh/en...);省略 = 服务端自动检测
+timeout_ms = 120000
+max_retry = 3
 
-常用库文件位置示例（以 arm64 为例）：
-- `libmpv.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libmpv.so`
-- `libavcodec.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libavcodec.so`
-- `libavdevice.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libavdevice.so`
-- `libavformat.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libavformat.so`
-- `libavutil.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libavutil.so`
-- `libswresample.so`：`mpv-android/buildscripts/prefix/arm64/usr/local/lib/libswresample.so`
+# [stt.ferrum]
+# server_addr = "http://127.0.0.1:8000"
+# model = "sensevoice"       # 通过 x-model header 传给服务端
+# language = "ja"            # 通过 x-language header 传;省略 = 自动检测
+# use_opus = true
+# enable_encryption = false
+# encryption_key = "..."
+# auth_secret = "..."
+# timeout_ms = 120000
+# max_retry = 3
+```
 
-`libc++_shared.so` 来自 NDK：
-- `.../android-ndk-r29/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/<triple>/libc++_shared.so`
-  - 例如 arm64：`.../sysroot/usr/lib/aarch64-linux-android/libc++_shared.so`
+ferrum 协议的服务端由 [subtitle-gateway](https://github.com/canxin121/subtitle-gateway)
+(FunASR ASR + 翻译统一网关)实现,同一端点复用同一套 FunASR 引擎。
 
-### 关键环境变量（脚本已自动处理）
-- `ANDROID_NDK_HOME`/`NDK`：NDK 路径
-- `MPV_ANDROID`：mpv-android 仓库路径（默认 `/mnt/disk1/shared/git/mpv-android`）
-- `ANDROID_API`：API level（默认 21）
+### 翻译
 
-## 使用方法
+```toml
+[translate]
+backend = "deepl"             # deepl(默认) | libretranslate
+from_lang = "ja"              # 内容语言(建议显式指定,避免 auto 把日文误判成中文)
+to_lang = "zh"
+concurrency = 4
+server_addr = "http://127.0.0.1:8000"   # DeepL 兼容基址
+api_key = ""                            # 网关 key(DeepL-Auth-Key)
 
-1. 启动 MPV 播放视频
-2. 插件会自动加载并显示欢迎消息
-3. 按 `Ctrl+.` 切换实时字幕生成
-4. 再次按 `Ctrl+.` 停止
+[translate.libretranslate]
+server_addr = "http://127.0.0.1:8000"
+api_key = ""
+```
+
+`deepl` 协议期望 `POST {server}/v1/translate`,body
+`{"text": [...], "target_lang": "ZH", "source_lang": "JA"}`(source_lang 省略 = auto),
+响应 `{"translations": [{"text": "..."}]}`。
+
+### 其他
+
+```toml
+[chunk]
+local_ms = 15000              # 本地文件每个转写分片时长
+network_ms = 15000            # 网络流分片时长
+
+[playback]
+show_progress = true
+save_srt = true
+auto_start = false            # 打开文件自动开始
+
+[prefetch]
+lookahead_chunks = 2
+
+[network]
+demuxer_max_bytes = 0         # 可选;网络流缓存上限
+```
+
+## 测试
+
+```bash
+./scripts/cargo-with-deps.sh test
+```
+
+`translate.rs` 里标了 `#[ignore]` 的端到端测试需要本地跑一个 subtitle-gateway:
+
+```bash
+cargo test --lib -- --ignored translate_against_live_gateway
+```
+
+## License
+
+MIT

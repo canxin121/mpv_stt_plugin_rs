@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum MpvSttPluginRsError {
+pub enum MpvSttError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -24,7 +24,7 @@ pub enum MpvSttPluginRsError {
     AudioExtractionCancelled,
 
     #[error("WAV error: {0}")]
-    Wav(#[from] hound::Error),
+    Wav(String),
 
     #[error("STT execution failed: {0}")]
     SttFailed(String),
@@ -34,6 +34,15 @@ pub enum MpvSttPluginRsError {
 
     #[error("Invalid path: {0}")]
     InvalidPath(String),
+
+    #[error("Encryption/Decryption error: {0}")]
+    CryptoError(String),
 }
 
-pub type Result<T> = std::result::Result<T, MpvSttPluginRsError>;
+pub type Result<T> = std::result::Result<T, MpvSttError>;
+
+impl From<hound::Error> for MpvSttError {
+    fn from(err: hound::Error) -> Self {
+        MpvSttError::Wav(err.to_string())
+    }
+}

@@ -4,3 +4,8 @@ toolchains/vulkan-headers/
 log
 temp/
 AGENTS.md
+
+# C plugins on non-Windows platforms must carry a .so suffix for mpv to load
+# them, so the Cargo `cdylib` output gets copied to a .so next to its Mach-O/ELF
+# original when installing.
+*.dylib

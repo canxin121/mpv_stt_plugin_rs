@@ -1,4 +1,4 @@
-use crate::error::{MpvSttPluginRsError, Result};
+use crate::common::{MpvSttError, Result};
 use ffmpeg::format::Sample;
 use ffmpeg::format::sample::Type as SampleType;
 use ffmpeg::util::mathematics::rescale;
@@ -17,14 +17,14 @@ static FFMPEG_INIT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 fn ensure_ffmpeg() -> Result<()> {
     match FFMPEG_INIT.get_or_init(|| ffmpeg::init().map_err(|e| e.to_string())) {
         Ok(()) => Ok(()),
-        Err(err) => Err(MpvSttPluginRsError::AudioExtractionFailed(format!(
+        Err(err) => Err(MpvSttError::AudioExtractionFailed(format!(
             "ffmpeg init failed: {err}"
         ))),
     }
 }
 
-fn ffmpeg_err(context: &str, err: impl std::fmt::Display) -> MpvSttPluginRsError {
-    MpvSttPluginRsError::AudioExtractionFailed(format!("{context}: {err}"))
+fn ffmpeg_err(context: &str, err: impl std::fmt::Display) -> MpvSttError {
+    MpvSttError::AudioExtractionFailed(format!("{context}: {err}"))
 }
 
 fn check_timeout(start: Instant, timeout: Duration, label: &str) -> Result<()> {
@@ -32,7 +32,7 @@ fn check_timeout(start: Instant, timeout: Duration, label: &str) -> Result<()> {
         return Ok(());
     }
     if start.elapsed() > timeout {
-        return Err(MpvSttPluginRsError::ProcessTimeout(format!(
+        return Err(MpvSttError::ProcessTimeout(format!(
             "{label} timed out after {}ms",
             timeout.as_millis()
         )));
@@ -48,6 +48,19 @@ fn output_channel_layout(channels: u8) -> ffmpeg::channel_layout::ChannelLayout 
     }
 }
 
+/// Decoded frames may carry an UNSPEC channel order (empty mask), e.g. WAV
+/// files without an explicit channel mask. FFmpeg 9's `swr_convert_frame`
+/// strict-compares the frame layout against the configured source layout and
+/// returns `AVERROR_INPUT_CHANGED` on any mismatch. Normalize the frame layout
+/// to a concrete one derived from the channel count so it matches the
+/// resampler configuration.
+fn normalize_frame_layout(frame: &mut ffmpeg::frame::Audio) {
+    if frame.channel_layout().is_empty() {
+        frame.set_channel_layout(output_channel_layout(frame.channels() as u8));
+    }
+}
+
+#[derive(Clone)]
 pub struct AudioExtractor {
     output_sample_rate: u32,
     output_channels: u8,
@@ -93,7 +106,7 @@ impl AudioExtractor {
 
     fn check_cancel(&self, generation: u64) -> Result<()> {
         if self.cancel_generation.load(Ordering::Relaxed) != generation {
-            return Err(MpvSttPluginRsError::AudioExtractionCancelled);
+            return Err(MpvSttError::AudioExtractionCancelled);
         }
         Ok(())
     }
@@ -113,11 +126,11 @@ impl AudioExtractor {
         let input_str = input_path
             .as_ref()
             .to_str()
-            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid input path".to_string()))?;
+            .ok_or_else(|| MpvSttError::InvalidPath("Invalid input path".to_string()))?;
         let output_str = output_path
             .as_ref()
             .to_str()
-            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid output path".to_string()))?;
+            .ok_or_else(|| MpvSttError::InvalidPath("Invalid output path".to_string()))?;
 
         trace!(
             "Extracting audio: {}ms-{}ms from {} -> {}",
@@ -154,7 +167,7 @@ impl AudioExtractor {
             .streams()
             .best(ffmpeg::media::Type::Audio)
             .ok_or_else(|| {
-                MpvSttPluginRsError::AudioExtractionFailed("No audio stream found".to_string())
+                MpvSttError::AudioExtractionFailed("No audio stream found".to_string())
             })?;
         let stream_index = input_stream.index();
 
@@ -168,9 +181,20 @@ impl AudioExtractor {
 
         let output_layout = output_channel_layout(self.output_channels);
         let output_format = Sample::I16(SampleType::Packed);
+
+        // The decoder is not opened yet, so its `channel_layout()` may carry an
+        // empty mask (channels > 0 but layout unknown). FFmpeg 9's swr compares
+        // this against the decoded frame's layout and fails with
+        // AVERROR_INPUT_CHANGED. Derive a concrete source layout from the
+        // channel count instead, so it matches the frames once decoded.
+        let src_layout = if decoder.channel_layout().is_empty() {
+            output_channel_layout(decoder.channels() as u8)
+        } else {
+            decoder.channel_layout()
+        };
         let mut resampler = ffmpeg::software::resampling::Context::get(
             decoder.format(),
-            decoder.channel_layout(),
+            src_layout,
             decoder.rate() as u32,
             output_format,
             output_layout,
@@ -217,6 +241,8 @@ impl AudioExtractor {
                 check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
                 self.check_cancel(run_generation)?;
 
+                normalize_frame_layout(&mut decoded);
+
                 let mut resampled = ffmpeg::frame::Audio::empty();
                 let _ = resampler
                     .run(&decoded, &mut resampled)
@@ -230,7 +256,7 @@ impl AudioExtractor {
                 let data = resampled.data(0);
                 let sample_count = data.len() / std::mem::size_of::<i16>();
                 if sample_count < frames * channels {
-                    return Err(MpvSttPluginRsError::AudioExtractionFailed(
+                    return Err(MpvSttError::AudioExtractionFailed(
                         "resampled frame shorter than expected".to_string(),
                     ));
                 }
@@ -271,6 +297,9 @@ impl AudioExtractor {
             while decoder.receive_frame(&mut decoded).is_ok() {
                 check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
                 self.check_cancel(run_generation)?;
+
+                normalize_frame_layout(&mut decoded);
+
                 let mut resampled = ffmpeg::frame::Audio::empty();
                 let _ = resampler
                     .run(&decoded, &mut resampled)
@@ -284,7 +313,7 @@ impl AudioExtractor {
                 let data = resampled.data(0);
                 let sample_count = data.len() / std::mem::size_of::<i16>();
                 if sample_count < frames * channels {
-                    return Err(MpvSttPluginRsError::AudioExtractionFailed(
+                    return Err(MpvSttError::AudioExtractionFailed(
                         "resampled frame shorter than expected".to_string(),
                     ));
                 }
@@ -317,7 +346,7 @@ impl AudioExtractor {
         self.check_cancel(run_generation)?;
         writer.finalize()?;
         if target_frames > 0 && written_frames == 0 {
-            return Err(MpvSttPluginRsError::AudioExtractionFailed(
+            return Err(MpvSttError::AudioExtractionFailed(
                 "no audio samples decoded".to_string(),
             ));
         }
@@ -336,7 +365,7 @@ impl AudioExtractor {
         let path_str = path
             .as_ref()
             .to_str()
-            .ok_or_else(|| MpvSttPluginRsError::InvalidPath("Invalid path".to_string()))?;
+            .ok_or_else(|| MpvSttError::InvalidPath("Invalid path".to_string()))?;
 
         let start_time = Instant::now();
         let ictx = ffmpeg::format::input(&path).map_err(|e| ffmpeg_err("open input failed", e))?;

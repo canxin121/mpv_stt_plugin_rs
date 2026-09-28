@@ -1,7 +1,6 @@
-use crate::error::Result;
-use crate::srt::{SrtFile, SubtitleEntry};
 use log::{debug, trace};
-use srtlib::Timestamp;
+use crate::common::Result;
+use crate::srt::{SrtFile, SubtitleEntry, Timestamp};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -127,7 +126,6 @@ impl SubtitleManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use srtlib::Timestamp;
 
     #[test]
     fn test_timestamp_to_millis() {

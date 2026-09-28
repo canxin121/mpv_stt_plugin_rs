@@ -1,9 +1,12 @@
-use crate::error::{MpvSttPluginRsError, Result};
 use log::{debug, trace};
-use srtlib::{Subtitle, Subtitles, Timestamp};
+use crate::common::{MpvSttError, Result};
+use srtlib::{Subtitle, Subtitles};
 use std::fmt;
 use std::fs;
 use std::path::Path;
+
+// Re-export Timestamp for external use
+pub use srtlib::Timestamp;
 
 #[derive(Debug, Clone)]
 pub struct SubtitleEntry {
@@ -14,7 +17,6 @@ pub struct SubtitleEntry {
 }
 
 impl SubtitleEntry {
-    /// Convert from srtlib::Subtitle
     fn from_srtlib(sub: Subtitle) -> Self {
         Self {
             index: sub.num as u32,
@@ -59,7 +61,7 @@ impl SrtFile {
     pub fn parse<P: AsRef<Path>>(path: P) -> Result<Self> {
         trace!("Parsing SRT file: {}", path.as_ref().display());
         let subs = Subtitles::parse_from_file(path.as_ref(), None)
-            .map_err(|e| MpvSttPluginRsError::InvalidSrt(e.to_string()))?;
+            .map_err(|e| MpvSttError::InvalidSrt(e.to_string()))?;
 
         let entries: Vec<SubtitleEntry> = subs
             .to_vec()
@@ -73,7 +75,7 @@ impl SrtFile {
 
     pub fn parse_content(content: &str) -> Result<Self> {
         let subs = Subtitles::parse_from_str(content.to_string())
-            .map_err(|e| MpvSttPluginRsError::InvalidSrt(e.to_string()))?;
+            .map_err(|e| MpvSttError::InvalidSrt(e.to_string()))?;
 
         let entries: Vec<SubtitleEntry> = subs
             .to_vec()
@@ -117,7 +119,6 @@ impl fmt::Display for SrtFile {
     }
 }
 
-/// Offset all timestamps in an SRT file by a given number of milliseconds
 pub fn offset_srt_file<P: AsRef<Path>>(
     input_path: P,
     output_path: P,
@@ -125,17 +126,16 @@ pub fn offset_srt_file<P: AsRef<Path>>(
 ) -> Result<()> {
     trace!("Offsetting SRT timestamps by {}ms", offset_ms);
     let mut subs = Subtitles::parse_from_file(input_path.as_ref(), None)
-        .map_err(|e| MpvSttPluginRsError::InvalidSrt(e.to_string()))?;
+        .map_err(|e| MpvSttError::InvalidSrt(e.to_string()))?;
 
-    // srtlib uses i64 milliseconds for add_milliseconds
     for sub in &mut subs {
         sub.add_milliseconds(offset_ms);
     }
 
     subs.write_to_file(output_path.as_ref(), None)
         .map_err(|e| match e {
-            srtlib::ParsingError::IOError(io_err) => MpvSttPluginRsError::Io(io_err),
-            _ => MpvSttPluginRsError::InvalidSrt(e.to_string()),
+            srtlib::ParsingError::IOError(io_err) => MpvSttError::Io(io_err),
+            _ => MpvSttError::InvalidSrt(e.to_string()),
         })?;
 
     Ok(())
