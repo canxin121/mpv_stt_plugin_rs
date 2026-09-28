@@ -16,7 +16,7 @@ mpv_stt_plugin_rs/
 │   ├── crypto.rs            # AES-256-GCM / AuthToken(ferrum 协议)
 │   ├── srt.rs               # SRT 字幕解析/偏移
 │   ├── audio.rs             # FFmpeg 音频抽取(链接预编译 FFmpeg)
-│   ├── config.rs            # 配置 + 后端选择
+│   ├── config.rs            # 配置 + 具名源
 │   ├── plugin.rs            # mpv cplugin 入口(mpv_open_cplugin)、worker、缓存
 │   ├── ffi.rs               # C 导出(翻译 / 音频 / SRT)
 │   ├── process.rs           # 子进程管理
@@ -34,12 +34,15 @@ mpv_stt_plugin_rs/
 
 ### STT 后端
 
-两个远程 STT 后端**同时编译、运行时选择**(`config.stt.backend`):
+两种协议**同时编译**,由所选具名源的 `protocol` 决定用哪个:
 
-| Cargo feature | 配置字段 | 协议 |
+| Cargo feature | `protocol` | 协议 |
 |---|---|---|
-| `stt_ferrum` | `[stt.ferrum]` | 自定义 ferrum 协议:raw-body POST `/transcribe`,支持 Opus 压缩 / AES-256-GCM 加密 / 鉴权 / 模型选择(`x-model`)/ 语言提示(`x-language`) |
-| `stt_openai` | `[stt.openai]` | 标准 OpenAI `POST /v1/audio/transcriptions`(multipart),任何兼容服务端可用:本地 subtitle-gateway(`model = "sensevoice"`)、OpenAI(`whisper-1`)、Groq(`whisper-large-v3`) |
+| `stt_ferrum` | `ferrum` | 自定义 ferrum 协议:raw-body POST `/transcribe`,支持 Opus 压缩 / AES-256-GCM 加密 / 鉴权 / 模型选择(`x-model`)/ 语言提示(`x-language`) |
+| `stt_openai` | `openai` | 标准 OpenAI `POST /v1/audio/transcriptions`(multipart),任何兼容服务端可用:本地 subtitle-gateway(`model = "sensevoice"`)、OpenAI(`whisper-1`)、Groq(`whisper-large-v3`) |
+
+STT 侧**没有内置源**:每个源都要写清 `protocol` 和 `server_addr`,
+用 `[stt] source` 选一个(只声明一个时可以留空)。
 
 > `model` 必须是服务端实际提供的 id,写错会在第一个音频块上报
 > `Server error (404 Not Found): model_not_found`。
@@ -53,15 +56,20 @@ mpv_stt_plugin_rs/
 
 ### 翻译后端
 
-所有后端**同时编译、运行时选择**(`config.translate.backend`)。三个内置免费源不需要
-任何配置或 key,`auto`(默认)按 `google → edge → alibaba` 顺序回退,第一个成功为止:
+所有协议**同时编译**,由所选具名源的 `protocol` 决定用哪个。`[translate] source`
+默认 `auto`,按 `google_free → edge_free → alibaba_free` 顺序回退,第一个成功为止:
 
-| backend | 配置字段 | 协议 |
-|---|---|---|
-| `auto`(默认) | — | 依次试下面三个内置源,第一个成功为止 |
-| `google` / `edge` / `alibaba` | `[translate.google]` / `[translate.edge]` / `[translate.alibaba]` | 只用这一个内置源(失败不换源);host 已内置,通常整节都不用写 |
-| `deepl` | `[translate]` 平铺 `server_addr`/`api_key` | `POST {server}/v1/translate`,key 走 `Authorization: DeepL-Auth-Key`,target 大写 |
-| `libretranslate` | `[translate.libretranslate]` | `POST {server}/translate`,key 走 body `api_key`,target 小写,`auto` 可显式/省略 |
+| `source` | 内置 host | `protocol` | 怎么连 |
+|---|---|---|---|
+| `auto`(默认) | — | — | 依次试下面三个内置免费源,第一个成功为止 |
+| `google_free` | `clients5.google.com` | `google` | 零配置 |
+| `edge_free` | `edge.microsoft.com` | `edge` | 零配置;带 `api_key` 即走微软官方通道 |
+| `alibaba_free` | `translate.alibaba.com` | `alibaba` | 零配置;链尾,每条字幕一次 token + 一次请求 |
+| `deepl` | `127.0.0.1:8000` | `deepl` | `POST {server}/v1/translate`,key 走 `Authorization: DeepL-Auth-Key`,target 大写 |
+| `libretranslate` | `127.0.0.1:8000` | `libretranslate` | `POST {server}/translate`,key 走 body `api_key`,target 小写,`auto` 可显式/省略 |
+
+五个名字都是**内置的**:整节不写就按上表解析,写了只覆盖写到的字段。自己声明的源必须写
+`protocol`;选中单个源时**失败不换源**,不会悄悄降级到另一个引擎。
 
 内置源是这些站点**网页前端自己用的接口**,不保证长期可用、也不保证稳定:
 它们的形状一旦变了,日志里会出现带 HTTP 状态和响应体摘要的 `warn`,而不是静默给出空译文。
@@ -155,7 +163,7 @@ IINA 的 `input.conf`:
 
 - 翻译服务不可用(内置源被限速、网关没起、key 不对、上游 503…)时,原文照常显示、
   照常写盘,只是没有译文;屏幕上提示一次失败原因,不会每块都弹。
-  `backend = "auto"` 会先自己换一个内置源试,三个都不行才提示。
+  `source = "auto"` 会先自己换一个内置源试,三个都不行才提示。
 - 失败的那几条不再重复投递(否则每次 seek 都会重试一遍),恢复服务后按
   `Ctrl+Shift+T` 关再开(或 `Ctrl+Shift+C` 清缓存)即会重新翻译已有字幕。
 - 翻译相关的问题永远不会结束转写会话,`Ctrl+Shift+S` 的开关状态不受影响。
@@ -175,8 +183,13 @@ Ctrl+Shift+C script-message-to <client> clear-cache
 - macOS: `~/Library/Application Support/mpv/mpv_stt_plugin_rs.toml`
 - Linux: `~/.config/mpv/mpv_stt_plugin_rs.toml`
 
-可用环境变量 `MPV_STT_PLUGIN_RS_CONFIG=/path/to/file.toml` 覆盖路径;任何键都可用
-`MPV_STT_PLUGIN_RS_<键>` 形式的环境变量覆盖(键里的 `.` 写成 `_`,如 `MPV_STT_PLUGIN_RS_LOG_FILE=off`)。
+可用环境变量 `MPV_STT_PLUGIN_RS_CONFIG=/path/to/file.toml` 覆盖路径;扁平键都可用
+`MPV_STT_PLUGIN_RS_<键>` 形式的环境变量覆盖(键里的 `.` 写成 `_`,如
+`MPV_STT_PLUGIN_RS_LOG_FILE=off`、`MPV_STT_PLUGIN_RS_TRANSLATE_SOURCE=edge_free`)。
+
+`[stt.sources.<名字>]` / `[translate.sources.<名字>]` 里的字段**不在其列**:源的名字
+本身是键的一层,而 `_` 既可能是名字的一部分(如 `google_free`)又正是环境变量里表示
+层级的那个字符,拆出来对不上。要改某个源的 `server_addr`/`api_key`,直接改 toml。
 
 `MPV_STT_PLUGIN_RS_LOG` 是个例外:它不是配置键,而是日志过滤指令,详见[日志](#日志)。
 
@@ -184,9 +197,11 @@ Ctrl+Shift+C script-message-to <client> clear-cache
 
 ```toml
 [stt]
-backend = "openai"           # openai(默认) | ferrum
+source = "groq"              # 用哪个源;只声明一个时可以留空
 
-[stt.openai]
+# 名字是关键:同一协议可以声明任意多个源,想换服务端只改这一行
+[stt.sources.groq]
+protocol = "openai"          # openai | ferrum(必填)
 server_addr = "https://api.groq.com/openai"   # 任意 OpenAI 兼容 /v1/audio/transcriptions
 api_key = "..."              # 可选;设置后发 Authorization: Bearer {key}
 model = "whisper-large-v3"   # multipart form 里的 model;必须是服务端提供的模型
@@ -194,11 +209,19 @@ language = "ja"              # 可选语言提示(ja/zh/en...);省略 = 服务�
 timeout_ms = 120000
 max_retry = 3
 
+[stt.sources.gw]             # 同协议的第二个源:本地网关
+protocol = "openai"
+server_addr = "http://127.0.0.1:8000"
+model = "sensevoice"
+
 # 分段时间戳不需要配置:插件固定请求 response_format=verbose_json +
 # timestamp_granularities[]=segment(标准 OpenAI 字段);服务端不支持时自动退化成
 # 每块一条字幕。
-# [stt.ferrum]
-# server_addr = "http://127.0.0.1:8000"
+#
+# ferrum 协议:同一套字段,另有几个只为它读的键
+# [stt.sources.local]
+# protocol = "ferrum"
+# server_addr = "http://127.0.0.1:9000"
 # model = "sensevoice"       # 通过 x-model header 传给服务端
 # language = "ja"            # 通过 x-language header 传;省略 = 自动检测
 # use_opus = true
@@ -209,6 +232,11 @@ max_retry = 3
 # max_retry = 3
 ```
 
+`[stt.sources.<名字>]` 是**两种协议的并集**,扁平一层;`protocol` 决定读哪些
+(`use_opus` / `enable_encryption` / `encryption_key` / `auth_secret` 只有 `ferrum` 读,
+`api_key` 只有 `openai` 读)。`source` 留空 = 用唯一声明的那一个;声明了 0 个或多个
+而没选,启动时直接报错并列出已声明的名字,不会静默挑一个。
+
 ferrum 协议的服务端由 [subtitle-gateway](https://github.com/canxin121/subtitle-gateway)
 (FunASR ASR + 翻译统一网关)实现,同一端点复用同一套 FunASR 引擎。
 
@@ -216,29 +244,22 @@ ferrum 协议的服务端由 [subtitle-gateway](https://github.com/canxin121/sub
 
 ```toml
 [translate]
-backend = "auto"              # auto(默认) | google | edge | alibaba | deepl | libretranslate
+source = "auto"               # auto(默认) | 任意一个源的名字
 from_lang = "ja"              # 内容语言(建议显式指定,避免 auto 把日文误判成中文)
 to_lang = "zh"
 concurrency = 4
-server_addr = "http://127.0.0.1:8000"   # DeepL 兼容基址
-api_key = ""                            # 网关 key(DeepL-Auth-Key)
 
-[translate.libretranslate]
-server_addr = "http://127.0.0.1:8000"
-api_key = ""
-
-# 三个内置免费源:host 已内置,整节不写就是下面这些值
-[translate.google]
-server_addr = "https://clients5.google.com"
-api_key = ""                  # 预留,当前查询串里不带
-
-[translate.edge]
-server_addr = "https://edge.microsoft.com"
+# 内置源:名字已在插件里,整节不写就用内置的 host,写了只覆盖写到的字段
+#   google_free / edge_free / alibaba_free  —— auto 按这个顺序回退
+#   deepl / libretranslate                  —— 外部协议,默认指向本机 127.0.0.1:8000
+[translate.sources.edge_free]
 api_key = ""                  # 填了就走微软官方通道
 
-[translate.alibaba]
-server_addr = "https://translate.alibaba.com"
-api_key = ""                  # 预留
+# 自己声明的源:非内置名必须写 protocol
+[translate.sources.deepl_free]
+protocol = "deepl"
+server_addr = "https://api-free.deepl.com"
+api_key = "<xxx:fx>"
 ```
 
 `deepl` 协议期望 `POST {server}/v1/translate`(`server_addr` 写基址 `https://api-free.deepl.com`,
@@ -248,14 +269,14 @@ api_key = ""                  # 预留
 
 ### 内置免费源
 
-`backend = "auto"`(默认)就能直接翻:三个网页接口都在插件里用 Rust 实现,不需要外部进程、
+`source = "auto"`(默认)就能直接翻:三个网页接口都在插件里用 Rust 实现,不需要外部进程、
 不需要注册、不需要 key。它是插件里唯一"连出去"的地方,发出去的只有待译的字幕文本。
 
-| backend | 端点 | 批量 | 说明 |
+| `source` | 端点 | 批量 | 说明 |
 |---|---|---|---|
-| `google`(回退第 1) | `GET clients5.google.com/translate_a/t` | 原生多 `q` | 质量与速度均衡;限速按出口 IP 算,重度使用会吃到 |
-| `edge`(回退第 2) | `POST edge.microsoft.com/translate/translatetext` | 原生 JSON 数组 | 实测最稳定、几乎不限速;带 `api_key` 即走微软官方通道 |
-| `alibaba`(回退第 3) | `POST translate.alibaba.com` | 无 | 每条字幕一次 token + 一次请求,链路最重,故排最后 |
+| `google_free`(回退第 1) | `GET clients5.google.com/translate_a/t` | 原生多 `q` | 质量与速度均衡;限速按出口 IP 算,重度使用会吃到 |
+| `edge_free`(回退第 2) | `POST edge.microsoft.com/translate/translatetext` | 原生 JSON 数组 | 实测最稳定、几乎不限速;带 `api_key` 即走微软官方通道 |
+| `alibaba_free`(回退第 3) | `POST translate.alibaba.com` | 无 | 每条字幕一次 token + 一次请求,链路最重,故排最后 |
 
 选中单个源时**失败不换源**(不会悄悄降级到质量更差的引擎还让你以为用的是它);
 只有 `auto` 会按上表顺序回退,全失败才走"翻译放弃"提示。
@@ -268,12 +289,15 @@ api_key = ""                  # 预留
 改 `server_addr`/`api_key`/`from_lang`/`to_lang` 即可,不需要改代码 —— 前提是对方讲的是
 DeepL 或 LibreTranslate 这两种形状之一(2026-09 实测核对,服务端随时可能变)。
 
-| 服务 | 怎么连 | 说明 |
+| 服务 | `[translate.sources.<名字>]` | 说明 |
 |---|---|---|
-| [subtitle-gateway](https://github.com/canxin121/subtitle-gateway) | `backend = "deepl"`,`server_addr = "http://127.0.0.1:8000"` | 本仓库配套网关,ASR 与翻译同一端点 |
-| [DeepL API Free](https://www.deepl.com/en/signup?cta=checkout&is_api=true&productId=api-developer) | `backend = "deepl"`,`server_addr = "https://api-free.deepl.com"`,`api_key = "<xxx:fx>"` | 免费档叫 **API Developer**:100 万字符/月、1 个 key;免费 key 带 `:fx` 后缀,所以 endpoint 是 `api-free` 而不是 `api`;日译中质量最好;国内可直连 |
-| [LibreTranslate](https://github.com/LibreTranslate/LibreTranslate) | `backend = "libretranslate"`,`server_addr = "http://127.0.0.1:5000"` | 自建:不限量、不出内网。`pip install libretranslate` 或官方 Docker 镜像;默认监听 `127.0.0.1:5000`;AGPL-3.0;Argos 引擎,日译中绕英语 |
-| 公共 LibreTranslate 镜像 | `backend = "libretranslate"`,`server_addr = "https://translate.hostux.net"` | 无需 key,但**必须显式写 `from_lang`**(镜像不接受省略 `source`);`to_lang` 只能写 `zh` 或 `zh-Hans`,写 `zh-CN` 会 400;Argos 引擎,质量明显低于内置源 |
+| [subtitle-gateway](https://github.com/canxin121/subtitle-gateway) | `protocol = "deepl"`,`server_addr = "http://127.0.0.1:8000"` | 本仓库配套网关,ASR 与翻译同一端点 |
+| [DeepL API Free](https://www.deepl.com/en/signup?cta=checkout&is_api=true&productId=api-developer) | `protocol = "deepl"`,`server_addr = "https://api-free.deepl.com"`,`api_key = "<xxx:fx>"` | 免费档叫 **API Developer**:100 万字符/月、1 个 key;免费 key 带 `:fx` 后缀,所以 endpoint 是 `api-free` 而不是 `api`;日译中质量最好;国内可直连 |
+| [LibreTranslate](https://github.com/LibreTranslate/LibreTranslate) | `protocol = "libretranslate"`,`server_addr = "http://127.0.0.1:5000"` | 自建:不限量、不出内网。`pip install libretranslate` 或官方 Docker 镜像;默认监听 `127.0.0.1:5000`;AGPL-3.0;Argos 引擎,日译中绕英语 |
+| 公共 LibreTranslate 镜像 | `protocol = "libretranslate"`,`server_addr = "https://translate.hostux.net"` | 无需 key,但**必须显式写 `from_lang`**(镜像不接受省略 `source`);`to_lang` 只能写 `zh` 或 `zh-Hans`,写 `zh-CN` 会 400;Argos 引擎,质量明显低于内置源 |
+
+非内置名不写 `protocol` 是启动错误(消息里会列出可选的协议名),不会猜。
+直接复用内置名(`[translate.sources.deepl]`)则连 `protocol` 都不用写。
 
 需要绑定信用卡才能开通、或整条链路要额外跑一个服务端(Google Cloud / Azure Translator /
 [MTranServer](https://github.com/xxnuo/MTranServer))的,请求形状既不是 DeepL 也不是
@@ -296,11 +320,14 @@ LibreTranslate,光改 `server_addr` 接不上 —— 内置源已经覆盖了这
 
 ```toml
 [translate]
-backend = "deepl"
-server_addr = "https://api-free.deepl.com"   # 不看 key 也不看套餐,免费档固定是 api-free
-api_key = "<你的 xxx:fx>"
+source = "deepl_free"
 from_lang = "ja"
 to_lang = "zh"
+
+[translate.sources.deepl_free]
+protocol = "deepl"
+server_addr = "https://api-free.deepl.com"   # 不看 key 也不看套餐,免费档固定是 api-free
+api_key = "<你的 xxx:fx>"
 ```
 
 额度是 100 万字符/月,超了不会自动扣费,只会停到下个月。要查用量:
@@ -340,8 +367,8 @@ demuxer_max_bytes = 0         # 可选;网络流缓存上限
 - **error** —— 用户要的事做不成、只能收摊:分片失败终止会话、字幕落盘失败、worker 不可用、FFI 调用失败。
 - **warn** —— 降级但还能继续:重试、翻译放弃、某个内置免费源失败后换下一个、空结果、
   缓存文件读写失败、manifest 损坏后重新转写。
-- **info** —— 每个会话/每次操作一条的里程碑:生效配置、插件加载、进入本地/网络模式、字幕路径、缓存命中、设备提示、翻译后端不响应。
-- **debug** —— 每块/每请求的生命周期:调度、提交、HTTP 结果摘要、seek 判定、mpv 事件、后端选择。
+- **info** —— 每个会话/每次操作一条的里程碑:生效配置、插件加载、进入本地/网络模式、字幕路径、缓存命中、设备提示、翻译源不响应。
+- **debug** —— 每块/每请求的生命周期:调度、提交、HTTP 结果摘要、seek 判定、mpv 事件、源选择。
 - **trace** —— 热循环里的空转与逐条判定:等缓存、等播放追上、look-ahead 上限、迟到结果丢弃、单条文本翻译。
 
 ### 上下文与字段
