@@ -72,11 +72,13 @@ LD_LIBRARY_PATH="/path/to/ffmpeg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" mpv "
 
 下载 `android-arm64-v8a-libmpv_stt_plugin_rs.so`。
 
-**先把文件重命名为 `libmpv_stt_plugin_rs.so` 再安装。** mpv 用文件名给插件起客户端名（去掉扩展名，其余非字母数字的字符全部换成 `_`），`script-message-to` 和 IINA 的快捷键绑定都按这个名字找插件。保留下载时的完整文件名，插件会以 `android_arm64_v8a_libmpv_stt_plugin_rs` 注册，下面 `input.conf` 里的绑定不会生效，而播放器不会报任何错。
+**先把文件重命名为 `libmpv_stt_plugin_rs.so` 再安装。** mpv 用文件名给插件起客户端名（去掉扩展名，其余非字母数字的字符全部换成 `_`），`script-message-to` 按这个名字找插件。保留下载时的完整文件名，插件会以 `android_arm64_v8a_libmpv_stt_plugin_rs` 注册，按文档写出的 `script-message-to` 就匹配不到，而播放器只把这条记成一行 verbose 日志。
 
 需要支持 C 插件、且提供匹配 libmpv / FFmpeg 库的播放器。安装目录与加载方式由宿主决定，不能按普通 Lua 脚本的方式直接套用桌面安装步骤。
 
-**mpvEx**：设置 → 高级 → C 插件里开启开关并选中重命名后的 `.so`，App 会在播放器启动前把它复制到 libmpv 的脚本目录。再把三行快捷键写进配置目录的 `input.conf`：
+**mpvEx**：设置 → 高级 → C 插件里开启开关并选中重命名后的 `.so`，App 会在播放器启动前把它复制到 libmpv 的脚本目录。
+
+加载成功后插件会自己 `define-section` + `enable-section` 注册三组快捷键，自己打印一行 `registered the forced shortcut section`，这一步正常时不需要再配 `input.conf`。若该行没出现，或快捷键与输入法冲突，再在配置目录的 `input.conf` 里写一份；`script-message-to` 的客户端名以 mpvEx 日志里 `Synced C plugin: <文件名> (client name: <客户端名>)` 那条为准：
 
 ```text
 Ctrl+Shift+S script-message-to libmpv_stt_plugin_rs toggle-stt
@@ -84,7 +86,7 @@ Ctrl+Shift+T script-message-to libmpv_stt_plugin_rs toggle-translate
 Ctrl+Shift+C script-message-to libmpv_stt_plugin_rs clear-cache
 ```
 
-插件加载后，mpvEx 的日志里会有一条 `Synced C plugin: <文件名> (client name: <客户端名>)`；用哪个名字写 `script-message-to`，以这条日志为准。插件的加载失败与它自己打印的日志都在同一个日志页面里（设置 → 高级 → 日志）。
+插件的加载失败与它自己打印的日志都在同一个日志页面里（设置 → 高级 → 日志）。
 
 Android 上没有插件能自动找到的配置目录（`BaseDirs` 拿不到），所以配置文件必须靠宿主的环境变量 `MPV_STT_PLUGIN_RS_CONFIG` 指定绝对路径；mpvEx 在「设置 → 高级 → 环境变量」里加即可。
 
