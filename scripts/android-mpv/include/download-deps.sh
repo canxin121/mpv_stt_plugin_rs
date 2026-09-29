@@ -17,6 +17,27 @@ if [ ! -d ffmpeg ]; then
   git clone --depth 1 --branch $v_ci_ffmpeg https://github.com/FFmpeg/FFmpeg ffmpeg
 fi
 
+# mpv
+#
+# Of the two players here, only the host is real: this prefix is built to get at
+# mpv's headers, and the plugin talks to the host's live client API at load
+# time. MPV_PREFIX is what the header includes and the link resolve against, but
+# nothing of this libmpv ends up in the artifact.
+#
+# Upstream mpv-android tracks mpv master, so a plugin pinned to a tag lags the
+# host rather than leading it, which is the direction that fails safely: a tag's
+# client.h only declares what that release's libmpv had, so the plugin cannot
+# bind a symbol an older host lacks. The reverse — building against master and
+# running against an older player — is the failure this pin avoids, and it is a
+# `dlopen failed: cannot locate symbol "mpv_..."` with nothing in the build
+# output to warn about it. Bump this when mpvEx's mpv-android AAR moves to a
+# libmpv that reports a newer version, so the header does not hold the plugin
+# back from API the host actually has.
+v_mpv_release="${v_mpv_release:-v0.41.0}"
+if [ ! -d mpv ]; then
+  git clone --depth 1 --branch "$v_mpv_release" https://github.com/mpv-player/mpv
+fi
+
 # freetype2
 [ ! -d freetype2 ] && git clone --recurse-submodules https://gitlab.freedesktop.org/freetype/freetype.git freetype2 -b VER-${v_freetype//./-}
 
@@ -44,10 +65,8 @@ fi
 # libass
 [ ! -d libass ] && git clone --depth 1 https://github.com/libass/libass
 
-# libplacebo
+# libplacebo (+ the vendored msdfgen, which carries a handful of submodules of
+# its own — the Vulkan headers among them are the slowest download here)
 [ ! -d libplacebo ] && git clone --depth 1 --recursive https://github.com/haasn/libplacebo
-
-# mpv
-[ ! -d mpv ] && git clone --depth 1 https://github.com/mpv-player/mpv
 
 cd ..

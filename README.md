@@ -70,9 +70,23 @@ LD_LIBRARY_PATH="/path/to/ffmpeg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" mpv "
 <details>
 <summary><strong>Android · arm64-v8a</strong></summary>
 
-下载 `android-arm64-v8a-libmpv_stt_plugin_rs.so`，安装时命名为 `libmpv_stt_plugin_rs.so`。
+下载 `android-arm64-v8a-libmpv_stt_plugin_rs.so`。
+
+**先把文件重命名为 `libmpv_stt_plugin_rs.so` 再安装。** mpv 用文件名给插件起客户端名（去掉扩展名，其余非字母数字的字符全部换成 `_`），`script-message-to` 和 IINA 的快捷键绑定都按这个名字找插件。保留下载时的完整文件名，插件会以 `android_arm64_v8a_libmpv_stt_plugin_rs` 注册，下面 `input.conf` 里的绑定不会生效，而播放器不会报任何错。
 
 需要支持 C 插件、且提供匹配 libmpv / FFmpeg 库的播放器。安装目录与加载方式由宿主决定，不能按普通 Lua 脚本的方式直接套用桌面安装步骤。
+
+**mpvEx**：设置 → 高级 → C 插件里开启开关并选中重命名后的 `.so`，App 会在播放器启动前把它复制到 libmpv 的脚本目录。再把三行快捷键写进配置目录的 `input.conf`：
+
+```text
+Ctrl+Shift+S script-message-to libmpv_stt_plugin_rs toggle-stt
+Ctrl+Shift+T script-message-to libmpv_stt_plugin_rs toggle-translate
+Ctrl+Shift+C script-message-to libmpv_stt_plugin_rs clear-cache
+```
+
+插件加载后，mpvEx 的日志里会有一条 `Synced C plugin: <文件名> (client name: <客户端名>)`；用哪个名字写 `script-message-to`，以这条日志为准。插件的加载失败与它自己打印的日志都在同一个日志页面里（设置 → 高级 → 日志）。
+
+Android 上没有插件能自动找到的配置目录（`BaseDirs` 拿不到），所以配置文件必须靠宿主的环境变量 `MPV_STT_PLUGIN_RS_CONFIG` 指定绝对路径；mpvEx 在「设置 → 高级 → 环境变量」里加即可。
 
 </details>
 
@@ -246,6 +260,10 @@ network_ms = 15000     # 网络媒体：每片 15 秒
 | 服务返回 404 | 检查服务地址和模型名称，不要把完整请求路径填入 `server_addr`。 |
 | 有原文，没有译文 | 检查翻译开关和服务状态；服务恢复后，将 `Ctrl+Shift+T` 关闭再开启以重试。 |
 | 插件无法加载 | 确认播放器支持 C 插件、文件架构正确，且 FFmpeg 共享库已安装并可被加载。 |
+| 报 `cannot locate symbol "avcodec_..."` | 插件与宿主播放器的 FFmpeg 主版本不一致。桌面版下载与播放器同版本的 FFmpeg 共享库（Linux 见上文的 `LD_LIBRARY_PATH`）；Android 的库由播放器自带、无法替换，需换用与宿主 FFmpeg 主版本一致的插件版本。 |
+| 报 `cannot locate symbol "mpv_..."` | 宿主播放器的 libmpv 比插件编译时更旧。升级播放器，或改用更早的插件版本。 |
+| 快捷键无效 / 按了没有反应 | 插件加载后会自己注册一组快捷键（日志里的 `registered the forced shortcut section`），正常情况下不需要用户配置。若仍未响应，先确认插件名是 `libmpv_stt_plugin_rs.so`——mpv 用文件名生成客户端名，文件名不同，`script-message-to` 就匹配不到且不会报错。 |
+| mpvEx 上快捷键无效 | 设置 → 高级：开启 C 插件并选中重命名后的 `.so`；插件加载失败或它自己的日志都在设置 → 高级 → 日志里。若插件自带的快捷键与系统输入法冲突，可把那三行写进配置目录的 `input.conf` 取代。 |
 
 ---
 

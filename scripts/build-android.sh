@@ -89,13 +89,33 @@ resolve_ndk() {
     echo "${ndk}"
 }
 
+# NDK ships its prebuilt LLVM under one host-tagged directory. The tag is not
+# always the host it is running on: the macOS package is a single
+# `darwin-x86_64` directory holding universal binaries, so an Apple Silicon
+# machine picks `darwin-arm64` by name, finds nothing, and cc-rs fails with
+# `failed to find tool .../darwin-arm64/bin/aarch64-linux-android21-clang`.
+# Prefer the name for this host and fall back to whatever is actually there.
 host_tag() {
+    local ndk="$1" preferred
     case "$(uname -s)-$(uname -m)" in
-        Linux-x86_64)  echo "linux-x86_64" ;;
-        Darwin-arm64)  echo "darwin-arm64" ;;
-        Darwin-x86_64) echo "darwin-x86_64" ;;
-        *)             echo "linux-x86_64" ;;
+        Linux-x86_64)  preferred="linux-x86_64" ;;
+        Darwin-arm64)  preferred="darwin-arm64" ;;
+        Darwin-x86_64) preferred="darwin-x86_64" ;;
+        *)             preferred="linux-x86_64" ;;
     esac
+    if [[ -d "${ndk}/toolchains/llvm/prebuilt/${preferred}" ]]; then
+        echo "${preferred}"
+        return
+    fi
+    local found
+    found="$(find "${ndk}/toolchains/llvm/prebuilt" -mindepth 1 -maxdepth 1 -type d \
+        -name "$( [[ "$preferred" == darwin-* ]] && echo 'darwin-*' || echo 'linux-*' )" \
+        2>/dev/null | head -1)"
+    if [[ -n "${found}" ]]; then
+        echo "$(basename "${found}")"
+        return
+    fi
+    echo "${preferred}"
 }
 
 ensure_rust_target() {
@@ -155,6 +175,16 @@ setup_android_env() {
     export BINDGEN_EXTRA_CLANG_ARGS="--target=${clang_target} --sysroot=${sysroot} -I${prefix}/include -I${MPV_INCLUDE_DIR}"
     export CC="${toolchain}/bin/${clang_target}${API}-clang"
     export CXX="${toolchain}/bin/${clang_target}${API}-clang++"
+    # ffmpeg-sys-next probes FFmpeg's headers by compiling a throwaway program
+    # for the *host* — `cc::Build::new().target(&env::var("HOST"))` in its
+    # build.rs — so it reaches for `CC` first and, with the value above, runs a
+    # cross compiler against macOS headers: `'stdio.h' file not found`, and the
+    # build dies before cargo ever links anything. cc-rs checks the target
+    # triple before the bare name, so naming the host compiler here is what
+    # diverts only that probe back to clang; the cross values above still apply
+    # to every target-compiled crate (ring, opusic-sys) and to the linker.
+    export HOST_CC="$(command -v clang)"
+    export HOST_CXX="$(command -v clang++)"
     export AR="${toolchain}/bin/llvm-ar"
     export RANLIB="${toolchain}/bin/llvm-ranlib"
     export STRIP="${toolchain}/bin/llvm-strip"
@@ -182,7 +212,7 @@ build_abi() {
         error "Android NDK not found at ${ndk}; set ANDROID_NDK_HOME"
         return 1
     fi
-    toolchain="${ndk}/toolchains/llvm/prebuilt/$(host_tag)"
+    toolchain="${ndk}/toolchains/llvm/prebuilt/$(host_tag "${ndk}")"
 
     restore_env
     ensure_rust_target "${rust_target}"

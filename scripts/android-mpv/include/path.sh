@@ -13,8 +13,18 @@ export os
 
 if [ "$os" == "mac" ]; then
   [ -z "$cores" ] && cores=$(sysctl -n hw.ncpu)
-  export INSTALL=$(command -v ginstall)
-  export SED=gsed
+  # Both names are resolved to absolute paths, because the helper's `env -i`
+  # re-exec keeps only PATH: a bare name would be looked up by every configure
+  # script that inherited it, and the value also lands in libtool as a relative
+  # path (`../ginstall`) that does not resolve from the build directory.
+  # Only export when present. An exported `SED=gsed` that does not exist is
+  # worse than not setting it: autoconf's `AC_PROG_LD` runs `$SED` to locate the
+  # linker, gets "command not found" through the shell, and reports it as
+  # `no acceptable ld found in $PATH` — naming the linker rather than the
+  # missing sed. BSD sed is enough everywhere the tree uses it; the one caller
+  # that needs GNU syntax asks with `${SED:-sed}` and gets the fallback.
+  gsed_path=$(command -v gsed) && export SED="$gsed_path"
+  ginstall_path=$(command -v ginstall) && export INSTALL="$ginstall_path"
 else
   [ -z "$cores" ] && cores=$(grep -c ^processor /proc/cpuinfo)
 fi
