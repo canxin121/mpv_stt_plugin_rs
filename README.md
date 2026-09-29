@@ -174,17 +174,19 @@ export ANDROID_NDK_HOME=~/Android/Sdk/ndk/29.0.14206865   # NDK r29 或更新
 GitHub Release —— **不是压缩包**,每个文件都带平台后缀:
 
 ```
-libmpv_stt_plugin_rs.so-linux-x86_64        libavcodec.so.63.1.102-linux-x86_64  ...
+libmpv_stt_plugin_rs.so-linux-x86_64        libavcodec.so.63-linux-x86_64   ...
 libmpv_stt_plugin_rs.so-darwin-arm64
 libmpv_stt_plugin_rs.so-android-arm64-v8a
-mpv_stt_plugin_rs.dll-windows-x86_64        avcodec-63.dll-windows-x86_64        ...
+mpv_stt_plugin_rs.dll-windows-x86_64        avcodec-63.dll-windows-x86_64   ...
 ```
 
 这么发有两个原因。一是 mpv 用**加载的文件名**给 C 插件起 client 名,下载下来直接就是
 `libmpv_stt_plugin_rs.so`,client 名正好是 `libmpv_stt_plugin_rs`,和 [IINA 快捷键
 配置](#安装)里的 `script-message-to libmpv_stt_plugin_rs` 对得上;一旦套一层 zip,有些
 unzip 会把扩展名丢掉,client 名就变了,快捷键跟着失效。二是 Windows 的 FFmpeg DLL 和
-插件在同一个目录里,扁平化之后必须靠后缀区分。
+插件在同一个目录里,扁平化之后必须靠后缀区分(所以这些文件都是 `-<平台>` 结尾的**真
+文件**,不是符号链接)。Linux 的 FFmpeg 库只发 SONAME 那一份(`libavcodec.so.63`),
+插件本身只 `NEEDED` 这些名字。
 
 装的时候把该平台的文件下下来,去掉后缀、恢复原始文件名:
 
@@ -195,8 +197,7 @@ for f in *-linux-x86_64; do
 done
 ```
 
-Windows 把 `runtime/` 里那些 DLL 和 `mpv_stt_plugin_rs.dll` 放进同一个目录,再把 DLL
-所在目录加进 `PATH`。
+Windows 把那些 DLL 和 `mpv_stt_plugin_rs.dll` 放进同一个目录,再把该目录加进 `PATH`。
 
 ## 安装
 

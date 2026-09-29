@@ -206,14 +206,28 @@ resolve_ffmpeg() {
 # Windows needs the FFmpeg DLLs on the DLL search path, Linux needs the .so via
 # LD_LIBRARY_PATH; ship both next to the plugin. macOS links the brew dylibs at
 # their absolute install paths, so there is nothing to copy.
+#
+# BtbN's Linux package ships each library three times — `libavcodec.so` (the
+# dev symlink), `libavcodec.so.63` and `libavcodec.so.63.1.102` — and they are
+# three identical files, not symlinks. Only the fully-versioned name and the
+# SONAME the plugin was linked against are kept: the `.so` one is what the
+# linker wants at build time, and nobody dlopens an FFmpeg by that name.
 collect_ffmpeg_runtime() {
-    local platform="$1" rt
+    local platform="$1" rt file
     [[ "${platform}" == darwin-* ]] && return 0
     [[ -n "${FFMPEG_DIR:-}" ]] || return 0
     rt="${DIST_DIR}/${platform}/runtime"
     mkdir -p "${rt}"
     case "${platform}" in
-        linux-x86_64)   cp -P "${FFMPEG_DIR}"/lib/lib*.so* "${rt}"/ 2>/dev/null || true ;;
+        linux-x86_64)
+            for file in "${FFMPEG_DIR}"/lib/lib*.so.*; do
+                case "${file}" in
+                    # `libavcodec.so.63.1.102` -> `libavcodec.so.63`
+                    *.so.*.*.*) continue ;;
+                esac
+                cp -P "${file}" "${rt}"/ 2>/dev/null || true
+            done
+            ;;
         windows-x86_64) cp "${FFMPEG_DIR}"/bin/*.dll "${rt}"/ 2>/dev/null || true ;;
     esac
     if [[ -z "$(ls -A "${rt}")" ]]; then
