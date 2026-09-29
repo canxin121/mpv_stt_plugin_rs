@@ -1,6 +1,6 @@
 [package]
 name = "mpv_stt_plugin_rs"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "MPV real-time subtitle plugin (pure remote client: ASR + translation via subtitle-gateway)"
 license = "MIT"
