@@ -196,18 +196,27 @@ jobs:
         with:
           path: artifacts
 
-      # One zip per platform, laid out so the plugin and the FFmpeg runtime
-      # libraries it needs sit at the zip root: unzip it into
-      # ~/.config/mpv/scripts and the plugin is in place (Linux and Windows
-      # also need the runtime/ directory next to it).
+      # The release carries the built files themselves — no archive around
+      # them. A zip is a trap here: mpv names a C plugin's client after the
+      # file it loaded, and a bare `libmpv_stt_plugin_rs.so` yields exactly the
+      # `libmpv_stt_plugin_rs` that README.md and the IINA key bindings pass to
+      # `script-message-to`, while some unzip builds drop the extension.
+      #
+      # Every file gets the platform as its suffix. The Windows one is not
+      # optional: its DLLs sit in the same directory as the plugin, and
+      # `mpv_stt_plugin_rs.dll` alone would collide with the `runtime/` copies
+      # of avcodec-63.dll and friends once they are all flattened together.
       - name: Package
         run: |
           mkdir -p out
           for d in artifacts/*/; do
             name="$(basename "${d}")"
+            name="${name#mpv_stt_plugin_rs-}"
             plugin="$(find "${d}" -name 'libmpv_stt_plugin_rs.so' -o -name 'mpv_stt_plugin_rs.dll' | head -1)"
             test -n "${plugin}" || { echo "no plugin found under ${d}" >&2; exit 1; }
-            (cd "$(dirname "${plugin}")" && zip -qr "${GITHUB_WORKSPACE}/out/${name}.zip" .)
+            find "$(dirname "${plugin}")" -type f | while read -r file; do
+              cp "${file}" "out/$(basename "${file}")-${name}"
+            done
           done
           ls -lh out/
 
@@ -219,4 +228,4 @@ jobs:
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --generate-notes \
-            out/*.zip
+            out/*
