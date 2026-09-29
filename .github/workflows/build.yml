@@ -202,10 +202,13 @@ jobs:
       # `libmpv_stt_plugin_rs` that README.md and the IINA key bindings pass to
       # `script-message-to`, while some unzip builds drop the extension.
       #
-      # Every file gets the platform as its suffix. The Windows one is not
-      # optional: its DLLs sit in the same directory as the plugin, and
-      # `mpv_stt_plugin_rs.dll` alone would collide with the `runtime/` copies
-      # of avcodec-63.dll and friends once they are all flattened together.
+      # The platform goes in front, not behind. Appending it would leave
+      # `libmpv_stt_plugin_rs.so-linux-x86_64` and
+      # `libavcodec.so.63-linux-x86_64`, and one `mv` away from that is a
+      # loader that no longer recognises either. A prefix keeps every
+      # filename's extension where it already is, so dropping it is a
+      # mechanical `cut -d- -f3-`. It also keeps the platform visible when the
+      # download is sorted by name.
       - name: Package
         run: |
           mkdir -p out
@@ -215,7 +218,7 @@ jobs:
             plugin="$(find "${d}" -name 'libmpv_stt_plugin_rs.so' -o -name 'mpv_stt_plugin_rs.dll' | head -1)"
             test -n "${plugin}" || { echo "no plugin found under ${d}" >&2; exit 1; }
             find "$(dirname "${plugin}")" -type f | while read -r file; do
-              cp "${file}" "out/$(basename "${file}")-${name}"
+              cp "${file}" "out/${name}-$(basename "${file}")"
             done
           done
           ls -lh out/
