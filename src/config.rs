@@ -302,8 +302,8 @@ impl SttSourceConfig {
     }
 }
 
-/// `[translate]`: which declared (or built-in) source is active, plus any
-/// sources the user declares on top of the built-in ones.
+/// `[translate]`: which source is active, plus the sources the user declares.
+/// The built-in free sources need no declaration; everything else does.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TranslateConfig {
     pub from_lang: String,
@@ -312,10 +312,10 @@ pub struct TranslateConfig {
     /// Name of the source to use, or `auto` to walk the built-in free sources
     /// (`google_free` → `edge_free` → `alibaba_free`) until one answers.
     pub source: String,
-    /// Declared sources, keyed by name. Naming a built-in source here (e.g.
-    /// `[translate.sources.edge_free]`) overrides just the fields written; the
-    /// rest stay at the built-in values. `auto` is reserved and cannot be
-    /// declared.
+    /// Declared sources, keyed by name. Naming one of the built-in free
+    /// sources here (e.g. `[translate.sources.edge_free]`) overrides just the
+    /// fields written; the rest stay at the built-in values. `auto` is
+    /// reserved and cannot be declared.
     pub sources: BTreeMap<String, TranslateSourceConfig>,
 }
 
@@ -332,15 +332,17 @@ impl Default for TranslateConfig {
 }
 
 /// One declared translation source. Every field is optional so that overriding
-/// a built-in source is a one-liner: `[translate.sources.edge_free]` with only
-/// `api_key` keeps the built-in host.
+/// a built-in free source is a one-liner: `[translate.sources.edge_free]` with
+/// only `api_key` keeps the built-in host. A name outside that table has to
+/// state `protocol` and `server_addr` both.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TranslateSourceConfig {
-    /// Wire protocol. Required unless the name is one of the built-in ones,
-    /// which already imply a protocol.
+    /// Wire protocol. Required unless the name is one of the built-in free
+    /// ones, which already imply a protocol.
     pub protocol: Option<TranslateSourceProtocol>,
-    /// Base URL, e.g. `https://api-free.deepl.com`. Defaults to the built-in
-    /// host for a built-in name, else to `http://127.0.0.1:8000`.
+    /// Base URL, e.g. `https://api-free.deepl.com` or
+    /// `http://127.0.0.1:5000`. Required unless the name is one of the
+    /// built-in free ones, which already carry their endpoint.
     pub server_addr: Option<String>,
     /// Optional API key: `deepl` sends it as `Authorization: DeepL-Auth-Key`,
     /// `libretranslate` in the body, `edge` as `Ocp-Apim-Subscription-Key`.

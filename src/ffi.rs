@@ -47,19 +47,24 @@ fn string_to_c_str(s: String) -> *mut c_char {
     CString::new(s).unwrap_or_default().into_raw()
 }
 
-/// Initialize Translator configuration (points at the default remote
-/// DeepL-compatible server on 127.0.0.1:8000, no API key).
+/// Initialize Translator configuration with an explicit remote server and
+/// optional API key. Null pointers fall back to the local gateway port.
 ///
 /// # Safety
 ///
-/// Both pointers are null or NUL-terminated strings valid for the call.
+/// Every pointer is null or a NUL-terminated string valid for the call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn translator_init(from_lang: *const c_char, to_lang: *const c_char) -> i32 {
     unsafe {
         let from_lang = c_str_to_string(from_lang).unwrap_or_else(|| "auto".to_string());
         let to_lang = c_str_to_string(to_lang).unwrap_or_else(|| "en".to_string());
 
-        let source = ResolvedSource::builtin("deepl");
+        let source = ResolvedSource {
+            name: "deepl".to_string(),
+            protocol: TranslateSourceProtocol::DeepL,
+            server_addr: "http://127.0.0.1:8000".to_string(),
+            api_key: String::new(),
+        };
         debug!(
             from_lang = %from_lang,
             to_lang = %to_lang,

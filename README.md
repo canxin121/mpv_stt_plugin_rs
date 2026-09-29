@@ -67,17 +67,34 @@ STT 侧**没有内置源**:每个源都要写清 `protocol` 和 `server_addr`,
 所有协议**同时编译**,由所选具名源的 `protocol` 决定用哪个。`[translate] source`
 默认 `auto`,按 `google_free → edge_free → alibaba_free` 顺序回退,第一个成功为止:
 
-| `source` | 内置 host | `protocol` | 怎么连 |
-|---|---|---|---|
-| `auto`(默认) | — | — | 依次试下面三个内置免费源,第一个成功为止 |
-| `google_free` | `clients5.google.com` | `google` | 零配置 |
-| `edge_free` | `edge.microsoft.com` | `edge` | 零配置;带 `api_key` 即走微软官方通道 |
-| `alibaba_free` | `translate.alibaba.com` | `alibaba` | 零配置;链尾,每条字幕一次 token + 一次请求 |
-| `deepl` | `127.0.0.1:8000` | `deepl` | `POST {server}/v1/translate`,key 走 `Authorization: DeepL-Auth-Key`,target 大写 |
-| `libretranslate` | `127.0.0.1:8000` | `libretranslate` | `POST {server}/translate`,key 走 body `api_key`,target 小写,`auto` 可显式/省略 |
+| `source` | `protocol` | 怎么连 |
+|---|---|---|
+| `auto`(默认) | — | 依次试下面三个内置免费源,第一个成功为止 |
+| `google_free`(host `clients5.google.com`) | `google` | 零配置 |
+| `edge_free`(host `edge.microsoft.com`) | `edge` | 零配置;带 `api_key` 即走微软官方通道 |
+| `alibaba_free`(host `translate.alibaba.com`) | `alibaba` | 零配置;链尾,每条字幕一次 token + 一次请求 |
 
-五个名字都是**内置的**:整节不写就按上表解析,写了只覆盖写到的字段。自己声明的源必须写
-`protocol`;选中单个源时**失败不换源**,不会悄悄降级到另一个引擎。
+只有这三个名字是**内置的**:它们的 host 是固定的公共站点,整节不写就能直接用,写了只覆盖
+写到的字段。`deepl` / `libretranslate` 只是 **protocol**,不是名字 —— 它们指向哪里取决于
+服务跑在哪(DeepL 官方站、自建实例、本机网关…),插件猜不出来,所以自己声明一个源、写
+`protocol` 和 `server_addr` 就行(往下两节各有现成的配方):
+
+```toml
+[translate]
+source = "deepl_free"
+
+[translate.sources.deepl_free]
+protocol = "deepl"            # deepl 走 POST {server}/v1/translate,key 是
+server_addr = "https://api-free.deepl.com"   # Authorization: DeepL-Auth-Key,target 大写
+api_key = "<xxx:fx>"
+
+[translate.sources.lt]
+protocol = "libretranslate"    # libretranslate 走 POST {server}/translate,key 走 body
+server_addr = "http://127.0.0.1:5000"        # api_key,target 小写,auto 可显式/省略
+```
+
+源名随你取(`deepl_free` / `lt` 只是例子)。自己声明的源必须同时写 `protocol` 和
+`server_addr`,少一个都是启动错误;选中单个源时**失败不换源**,不会悄悄降级到另一个引擎。
 
 内置源是这些站点**网页前端自己用的接口**,不保证长期可用、也不保证稳定:
 它们的形状一旦变了,日志里会出现带 HTTP 状态和响应体摘要的 `warn`,而不是静默给出空译文。
@@ -351,11 +368,10 @@ concurrency = 4
 
 # 内置源:名字已在插件里,整节不写就用内置的 host,写了只覆盖写到的字段
 #   google_free / edge_free / alibaba_free  —— auto 按这个顺序回退
-#   deepl / libretranslate                  —— 外部协议,默认指向本机 127.0.0.1:8000
 [translate.sources.edge_free]
 api_key = ""                  # 填了就走微软官方通道
 
-# 自己声明的源:非内置名必须写 protocol
+# 自己声明的源:protocol 和 server_addr 都要写(名字随你取)
 [translate.sources.deepl_free]
 protocol = "deepl"
 server_addr = "https://api-free.deepl.com"
@@ -396,8 +412,7 @@ DeepL 或 LibreTranslate 这两种形状之一(2026-09 实测核对,服务端随
 | [LibreTranslate](https://github.com/LibreTranslate/LibreTranslate) | `protocol = "libretranslate"`,`server_addr = "http://127.0.0.1:5000"` | 自建:不限量、不出内网。`pip install libretranslate` 或官方 Docker 镜像;默认监听 `127.0.0.1:5000`;AGPL-3.0;Argos 引擎,日译中绕英语 |
 | 公共 LibreTranslate 镜像 | `protocol = "libretranslate"`,`server_addr = "https://translate.hostux.net"` | 无需 key,但**必须显式写 `from_lang`**(镜像不接受省略 `source`);`to_lang` 只能写 `zh` 或 `zh-Hans`,写 `zh-CN` 会 400;Argos 引擎,质量明显低于内置源 |
 
-非内置名不写 `protocol` 是启动错误(消息里会列出可选的协议名),不会猜。
-直接复用内置名(`[translate.sources.deepl]`)则连 `protocol` 都不用写。
+不写 `protocol` 或 `server_addr` 都是启动错误(前者会在消息里列出可选的协议名),不会猜。
 
 需要绑定信用卡才能开通、或整条链路要额外跑一个服务端(Google Cloud / Azure Translator /
 [MTranServer](https://github.com/xxnuo/MTranServer))的,请求形状既不是 DeepL 也不是

@@ -19,19 +19,22 @@ const RETRY_BASE_DELAY_MS: u64 = 250;
 /// Name of the reserved selector value that walks the built-in free sources.
 pub const AUTO_SOURCE: &str = "auto";
 
-/// A built-in source: a name that resolves without being declared, because its
-/// protocol and endpoint are known. `[translate.sources.<name>]` may still be
-/// written to override individual fields.
+/// A built-in source: a name that resolves with no configuration at all,
+/// because both its protocol and its endpoint are known. `[translate.sources.
+/// <name>]` may still be written to override individual fields.
 struct BuiltinSource {
     name: &'static str,
     protocol: TranslateSourceProtocol,
     server_addr: &'static str,
 }
 
-/// The built-in sources. The first three are the free web endpoints `auto`
-/// walks in order; the last two are the external protocols, which point at a
-/// local service by default so that selecting them needs no address either.
-const BUILTIN_SOURCES: [BuiltinSource; 5] = [
+/// The built-in sources: exactly the free web endpoints `auto` walks in order.
+/// Each one is a public host that needs no address and no key, which is what
+/// makes a bare name useful. A name whose endpoint depends on where the user
+/// runs the service has nothing to fill in, so it is not here: `deepl` and
+/// `libretranslate` are protocols a declared source selects, and such a source
+/// states its own `server_addr`.
+const BUILTIN_SOURCES: [BuiltinSource; 3] = [
     BuiltinSource {
         name: "google_free",
         protocol: TranslateSourceProtocol::Google,
@@ -47,16 +50,6 @@ const BUILTIN_SOURCES: [BuiltinSource; 5] = [
         protocol: TranslateSourceProtocol::Alibaba,
         server_addr: "https://translate.alibaba.com",
     },
-    BuiltinSource {
-        name: "deepl",
-        protocol: TranslateSourceProtocol::DeepL,
-        server_addr: "http://127.0.0.1:8000",
-    },
-    BuiltinSource {
-        name: "libretranslate",
-        protocol: TranslateSourceProtocol::LibreTranslate,
-        server_addr: "http://127.0.0.1:8000",
-    },
 ];
 
 /// The names `auto` walks, in order: the built-in free sources only. Sources
@@ -64,19 +57,9 @@ const BUILTIN_SOURCES: [BuiltinSource; 5] = [
 /// self-hosted endpoint has to be an explicit choice.
 const FREE_SOURCE_NAMES: [&str; 3] = ["google_free", "edge_free", "alibaba_free"];
 
-/// Where a protocol points when neither the built-in table nor the source says
-/// otherwise. Only the two external protocols can get here: the free ones have
-/// a host built in, and a non-built-in name must state its protocol anyway.
-fn protocol_default_server(protocol: TranslateSourceProtocol) -> &'static str {
-    match protocol {
-        TranslateSourceProtocol::DeepL | TranslateSourceProtocol::LibreTranslate => {
-            "http://127.0.0.1:8000"
-        }
-        TranslateSourceProtocol::Google => "https://clients5.google.com",
-        TranslateSourceProtocol::Edge => "https://edge.microsoft.com",
-        TranslateSourceProtocol::Alibaba => "https://translate.alibaba.com",
-    }
-}
+/// The protocols a source may name, for the error messages that have to list
+/// them. Kept beside the enum's `Display`, which prints the same words.
+const PROTOCOL_NAMES: &str = "google, edge, alibaba, deepl, libretranslate";
 
 fn builtin(name: &str) -> Option<&'static BuiltinSource> {
     BUILTIN_SOURCES.iter().find(|s| s.name == name)
@@ -84,7 +67,9 @@ fn builtin(name: &str) -> Option<&'static BuiltinSource> {
 
 /// Resolve one named source: the declared fields win, the built-in entry (for
 /// a built-in name) fills the gaps, and a name that is neither built-in nor
-/// fully declared is an error rather than a guess.
+/// fully declared is an error rather than a guess. `server_addr` is required
+/// for everything but a built-in name — the plugin has no way to know where a
+/// DeepL or LibreTranslate service lives.
 pub fn resolve_source(
     name: &str,
     declared: Option<&TranslateSourceConfig>,
@@ -98,15 +83,23 @@ pub fn resolve_source(
         None => {
             return Err(MpvSttError::TranslationFailed(format!(
                 "translation source {name:?} is not built-in and has no protocol; \
-                 set protocol to one of: google, edge, alibaba, deepl, libretranslate"
+                 set protocol to one of: {PROTOCOL_NAMES}"
             )));
         }
     };
-    let server_addr = declared
+    let server_addr = match declared
         .server_addr
         .clone()
         .or_else(|| builtin.map(|b| b.server_addr.to_string()))
-        .unwrap_or_else(|| protocol_default_server(protocol).to_string());
+    {
+        Some(server_addr) => server_addr,
+        None => {
+            return Err(MpvSttError::TranslationFailed(format!(
+                "translation source {name:?} speaks {protocol} but has no server_addr; \
+                 set it to the base URL of the service"
+            )));
+        }
+    };
 
     Ok(ResolvedSource {
         name: name.to_string(),
@@ -126,8 +119,7 @@ pub struct ResolvedSource {
 }
 
 impl ResolvedSource {
-    /// A built-in source as it resolves with no override at all. Used by the
-    /// FFI initializers and by tests.
+    /// A built-in free source as it resolves with no override at all.
     pub fn builtin(name: &str) -> Self {
         resolve_source(name, None).expect("built-in names always resolve")
     }
@@ -150,8 +142,8 @@ pub struct TranslatorConfig {
     pub concurrency: usize,
     /// Name of the active source, or `auto` for the built-in free chain.
     pub source: String,
-    /// Every source this config can name, already resolved. Built-in names may
-    /// be absent: the resolver falls back to the built-in table for those.
+    /// Every source this config can name, already resolved. A built-in name
+    /// may be absent: the resolver fills in the built-in endpoint for those.
     pub sources: BTreeMap<String, ResolvedSource>,
 }
 
@@ -1883,6 +1875,22 @@ mod tests {
             message.contains("google_free"),
             "built-in names missing: {message}"
         );
+    }
+
+    #[test]
+    fn a_declared_source_must_state_where_the_service_is() {
+        let err = TranslatorConfig::new("ja".to_string(), "zh".to_string())
+            .with_source_config(
+                "deepl_free",
+                &TranslateSourceConfig {
+                    protocol: Some(TranslateSourceProtocol::DeepL),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        let message = format!("{err}");
+        assert!(message.contains("deepl_free"), "got: {message}");
+        assert!(message.contains("server_addr"), "got: {message}");
     }
 
     #[test]

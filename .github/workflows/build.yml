@@ -206,8 +206,8 @@ jobs:
       # `libmpv_stt_plugin_rs.so-linux-x86_64` and
       # `libavcodec.so.63-linux-x86_64`, and one `mv` away from that is a
       # loader that no longer recognises either. A prefix keeps every
-      # filename's extension where it already is, so dropping it is a
-      # mechanical `cut -d- -f3-`. It also keeps the platform visible when the
+      # filename's extension where it already is, so stripping it is
+      # `${f#linux-x86_64-}`. It also keeps the platform visible when the
       # download is sorted by name.
       - name: Package
         run: |
