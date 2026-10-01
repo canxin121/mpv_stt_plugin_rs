@@ -44,10 +44,9 @@ pub struct SttOpenAiConfig {
 /// Segments are requested with `response_format=verbose_json` plus
 /// `timestamp_granularities[]=segment` (the default granularity, sent
 /// explicitly). Both are standard OpenAI multipart fields; OpenAI itself only
-/// returns the `segments` array for `verbose_json`. Servers that reject
-/// `verbose_json` and answer with plain `{"text": ...}`, or that return no
-/// segments, fall back to one subtitle per chunk (`parse_transcription`);
-/// servers that emit segments anyway (Groq does) leave that fallback unused.
+/// returns the `segments` array for `verbose_json`. Servers that return only
+/// plain text cannot provide sentence-level timing; those responses are
+/// rejected instead of being assigned a misleading whole-chunk timestamp.
 ///
 /// 16 kHz mono PCM is what the OpenAI API itself documents, and it is exactly
 /// what `audio.rs`'s extractor emits (16000 Hz / 1 channel), so the payload is
@@ -151,17 +150,17 @@ impl OpenAiBackend {
         }
 
         if srt.entries.is_empty() {
-            // An empty SRT still replaces a real subtitle file upstream, so
-            // report failure and leave the caller's file untouched.
-            warn!(
+            // A valid empty transcription is a successful no-speech chunk.
+            // Save an empty SRT so the plugin can mark it processed instead
+            // of repeatedly sending silence to the API.
+            debug!(
                 server = %self.server_url,
                 model = %self.model,
                 duration_ms,
-                "the transcription server returned no text for this chunk"
+                "the transcription server returned no speech for this chunk"
             );
-            return Err(MpvSttError::SttFailed(
-                "the transcription server returned no text".to_string(),
-            ));
+            srt.save(&output_path)?;
+            return Ok(());
         }
 
         srt.save(&output_path)?;
@@ -327,12 +326,17 @@ impl OpenAiBackend {
 }
 
 #[derive(Debug, Deserialize)]
+struct ResponseSegment {
+    start: Option<f64>,
+    end: Option<f64>,
+    #[serde(default)]
+    text: String,
+}
+
+#[derive(Debug)]
 struct Segment {
-    #[serde(default)]
     start: f64,
-    #[serde(default)]
     end: f64,
-    #[serde(default)]
     text: String,
 }
 
@@ -343,21 +347,15 @@ struct TranscriptionResponse {
     #[serde(default)]
     text: String,
     #[serde(default)]
-    segments: Vec<Segment>,
+    segments: Vec<ResponseSegment>,
     /// `verbose_json` only: the server's own measured audio duration.
     #[serde(default)]
     duration: Option<f64>,
 }
 
-/// Turn any OpenAI-compatible transcription response into subtitle segments.
-///
-/// `verbose_json` responses carry a `segments` array, which is used directly.
-/// Anything else — a plain `{"text": ...}` from a server that ignores or
-/// rejects `response_format`, or a server that returns no segments at all —
-/// falls back to a single subtitle covering the whole chunk (`chunk_ms`). Text
-/// without timings is still worth showing; a chunk with no text at all yields
-/// no entries, which the caller reports as a failure rather than writing an
-/// empty SRT over the user's existing subtitles.
+/// Turn an OpenAI-compatible response into validated, chunk-relative segments.
+/// Responses without usable segment timestamps cannot be aligned to speech and
+/// must not be spread over a guessed whole-chunk interval.
 fn parse_transcription(json: &[u8], chunk_ms: u64) -> Result<Vec<Segment>> {
     let resp: TranscriptionResponse =
         serde_json::from_slice(json).map_err(|e| MpvSttError::MalformedResponse {
@@ -368,27 +366,78 @@ fn parse_transcription(json: &[u8], chunk_ms: u64) -> Result<Vec<Segment>> {
             ),
         })?;
 
-    if resp.segments.iter().any(|s| !s.text.trim().is_empty()) {
-        return Ok(resp.segments);
+    // SRT timestamps are represented as milliseconds in u32 throughout this
+    // plugin; do not let a huge response overflow while converting seconds.
+    let chunk_duration_s = chunk_ms.min(u32::MAX as u64) as f64 / 1000.0;
+    let duration_s = resp
+        .duration
+        .filter(|duration| duration.is_finite() && *duration > 0.0)
+        .map(|duration| duration.min(chunk_duration_s))
+        .unwrap_or(chunk_duration_s);
+    let response_has_text = !resp.text.trim().is_empty()
+        || resp
+            .segments
+            .iter()
+            .any(|segment| !segment.text.trim().is_empty());
+
+    let mut segments = Vec::with_capacity(resp.segments.len());
+    let mut rejected_segments = 0usize;
+    for segment in resp.segments {
+        let text = segment.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+
+        let (Some(start), Some(end)) = (segment.start, segment.end) else {
+            rejected_segments += 1;
+            continue;
+        };
+        if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
+            rejected_segments += 1;
+            continue;
+        }
+
+        // A model can round its final segment a little past the WAV duration.
+        // Keep the part inside this audio chunk, but never move a segment that
+        // begins after the chunk back onto its final millisecond.
+        if start >= duration_s || end <= 0.0 {
+            rejected_segments += 1;
+            continue;
+        }
+        let end = end.min(duration_s);
+        if end <= start {
+            rejected_segments += 1;
+            continue;
+        }
+
+        segments.push(Segment {
+            start,
+            end,
+            text: text.to_string(),
+        });
     }
 
-    let text = resp.text.trim();
-    if text.is_empty() {
+    if rejected_segments > 0 {
+        warn!(
+            rejected_segments,
+            accepted_segments = segments.len(),
+            chunk_ms,
+            "discarded transcription segments with invalid or out-of-range timestamps"
+        );
+    }
+
+    segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+    if !segments.is_empty() {
+        return Ok(segments);
+    }
+
+    if !response_has_text {
         return Ok(Vec::new());
     }
 
-    // Prefer the server's own duration (verbose_json); otherwise the chunk's
-    // requested length is the best local estimate.
-    let end_s = resp
-        .duration
-        .filter(|d| *d > 0.0)
-        .unwrap_or(chunk_ms as f64 / 1000.0);
-
-    Ok(vec![Segment {
-        start: 0.0,
-        end: end_s,
-        text: text.to_string(),
-    }])
+    Err(MpvSttError::SttFailed(
+        "the transcription server returned text without valid segment timestamps; use a model/server that supports verbose_json segment timestamps".to_string(),
+    ))
 }
 
 fn normalize_server_url(raw: &str) -> String {
@@ -447,34 +496,23 @@ mod tests {
     }
 
     #[test]
-    fn plain_text_response_falls_back_to_one_segment() {
+    fn plain_text_response_without_timestamps_is_rejected() {
         let json = r#"{"text": "  你好世界  "}"#.as_bytes();
-        let segments = parse_transcription(json, 15_000).unwrap();
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].text, "你好世界");
-        assert_eq!(segments[0].start, 0.0);
-        assert_eq!(segments[0].end, 15.0);
+        assert!(parse_transcription(json, 15_000).is_err());
     }
 
     #[test]
-    fn empty_segments_fall_back_to_text_and_prefer_server_duration() {
+    fn empty_segments_with_text_are_rejected() {
         let json = r#"{"text": "auto 语言", "duration": 3.25, "segments": []}"#.as_bytes();
-        let segments = parse_transcription(json, 15_000).unwrap();
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].end, 3.25);
+        assert!(parse_transcription(json, 15_000).is_err());
     }
 
     #[test]
-    fn blank_segments_do_not_shadow_the_text_field() {
-        // Some servers return a segments array of empty entries; the text is
-        // the only usable content.
+    fn blank_segments_with_text_are_rejected() {
         let json =
             r#"{"text": "はじめまして", "segments": [{"start": 0.0, "end": 1.0, "text": "  "}]}"#
                 .as_bytes();
-        let segments = parse_transcription(json, 8_000).unwrap();
-        assert_eq!(segments.len(), 1);
-        assert_eq!(segments[0].text, "はじめまして");
-        assert_eq!(segments[0].end, 8.0);
+        assert!(parse_transcription(json, 8_000).is_err());
     }
 
     #[test]

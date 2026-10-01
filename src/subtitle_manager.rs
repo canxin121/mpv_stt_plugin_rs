@@ -111,6 +111,11 @@ impl SubtitleManager {
             .collect()
     }
 
+    /// Get every subtitle entry, ordered by its media start time.
+    pub fn all_entries(&self) -> Vec<(u32, SubtitleEntry)> {
+        self.entries.iter().map(|(k, v)| (*k, v.clone())).collect()
+    }
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

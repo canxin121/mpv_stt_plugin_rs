@@ -9,7 +9,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tracing::{Span, debug, error, info, trace, warn};
 
@@ -23,6 +23,13 @@ use crate::subtitle_manager::SubtitleManager;
 use crate::translate::{
     AsyncTranslationQueue, TranslationOutcome, TranslationTask, TranslatorConfig,
 };
+
+const SUBTITLE_TIMELINE_VERSION: u32 = 2;
+const TRANSCRIPTION_RETRY_BASE_SECS: u64 = 2;
+const TRANSLATION_RETRY_BASE_SECS: u64 = 2;
+const RATE_LIMIT_RETRY_BASE_SECS: u64 = 15;
+const RETRY_MAX_DELAY_SECS: u64 = 60;
+const TRANSLATION_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 
 struct TempPaths {
     _dir: TempDir,
@@ -76,6 +83,9 @@ struct TranslationCacheEntry {
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct CacheManifest {
+    /// Bump when subtitle timestamps can no longer be reused safely.
+    #[serde(default)]
+    timeline_version: u32,
     chunk_size_ms: u64,
     processed_chunks: Vec<u64>,
     translations: Vec<TranslationCacheEntry>,
@@ -128,7 +138,11 @@ fn key_binding_section(target: &str) -> String {
 struct TranscriptionJob {
     generation: u64,
     media_path: String,
+    chunk_start_ms: u64,
     audio_start_ms: u64,
+    /// Network `dump-cache` files may start before the requested chunk because
+    /// mpv seeks to a preceding keyframe and rebases the dump timestamps.
+    align_audio_to_chunk_end: bool,
     duration_ms: u64,
     wav_path: PathBuf,
     output_prefix: PathBuf,
@@ -179,27 +193,48 @@ impl TranscriptionWorker {
                     }
                     debug!(
                         media = %job.media_path,
-                        start_ms = job.audio_start_ms,
+                        chunk_start_ms = job.chunk_start_ms,
+                        requested_audio_start_ms = job.audio_start_ms,
+                        align_audio_to_chunk_end = job.align_audio_to_chunk_end,
                         "transcription job started"
                     );
 
-                    let result = worker_audio
-                        .extract_audio_segment(
+                    let result = (|| {
+                        let (extraction_start_ms, audio_end_ms) = if job.align_audio_to_chunk_end {
+                            let audio_end_ms =
+                                worker_audio.audio_end_relative_ms(job.media_path.as_str())?;
+                            let extraction_start_ms =
+                                audio_end_ms.checked_sub(job.duration_ms).ok_or_else(|| {
+                                    MpvSttError::AudioExtractionFailed(format!(
+                                        "dumped audio covers only {audio_end_ms}ms, shorter than the requested {}ms chunk",
+                                        job.duration_ms
+                                    ))
+                                })?;
+                            (extraction_start_ms, Some(audio_end_ms))
+                        } else {
+                            (job.audio_start_ms, None)
+                        };
+                        debug!(
+                            extraction_start_ms,
+                            audio_end_ms = ?audio_end_ms,
+                            duration_ms = job.duration_ms,
+                            "resolved the audio window inside the input"
+                        );
+                        worker_audio.extract_audio_segment(
                             job.media_path.as_str(),
                             job.wav_path.to_str().unwrap_or_default(),
-                            job.audio_start_ms,
+                            extraction_start_ms,
+                            job.duration_ms,
+                        )?;
+                        if worker_generation.load(Ordering::Acquire) != job.generation {
+                            return Err(MpvSttError::SttCancelled);
+                        }
+                        stt_runner.transcribe(
+                            job.wav_path.to_str().unwrap_or_default(),
+                            job.output_prefix.to_str().unwrap_or_default(),
                             job.duration_ms,
                         )
-                        .and_then(|()| {
-                            if worker_generation.load(Ordering::Acquire) != job.generation {
-                                return Err(MpvSttError::SttCancelled);
-                            }
-                            stt_runner.transcribe(
-                                job.wav_path.to_str().unwrap_or_default(),
-                                job.output_prefix.to_str().unwrap_or_default(),
-                                job.duration_ms,
-                            )
-                        });
+                    })();
                     let device_notice = stt_runner.take_device_notice();
 
                     let _ = result_sender.send(TranscriptionWorkerResult {
@@ -224,7 +259,9 @@ impl TranscriptionWorker {
     fn submit(
         &self,
         media_path: String,
+        chunk_start_ms: u64,
         audio_start_ms: u64,
+        align_audio_to_chunk_end: bool,
         duration_ms: u64,
         wav_path: PathBuf,
         output_prefix: PathBuf,
@@ -234,7 +271,9 @@ impl TranscriptionWorker {
         let job = TranscriptionJob {
             generation,
             media_path,
+            chunk_start_ms,
             audio_start_ms,
+            align_audio_to_chunk_end,
             duration_ms,
             wav_path,
             output_prefix,
@@ -300,22 +339,38 @@ struct PendingTranscription {
     span: Span,
 }
 
+struct ChunkRetryState {
+    start_ms: u64,
+    attempts: u32,
+    retry_at: Instant,
+}
+
+struct TranslationRetryState {
+    attempts: u32,
+    retry_at: Instant,
+}
+
 struct PluginState {
     config: Config,
     paths: TempPaths,
     transcription_worker: TranscriptionWorker,
     pending_transcription: Option<PendingTranscription>,
+    transcription_retry: Option<ChunkRetryState>,
     async_translation_queue: Option<AsyncTranslationQueue>,
     subtitle_manager: SubtitleManager,
     translation_cache: HashMap<u32, (String, String)>,
-    /// Cues the translation backend definitively failed on, so they are not
-    /// re-queued on every seek/chunk boundary. Cleared when the session is
-    /// restarted, when the cache is cleared, or when the user toggles
-    /// translation back on (an explicit "try again").
+    /// Cues transcribed during this process are known to contain original
+    /// speech only, even if the recognizer placed the text on multiple lines.
+    known_original_cues: HashSet<u32>,
+    /// Cues currently waiting for their translation retry cooldown to expire.
     failed_translations: HashSet<u32>,
-    /// Whether the current session has already told the user that translation
-    /// stopped working. Keeps a broken backend to one OSD message per session
-    /// instead of one per chunk.
+    /// Backoff state for cues whose last translation batch failed.
+    translation_retries: HashMap<u32, TranslationRetryState>,
+    /// Cues already submitted to the translation worker.
+    pending_translations: HashSet<u32>,
+    last_translation_scan: Option<Instant>,
+    /// Whether the current failure burst has already produced a translation
+    /// OSD, avoiding one message per failed cue.
     translation_failure_reported: bool,
     processed_chunks: HashSet<u64>,
     network_cache: Option<CachePaths>,
@@ -375,10 +430,15 @@ impl PluginState {
             paths,
             transcription_worker,
             pending_transcription: None,
+            transcription_retry: None,
             async_translation_queue,
             subtitle_manager: SubtitleManager::new(),
             translation_cache: HashMap::new(),
+            known_original_cues: HashSet::new(),
             failed_translations: HashSet::new(),
+            translation_retries: HashMap::new(),
+            pending_translations: HashSet::new(),
+            last_translation_scan: None,
             translation_failure_reported: false,
             processed_chunks: HashSet::new(),
             network_cache: None,
@@ -447,9 +507,11 @@ impl PluginState {
         if let Some(queue) = self.async_translation_queue.as_ref() {
             queue.cancel_inflight();
         }
+        self.pending_translations.clear();
+        self.last_translation_scan = None;
     }
 
-    /// Whether this cue's translation has already been given up on.
+    /// Whether this cue is currently waiting for its retry cooldown.
     fn translation_failed(&self, start_ms: u32) -> bool {
         self.failed_translations.contains(&start_ms)
     }
@@ -460,23 +522,104 @@ impl PluginState {
         if !self.failed_translations.is_empty() {
             debug!(
                 cues = self.failed_translations.len(),
-                "clearing the failed-translation records; every cue may be retried"
+                "clearing translation retry state; every cue may be retried"
             );
         }
         self.failed_translations.clear();
+        self.translation_retries.clear();
         self.translation_failure_reported = false;
+        self.last_translation_scan = None;
     }
 
-    fn enqueue_missing_translations_for_chunk(&mut self, chunk_start_ms: u64) {
-        let Some(queue) = self.async_translation_queue.as_ref() else {
-            return;
-        };
+    fn retry_delay_secs(attempts: u32, base_secs: u64) -> u64 {
+        let shift = attempts.saturating_sub(1).min(6);
+        base_secs
+            .saturating_mul(1_u64 << shift)
+            .min(RETRY_MAX_DELAY_SECS)
+    }
 
-        let chunk_end = chunk_start_ms.saturating_add(self.active_chunk_size());
-        let entries = self.subtitle_manager.entries_in_range(
-            chunk_start_ms as u32,
-            chunk_end.min(u64::from(u32::MAX)) as u32,
+    fn defer_transcription_retry(&mut self, start_ms: u64, reason: &str) -> Duration {
+        self.defer_transcription_retry_with_base(start_ms, reason, TRANSCRIPTION_RETRY_BASE_SECS)
+    }
+
+    fn defer_transcription_retry_with_base(
+        &mut self,
+        start_ms: u64,
+        reason: &str,
+        base_secs: u64,
+    ) -> Duration {
+        let previous_attempts = self
+            .transcription_retry
+            .as_ref()
+            .filter(|retry| retry.start_ms == start_ms)
+            .map(|retry| retry.attempts)
+            .unwrap_or(0);
+        let attempts = previous_attempts.saturating_add(1);
+        let delay = Duration::from_secs(Self::retry_delay_secs(attempts, base_secs));
+        self.transcription_retry = Some(ChunkRetryState {
+            start_ms,
+            attempts,
+            retry_at: Instant::now() + delay,
+        });
+        self.session_failures = self.session_failures.saturating_add(1);
+        debug!(
+            start_ms,
+            attempts,
+            retry_in_secs = delay.as_secs(),
+            reason,
+            "transcription chunk failed; scheduling an automatic retry"
         );
+        delay
+    }
+
+    fn transcription_retry_waiting(&mut self) -> bool {
+        let Some(retry) = self.transcription_retry.as_ref() else {
+            return false;
+        };
+        if retry.start_ms != self.current_pos_ms {
+            self.transcription_retry = None;
+            return false;
+        }
+
+        let remaining = retry.retry_at.saturating_duration_since(Instant::now());
+        if !remaining.is_zero() {
+            trace!(
+                start_ms = retry.start_ms,
+                retry_in_ms = remaining.as_millis() as u64,
+                "waiting for the transcription retry backoff"
+            );
+            return true;
+        }
+        false
+    }
+
+    fn clear_transcription_retry(&mut self, start_ms: u64) {
+        if self
+            .transcription_retry
+            .as_ref()
+            .is_some_and(|retry| retry.start_ms == start_ms)
+        {
+            self.transcription_retry = None;
+        }
+    }
+
+    /// Periodically inspect every known cue, including subtitles restored from
+    /// cache, and submit any untranslated cue whose retry delay has elapsed.
+    fn enqueue_missing_translations(&mut self, force: bool) {
+        if !self.translate_enabled {
+            return;
+        }
+        let now = Instant::now();
+        if !force
+            && self
+                .last_translation_scan
+                .is_some_and(|last| now.duration_since(last) < TRANSLATION_SCAN_INTERVAL)
+        {
+            return;
+        }
+        self.last_translation_scan = Some(now);
+
+        let entries = self.subtitle_manager.all_entries();
 
         if entries.is_empty() {
             return;
@@ -484,7 +627,13 @@ impl PluginState {
 
         let mut pending_tasks = Vec::new();
         let mut already_translated = 0usize;
-        let mut skipped_failed = 0usize;
+        let mut waiting_retry = 0usize;
+        let retry_chunk_end_ms = self.transcription_retry.as_ref().map(|retry| {
+            retry
+                .start_ms
+                .saturating_add(self.active_chunk_size())
+                .min(u64::from(u32::MAX)) as u32
+        });
 
         for (start_ms, entry) in entries {
             let original = entry.text.trim();
@@ -492,23 +641,53 @@ impl PluginState {
                 continue;
             }
 
-            if self.translation_failed(start_ms) {
-                skipped_failed += 1;
+            // Do not dispatch translations from a chunk whose transcription
+            // result has not yet been successfully merged and saved.
+            if self.transcription_retry.as_ref().is_some_and(|retry| {
+                u64::from(start_ms) >= retry.start_ms
+                    && retry_chunk_end_ms.is_some_and(|end_ms| start_ms < end_ms)
+            }) {
                 continue;
             }
 
-            if let Some((_, translated)) = self.translation_cache.get(&start_ms) {
+            if self.pending_translations.contains(&start_ms) {
+                continue;
+            }
+
+            if self.translation_failed(start_ms) {
+                let retry_due = self
+                    .translation_retries
+                    .get(&start_ms)
+                    .map_or(true, |retry| retry.retry_at <= now);
+                if !retry_due {
+                    waiting_retry += 1;
+                    continue;
+                }
+                self.failed_translations.remove(&start_ms);
+            }
+
+            let cached_translation = self
+                .translation_cache
+                .get(&start_ms)
+                .map(|(_, translated)| translated.clone());
+            if let Some(translated) = cached_translation {
                 if !translated.trim().is_empty() {
                     self.subtitle_manager
-                        .update_translation(start_ms, translated);
+                        .update_translation(start_ms, &translated);
+                    self.failed_translations.remove(&start_ms);
+                    self.translation_retries.remove(&start_ms);
                     already_translated += 1;
                     continue;
                 }
             }
 
             if SubtitleManager::text_has_translation(&entry.text) {
-                already_translated += 1;
-                continue;
+                if !self.known_original_cues.contains(&start_ms) {
+                    self.failed_translations.remove(&start_ms);
+                    self.translation_retries.remove(&start_ms);
+                    already_translated += 1;
+                    continue;
+                }
             }
 
             pending_tasks.push(TranslationTask {
@@ -517,22 +696,63 @@ impl PluginState {
             });
         }
 
-        if skipped_failed > 0 {
-            trace!(
-                skipped_failed,
-                "not re-queueing cues whose translation already failed"
-            );
-        }
-
         if !pending_tasks.is_empty() {
             trace!(
                 queued = pending_tasks.len(),
-                already_translated, "re-queueing missing translations"
+                already_translated, waiting_retry, "queueing missing translations"
             );
+            if self.async_translation_queue.is_none() {
+                return;
+            }
             for task in pending_tasks {
-                queue.submit(task);
+                let start_ms = task.start_ms;
+                let submitted = self
+                    .async_translation_queue
+                    .as_ref()
+                    .is_some_and(|queue| queue.submit(task));
+                if submitted {
+                    self.pending_translations.insert(start_ms);
+                } else {
+                    self.defer_translation_retry(start_ms, "translation worker is unavailable");
+                }
             }
         }
+    }
+
+    fn defer_translation_retry(&mut self, start_ms: u32, reason: &str) -> Duration {
+        self.defer_translation_retry_with_base(start_ms, reason, TRANSLATION_RETRY_BASE_SECS)
+    }
+
+    fn defer_translation_retry_with_base(
+        &mut self,
+        start_ms: u32,
+        reason: &str,
+        base_secs: u64,
+    ) -> Duration {
+        self.pending_translations.remove(&start_ms);
+        let attempts = self
+            .translation_retries
+            .get(&start_ms)
+            .map(|retry| retry.attempts)
+            .unwrap_or(0)
+            .saturating_add(1);
+        let delay = Duration::from_secs(Self::retry_delay_secs(attempts, base_secs));
+        self.failed_translations.insert(start_ms);
+        self.translation_retries.insert(
+            start_ms,
+            TranslationRetryState {
+                attempts,
+                retry_at: Instant::now() + delay,
+            },
+        );
+        debug!(
+            start_ms,
+            attempts,
+            retry_in_secs = delay.as_secs(),
+            reason,
+            "translation failed; scheduling an automatic retry"
+        );
+        delay
     }
 
     fn toggle_stt(&mut self, client: &mut Handle) {
@@ -563,10 +783,10 @@ impl PluginState {
         );
         if self.translate_enabled {
             // Turning translation back on is an explicit retry: forget earlier
-            // give-ups and offer the untranslated cues to the backend again,
+            // backoff records and offer all untranslated cues to the backend,
             // which is how the user recovers after starting the gateway.
             self.reset_translation_failures();
-            self.enqueue_missing_translations_for_chunk(self.current_pos_ms);
+            self.enqueue_missing_translations(true);
         }
     }
 
@@ -598,6 +818,7 @@ impl PluginState {
         // Drop in-memory state so a fresh playback re-transcribes from scratch.
         let chunk_entries = self.translation_cache.len();
         self.translation_cache.clear();
+        self.cancel_translation_inflight();
         self.reset_translation_failures();
         self.processed_chunks.clear();
 
@@ -615,45 +836,62 @@ impl PluginState {
         &mut self,
         media_path: String,
         audio_start_ms: u64,
+        align_audio_to_chunk_end: bool,
         duration_ms: u64,
         subtitle_path: Option<PathBuf>,
     ) -> bool {
         if self.pending_transcription.is_some() {
             trace!(
-                start_ms = audio_start_ms,
+                start_ms = self.current_pos_ms,
                 "chunk not submitted: the previous one is still running"
             );
             return false;
         }
 
         let output_prefix = PathBuf::from(format!("{}_append", self.paths.tmp_sub.display()));
+        // An earlier attempt may have left a partial result behind. Never let
+        // the next attempt merge an SRT file it did not produce itself.
+        self.paths.cleanup_intermediate_subs();
         // The chunk span is created here, on the event thread, and travels with
         // the job so the worker's extractor/STT logs land inside it.
+        let chunk_start_ms = self.current_pos_ms;
         let span = logging::chunk_span(
             self.session_id,
             self.chunk_seq,
-            audio_start_ms,
+            chunk_start_ms,
             duration_ms,
             self.transcription_worker.generation(),
         );
         let Some(generation) = self.transcription_worker.submit(
             media_path,
+            chunk_start_ms,
             audio_start_ms,
+            align_audio_to_chunk_end,
             duration_ms,
             self.paths.tmp_wav.clone(),
             output_prefix,
             span.clone(),
         ) else {
+            let start_ms = self.current_pos_ms;
+            let delay =
+                self.defer_transcription_retry(start_ms, "transcription worker is unavailable");
             error!(
-                display = %logging::osd_line("the transcription worker is unavailable; restart playback"),
-                "transcription worker is unavailable; the plugin cannot process audio"
+                start_ms,
+                retry_in_secs = delay.as_secs(),
+                display = %logging::osd_line(&format!(
+                    "STT worker unavailable; retrying in {}s",
+                    delay.as_secs()
+                )),
+                "transcription worker is unavailable; keeping the session active"
             );
             return false;
         };
         self.chunk_seq += 1;
 
         debug!(
-            start_ms = audio_start_ms,
+            start_ms = chunk_start_ms,
+            audio_start_ms,
+            align_audio_to_chunk_end,
             dur_ms = duration_ms,
             gen = generation,
             "chunk submitted"
@@ -672,12 +910,15 @@ impl PluginState {
         let Some(worker_result) = self.transcription_worker.try_recv() else {
             return;
         };
+        let Some(pending_ref) = self.pending_transcription.as_ref() else {
+            return;
+        };
+        if worker_result.generation != pending_ref.generation {
+            return;
+        }
         let Some(pending) = self.pending_transcription.take() else {
             return;
         };
-        if worker_result.generation != pending.generation {
-            return;
-        }
 
         // Re-enter the chunk span for the second half of the round trip: the
         // merge, translation hand-off and SRT write belong to the same chunk as
@@ -698,6 +939,7 @@ impl PluginState {
                     pending.start_ms,
                     worker_result.device_notice,
                 ) {
+                    self.clear_transcription_retry(pending.start_ms);
                     self.current_pos_ms = pending.start_ms.saturating_add(pending.duration_ms);
                     if !self.subs_loaded {
                         let main_srt = pending
@@ -712,6 +954,20 @@ impl PluginState {
                             &format!("STT: {}", Self::format_progress(self.current_pos_ms)),
                         ]);
                     }
+                } else {
+                    let delay = self.defer_transcription_retry(
+                        pending.start_ms,
+                        "could not merge or save the subtitle chunk",
+                    );
+                    info!(
+                        start_ms = pending.start_ms,
+                        retry_in_secs = delay.as_secs(),
+                        display = %logging::osd_line(&format!(
+                            "字幕写入失败，{} 秒后重试",
+                            delay.as_secs()
+                        )),
+                        "could not apply the transcription result; keeping the session active"
+                    );
                 }
             }
             Err(MpvSttError::SttCancelled | MpvSttError::AudioExtractionCancelled) => {
@@ -719,15 +975,42 @@ impl PluginState {
                 self.paths.cleanup_intermediate_subs();
             }
             Err(err) => {
-                self.session_failures += 1;
-                // The OSD gets the short form, the log keeps the cause chain.
+                self.current_pos_ms = pending.start_ms;
+                if matches!(
+                    &err,
+                    MpvSttError::AudioExtractionFailed(_)
+                        | MpvSttError::ProcessFailed(_)
+                        | MpvSttError::ProcessTimeout(_)
+                        | MpvSttError::Wav(_)
+                ) && matches!(&self.mode, Some(ProcessingMode::Network))
+                {
+                    // A retained network dump that could not be decoded will
+                    // not improve on another attempt; let mpv create a fresh
+                    // dump from its cache if the range is still available.
+                    let _ = std::fs::remove_file(&self.paths.tmp_cache);
+                }
+                let base_secs = if matches!(&err, MpvSttError::HttpStatus { status: 429, .. }) {
+                    RATE_LIMIT_RETRY_BASE_SECS
+                } else {
+                    TRANSCRIPTION_RETRY_BASE_SECS
+                };
+                let delay = self.defer_transcription_retry_with_base(
+                    pending.start_ms,
+                    &err.to_string(),
+                    base_secs,
+                );
                 error!(
+                    start_ms = pending.start_ms,
                     error = %err,
                     cause = %logging::err_chain(&err),
-                    display = %logging::osd_line(&format!("STT failed: {err}")),
-                    "chunk failed; ending the session"
+                    retry_in_secs = delay.as_secs(),
+                    display = %logging::osd_line(&format!(
+                        "STT failed; retrying in {}s: {err}",
+                        delay.as_secs()
+                    )),
+                    "chunk failed; keeping the session active"
                 );
-                self.stop_transcription();
+                self.paths.cleanup_intermediate_subs();
             }
         }
     }
@@ -740,6 +1023,8 @@ impl PluginState {
         self.session_failures = 0;
         self.session_started = Some(Instant::now());
         self.transcription_complete = false;
+        self.transcription_retry = None;
+        self.last_translation_scan = None;
 
         // Get current position
         let time_pos: f64 = client.get_property("time-pos").unwrap_or(0.0);
@@ -875,6 +1160,7 @@ impl PluginState {
                     self.schedule_transcription(
                         path.clone(),
                         self.current_pos_ms,
+                        false,
                         self.chunk_dur,
                         Some(subtitle_path.clone()),
                     );
@@ -916,6 +1202,7 @@ impl PluginState {
                     None => None,
                 };
                 self.process_translation_results(client, subtitle_path.as_deref());
+                self.enqueue_missing_translations(false);
             }
             return;
         }
@@ -958,20 +1245,35 @@ impl PluginState {
 
         // Check for completed translations from async queue
         self.process_translation_results(client, subtitle_path.as_deref());
+        self.enqueue_missing_translations(false);
+
+        if self.transcription_retry_waiting() {
+            return;
+        }
+        let retry_dump_available = self
+            .transcription_retry
+            .as_ref()
+            .is_some_and(|retry| retry.start_ms == self.current_pos_ms)
+            && std::fs::metadata(&self.paths.tmp_cache).is_ok_and(|metadata| metadata.len() > 0);
 
         // Get cache end time
         let cache_end_sec: Option<f64> = client.get_property("demuxer-cache-time").ok();
-        if cache_end_sec.is_none() {
+        if cache_end_sec.is_none() && !retry_dump_available {
             trace!("demuxer cache has not reported a time yet");
             return; // Cache not ready yet
         }
-        let cache_end_ms = (cache_end_sec.unwrap() * 1000.0) as u64;
+        let cache_end_ms = cache_end_sec
+            .map(|cache_end| (cache_end * 1000.0) as u64)
+            .unwrap_or_else(|| {
+                self.current_pos_ms
+                    .saturating_add(self.network_chunk_size())
+            });
         let available_ms = cache_end_ms.saturating_sub(self.current_pos_ms);
         let chunk_ms = self.network_chunk_size();
 
-        if available_ms < chunk_ms {
+        if available_ms < chunk_ms && !retry_dump_available {
             trace!(
-                needed_ms = self.current_pos_ms + chunk_ms,
+                needed_ms = self.current_pos_ms.saturating_add(chunk_ms),
                 cached_ms = cache_end_ms,
                 "waiting for the demuxer cache to grow"
             );
@@ -1014,7 +1316,7 @@ impl PluginState {
             }
         }
 
-        if chunk_end_ms > cache_end_ms {
+        if chunk_end_ms > cache_end_ms && !retry_dump_available {
             trace!(
                 needed_ms = chunk_end_ms,
                 cached_ms = cache_end_ms,
@@ -1041,6 +1343,7 @@ impl PluginState {
 
         // Check for completed translations from async queue
         self.process_translation_results(client, Some(subtitle_path));
+        self.enqueue_missing_translations(false);
 
         // Calculate remaining time
         let time_left = if file_length_ms > self.current_pos_ms {
@@ -1067,6 +1370,10 @@ impl PluginState {
                 if self.current_pos_ms >= file_length_ms {
                     return;
                 }
+            }
+
+            if self.transcription_retry_waiting() {
+                return;
             }
 
             let lookahead_limit_ms = local_chunk_size
@@ -1200,11 +1507,22 @@ impl PluginState {
         if !forward {
             self.subtitle_manager
                 .remove_after(new_pos.min(u64::from(u32::MAX)) as u32);
+            self.known_original_cues
+                .retain(|start_ms| u64::from(*start_ms) <= new_pos);
+            // The seek target is chunk-aligned. Its cues were removed above
+            // unless they start exactly at the boundary, so process that chunk
+            // again along with every later chunk.
+            self.processed_chunks.retain(|start_ms| *start_ms < new_pos);
         }
 
-        if self.is_chunk_processed(new_pos) {
-            self.enqueue_missing_translations_for_chunk(new_pos);
+        self.transcription_retry = None;
+        if !forward {
+            self.failed_translations
+                .retain(|start_ms| u64::from(*start_ms) <= new_pos);
+            self.translation_retries
+                .retain(|start_ms, _| u64::from(*start_ms) <= new_pos);
         }
+        self.enqueue_missing_translations(true);
     }
 
     /// Process one chunk from network cache
@@ -1214,13 +1532,42 @@ impl PluginState {
         chunk_ms: u64,
         subtitle_path: Option<&Path>,
     ) -> bool {
+        // Keep the last network dump while retrying the same chunk. A live
+        // stream may evict that media range from mpv's cache before a long
+        // backoff expires; the retained dump lets us retry the exact audio.
+        if self
+            .transcription_retry
+            .as_ref()
+            .is_some_and(|retry| retry.start_ms == self.current_pos_ms)
+            && std::fs::metadata(&self.paths.tmp_cache).is_ok_and(|metadata| metadata.len() > 0)
+        {
+            return self.schedule_transcription(
+                self.paths.tmp_cache.to_string_lossy().into_owned(),
+                0,
+                true,
+                chunk_ms,
+                subtitle_path.map(Path::to_path_buf),
+            );
+        }
+
         // Dump cache
         let start_sec = self.current_pos_ms as f64 / 1000.0;
-        let end_sec = (self.current_pos_ms + chunk_ms) as f64 / 1000.0;
+        let end_sec = self.current_pos_ms.saturating_add(chunk_ms) as f64 / 1000.0;
+        if !Self::single_cache_range_covers(client, start_sec, end_sec) {
+            trace!(
+                start_sec,
+                end_sec, "waiting for one continuous demuxer cache range to cover the chunk"
+            );
+            return false;
+        }
         trace!(
             start_sec,
             end_sec, "dumping the demuxer cache to a temp file"
         );
+
+        // Never mistake an older chunk's retained dump for this request if
+        // mpv fails to create a new cache file.
+        let _ = std::fs::remove_file(&self.paths.tmp_cache);
 
         let dump_result = client.command(&[
             "dump-cache",
@@ -1230,9 +1577,20 @@ impl PluginState {
         ]);
 
         if dump_result.is_err() {
+            let _ = std::fs::remove_file(&self.paths.tmp_cache);
+            let delay = self.defer_transcription_retry(
+                self.current_pos_ms,
+                "mpv refused to dump the network cache",
+            );
             error!(
                 start_sec,
-                end_sec, "mpv refused to dump the demuxer cache; this chunk cannot be transcribed"
+                end_sec,
+                retry_in_secs = delay.as_secs(),
+                display = %logging::osd_line(&format!(
+                    "无法读取网络音频，{} 秒后重试",
+                    delay.as_secs()
+                )),
+                "mpv refused to dump the demuxer cache; keeping the session active"
             );
             return false;
         }
@@ -1240,9 +1598,54 @@ impl PluginState {
         self.schedule_transcription(
             self.paths.tmp_cache.to_string_lossy().into_owned(),
             0,
+            true,
             chunk_ms,
             subtitle_path.map(Path::to_path_buf),
         )
+    }
+
+    /// `dump-cache` concatenates every cached range that intersects its
+    /// request. If a request crosses a gap or overlapping ranges, mpv may
+    /// rebase discontinuous packets into one output timeline. Such a dump has
+    /// no single reliable offset back to the source media.
+    fn single_cache_range_covers(client: &mut Handle, start_sec: f64, end_sec: f64) -> bool {
+        let Ok(mpv_client::Node::Map(state)) =
+            client.get_property::<mpv_client::Node>("demuxer-cache-state")
+        else {
+            return false;
+        };
+        let Some(mpv_client::Node::Array(ranges)) = state.get("seekable-ranges") else {
+            return false;
+        };
+
+        let mut intersecting = 0usize;
+        let mut request_is_covered = false;
+        let to_seconds = |value: &mpv_client::Node| match value {
+            mpv_client::Node::Double(value) => Some(*value),
+            mpv_client::Node::Int(value) => Some(*value as f64),
+            _ => None,
+        };
+        for range in ranges {
+            let mpv_client::Node::Map(range) = range else {
+                continue;
+            };
+            let (Some(start), Some(end)) = (range.get("start"), range.get("end")) else {
+                continue;
+            };
+            let (Some(range_start), Some(range_end)) = (to_seconds(start), to_seconds(end)) else {
+                continue;
+            };
+            if !range_start.is_finite() || !range_end.is_finite() {
+                continue;
+            }
+            if range_end <= start_sec || range_start >= end_sec {
+                continue;
+            }
+            intersecting += 1;
+            request_is_covered = range_start <= start_sec && range_end >= end_sec;
+        }
+
+        intersecting == 1 && request_is_covered
     }
 
     /// Process one chunk from local file
@@ -1250,6 +1653,7 @@ impl PluginState {
         self.schedule_transcription(
             media_path.to_string(),
             self.current_pos_ms,
+            false,
             self.chunk_dur,
             Some(subtitle_path.to_path_buf()),
         )
@@ -1310,66 +1714,32 @@ impl PluginState {
             }
         };
         self.subtitle_manager.add_from_srt(&srt_file);
-        self.mark_chunk_processed(chunk_start_ms);
+        for entry in &srt_file.entries {
+            let start_ms = Self::timestamp_to_millis(entry.start_time);
+            if !entry.text.trim().is_empty() {
+                self.known_original_cues.insert(start_ms);
+            }
+        }
         debug!(
             entries = srt_file.entries.len(),
             total = self.subtitle_manager.len(),
             "subtitles merged"
         );
 
-        let mut pending_tasks = Vec::new();
-        let mut already_translated = 0usize;
-        let mut skipped_failed = 0usize;
-
-        for entry in &srt_file.entries {
-            let original = entry.text.trim();
-            if original.is_empty() {
-                continue;
-            }
-            let start_ms = Self::timestamp_to_millis(entry.start_time);
-            if SubtitleManager::text_has_translation(&entry.text) {
-                already_translated += 1;
-                continue;
-            }
-            // Already attempted and given up on (e.g. this session restarted
-            // mid-file, or the seek path re-queued this chunk): the original is
-            // on screen and stays there rather than being retried forever.
-            if self.translation_failed(start_ms) {
-                skipped_failed += 1;
-                continue;
-            }
-
-            pending_tasks.push(TranslationTask {
-                start_ms,
-                text: entry.text.clone(),
-            });
-        }
-
+        let already_processed = self.is_chunk_processed(chunk_start_ms);
+        self.mark_chunk_processed(chunk_start_ms);
         if !self.save_subs(client, &main_srt) {
+            if !already_processed {
+                self.processed_chunks.remove(&chunk_start_ms);
+            }
             return false;
         }
 
-        // Translate using async translation queue (Ctrl+Shift+t toggles translate_enabled).
-        // Purely additive: the originals are already saved above, so nothing
-        // here can take them away.
-        if self.translate_enabled && !pending_tasks.is_empty() {
-            if let Some(ref queue) = self.async_translation_queue {
-                let queued = pending_tasks.len();
-                for task in pending_tasks {
-                    queue.submit(task);
-                }
-                debug!(
-                    queued,
-                    already_translated, skipped_failed, "submitted cues for translation"
-                );
-            }
-        } else if !self.translate_enabled && !pending_tasks.is_empty() {
-            debug!(
-                cues = pending_tasks.len(),
-                "translation is off; keeping the original text"
-            );
-        } else if already_translated > 0 {
-            debug!(already_translated, "every cue already had a translation");
+        // Only a successfully persisted chunk counts as complete. Scanning all
+        // entries also catches untranslated cues restored from an SRT cache.
+        if self.translate_enabled {
+            self.last_translation_scan = None;
+            self.enqueue_missing_translations(true);
         }
 
         // Keep only the main subtitle file on disk during playback to reduce clutter.
@@ -1406,13 +1776,9 @@ impl PluginState {
         );
     }
 
-    /// Process completed translation outcomes from the async queue.
-    ///
-    /// Translations are merged into the subtitle text. Give-ups are recorded
-    /// instead, so the cue is neither retried forever nor silently lost: the
-    /// original line stays on screen, and the user is told once that
-    /// translation is not coming. Nothing here can affect the STT session —
-    /// a dead translation backend leaves subtitles working and untranslated.
+    /// Process completed translation outcomes from the async queue. A failed
+    /// batch enters a per-cue cooldown; the periodic missing-translation scan
+    /// will submit it again after the backoff expires.
     fn process_translation_results(&mut self, client: &mut Handle, subtitle_path: Option<&Path>) {
         let Some(ref queue) = self.async_translation_queue else {
             return;
@@ -1429,10 +1795,15 @@ impl PluginState {
         let mut translated = 0usize;
         let mut failed = 0usize;
         let mut last_reason = String::new();
+        let mut last_retry_secs = 0u64;
 
         for outcome in outcomes {
             match outcome {
                 TranslationOutcome::Translated(result) => {
+                    self.pending_translations.remove(&result.start_ms);
+                    self.failed_translations.remove(&result.start_ms);
+                    self.translation_retries.remove(&result.start_ms);
+                    self.known_original_cues.remove(&result.start_ms);
                     self.translation_cache.insert(
                         result.start_ms,
                         (result.original.clone(), result.translated.clone()),
@@ -1443,35 +1814,44 @@ impl PluginState {
                     translated += 1;
                 }
                 TranslationOutcome::Failed(failure) => {
-                    warn!(
+                    self.pending_translations.remove(&failure.start_ms);
+                    let delay = self.defer_translation_retry_with_base(
+                        failure.start_ms,
+                        &failure.cause,
+                        failure.retry_base_secs,
+                    );
+                    debug!(
                         start_ms = failure.start_ms,
                         cause = %failure.cause,
                         reason = %failure.reason,
-                        "giving up on this cue's translation; the original stays on screen"
+                        retry_in_secs = delay.as_secs(),
+                        "translation batch failed; the original stays on screen while retry is scheduled"
                     );
-                    // Remembering the failure is what keeps it from being
-                    // re-queued on every seek or chunk boundary.
-                    self.failed_translations.insert(failure.start_ms);
                     failed += 1;
                     last_reason = failure.reason;
+                    last_retry_secs = delay.as_secs();
                 }
             }
         }
         trace!(translated, failed, "translation outcomes applied");
+        if translated > 0 {
+            self.translation_failure_reported = false;
+        }
+        self.last_translation_scan = None;
 
         if failed > 0 {
             // The reason is worth seeing, but a backend that is down fails
-            // every cue, so say it once per session and keep the count in the
-            // log instead of on screen.
+            // every cue, so keep the OSD to one message per failure burst.
             if !self.translation_failure_reported {
                 self.translation_failure_reported = true;
                 info!(
                     failed,
                     reason = %last_reason,
+                    retry_in_secs = last_retry_secs,
                     display = %logging::osd_line(&format!(
-                        "翻译失败 ({failed} 条), 仅显示原文: {last_reason}"
+                        "翻译暂时失败 ({failed} 条)，{last_retry_secs} 秒后自动重试: {last_reason}"
                     )),
-                    "translation backend is not answering"
+                    "translation backend failed; retries remain scheduled"
                 );
             }
         }
@@ -1504,8 +1884,8 @@ impl PluginState {
     }
 
     /// Stop the current media/transcription session while keeping the plugin
-    /// alive. This path is used by the toggle, EndFile, completed media and
-    /// recoverable STT errors, so it must remain restartable.
+    /// alive. This path is used by the toggle, EndFile, and media changes, so
+    /// it must remain restartable.
     fn stop_transcription(&mut self) {
         // Report inside the session span before dropping it, so the summary
         // carries the session id and media it belongs to.
@@ -1529,6 +1909,7 @@ impl PluginState {
         self.chunk_seq = 0;
         self.session_failures = 0;
         self.cached_subtitle_path = None;
+        self.transcription_retry = None;
 
         self.running = false;
         self.transcription_worker.cancel_inflight();
@@ -1536,13 +1917,12 @@ impl PluginState {
 
         // Cancel tasks belonging to this media, but keep the worker alive so
         // Ctrl+Shift+S and the next file can start a fresh session.
-        if let Some(queue) = self.async_translation_queue.as_ref() {
-            queue.cancel_inflight();
-        }
+        self.cancel_translation_inflight();
 
         self.paths.cleanup();
         self.subtitle_manager.clear();
         self.translation_cache.clear();
+        self.known_original_cues.clear();
         self.reset_translation_failures();
         self.processed_chunks.clear();
         self.network_cache = None;
@@ -1645,6 +2025,35 @@ impl PluginState {
             return false;
         }
 
+        // Network subtitle files are plugin-owned caches. If their manifest
+        // predates a timeline fix, do not load the old cues or treat them as
+        // completed chunks; the next successful chunk will rewrite the cache.
+        let manifest = if let Some(path) = manifest_path {
+            match self.load_cache_manifest(path) {
+                Some(manifest) if manifest.timeline_version == SUBTITLE_TIMELINE_VERSION => {
+                    Some(manifest)
+                }
+                Some(manifest) => {
+                    warn!(
+                        cached_version = manifest.timeline_version,
+                        current_version = SUBTITLE_TIMELINE_VERSION,
+                        path = %srt_path.display(),
+                        "ignoring network subtitles produced with an older timeline"
+                    );
+                    return false;
+                }
+                None => {
+                    debug!(
+                        path = %srt_path.display(),
+                        "ignoring network subtitles without a current timeline manifest"
+                    );
+                    return false;
+                }
+            }
+        } else {
+            None
+        };
+
         let srt_file = match SrtFile::parse(srt_path) {
             Ok(srt) => srt,
             Err(err) => {
@@ -1660,7 +2069,8 @@ impl PluginState {
 
         self.subtitle_manager.clear();
         self.translation_cache.clear();
-        // A fresh media/session: earlier give-ups say nothing about this one.
+        self.known_original_cues.clear();
+        // A fresh media/session: earlier retry cooldowns say nothing about it.
         self.reset_translation_failures();
         self.processed_chunks.clear();
         self.subtitle_manager.add_from_srt(&srt_file);
@@ -1672,18 +2082,16 @@ impl PluginState {
             self.processed_chunks.insert(chunk_start);
         }
 
-        if let Some(path) = manifest_path {
-            if let Some(manifest) = self.load_cache_manifest(path) {
-                if manifest.chunk_size_ms == chunk_size {
-                    for chunk in manifest.processed_chunks {
-                        self.processed_chunks.insert(chunk);
-                    }
+        if let Some(manifest) = manifest {
+            if manifest.chunk_size_ms == chunk_size {
+                for chunk in manifest.processed_chunks {
+                    self.processed_chunks.insert(chunk);
                 }
-                for entry in manifest.translations {
-                    if !entry.translated.trim().is_empty() {
-                        self.translation_cache
-                            .insert(entry.start_ms, (entry.original, entry.translated));
-                    }
+            }
+            for entry in manifest.translations {
+                if !entry.translated.trim().is_empty() {
+                    self.translation_cache
+                        .insert(entry.start_ms, (entry.original, entry.translated));
                 }
             }
         }
@@ -1704,7 +2112,7 @@ impl PluginState {
                 debug!(
                     error = %err,
                     path = %path.display(),
-                    "no usable cache manifest; deriving progress from the subtitles"
+                    "no usable cache manifest"
                 );
                 return None;
             }
@@ -1715,7 +2123,7 @@ impl PluginState {
                 warn!(
                     error = %err,
                     path = %path.display(),
-                    "cache manifest is unreadable; deriving progress from the subtitles"
+                    "cache manifest is unreadable"
                 );
                 None
             }
@@ -1741,6 +2149,7 @@ impl PluginState {
             .collect();
 
         let manifest = CacheManifest {
+            timeline_version: SUBTITLE_TIMELINE_VERSION,
             chunk_size_ms: self.network_chunk_size(),
             processed_chunks,
             translations,
@@ -2148,18 +2557,24 @@ mod tests {
         config
     }
 
-    /// A cue whose translation was given up on must not be offered to the
-    /// backend again, and the user must be able to retry explicitly (toggle /
-    /// clear cache) once the backend is back.
+    /// Failed cues are held during their backoff, and an explicit reset lets
+    /// the user immediately retry after correcting the translation backend.
     #[test]
-    fn failed_translations_are_not_requeued_until_explicitly_reset() {
+    fn translation_retry_state_can_be_reset_explicitly() {
         let mut state = PluginState::new(test_config()).unwrap();
 
         assert!(!state.translation_failed(1_000));
         state.failed_translations.insert(1_000);
+        state.translation_retries.insert(
+            1_000,
+            TranslationRetryState {
+                attempts: 1,
+                retry_at: Instant::now() + Duration::from_secs(2),
+            },
+        );
         assert!(state.translation_failed(1_000));
 
-        // A give-up is per-cue: its neighbours are still offered.
+        // A cooldown is per-cue: its neighbours remain eligible for translation.
         assert!(!state.translation_failed(2_000));
 
         state.reset_translation_failures();
@@ -2171,16 +2586,24 @@ mod tests {
     }
 
     /// Ending a session (stop / new file / plugin shutdown) starts a clean
-    /// slate, so a stale give-up cannot mute the next media's subtitles.
+    /// slate, so a stale cooldown cannot mute the next media's subtitles.
     #[test]
     fn stopping_a_session_clears_translation_failures() {
         let mut state = PluginState::new(test_config()).unwrap();
         state.failed_translations.insert(1_000);
+        state.translation_retries.insert(
+            1_000,
+            TranslationRetryState {
+                attempts: 1,
+                retry_at: Instant::now() + Duration::from_secs(2),
+            },
+        );
         state.translation_failure_reported = true;
 
         state.stop_transcription();
 
         assert!(state.failed_translations.is_empty());
+        assert!(state.translation_retries.is_empty());
         assert!(!state.translation_failure_reported);
     }
 
@@ -2254,6 +2677,8 @@ mod tests {
             .submit(
                 input.to_string_lossy().into_owned(),
                 0,
+                0,
+                false,
                 100,
                 output_wav,
                 output_prefix,

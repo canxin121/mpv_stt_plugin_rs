@@ -1,6 +1,7 @@
 use crate::common::{MpvSttError, Result};
 use ffmpeg::format::Sample;
 use ffmpeg::format::sample::Type as SampleType;
+use ffmpeg::util::mathematics::Rounding;
 use ffmpeg::util::mathematics::rescale;
 use ffmpeg::util::mathematics::rescale::Rescale;
 use ffmpeg_next as ffmpeg;
@@ -60,6 +61,28 @@ fn normalize_frame_layout(frame: &mut ffmpeg::frame::Audio) {
     }
 }
 
+/// Align output samples with `target_time_us`, given the PTS of the first
+/// decoded frame. A backward seek can still land slightly after the target;
+/// report that as leading silence instead of shifting the remaining speech to
+/// time zero.
+fn sample_alignment(
+    target_time_us: i64,
+    frame_pts: i64,
+    stream_time_base: ffmpeg::Rational,
+    output_sample_rate: u32,
+) -> (u64, u64) {
+    let output_time_base = (1, output_sample_rate as i32);
+    let target_sample =
+        target_time_us.rescale_with(rescale::TIME_BASE, output_time_base, Rounding::Up);
+    let first_sample = frame_pts.rescale_with(stream_time_base, output_time_base, Rounding::Down);
+
+    if first_sample >= target_sample {
+        (0, first_sample.saturating_sub(target_sample) as u64)
+    } else {
+        (target_sample.saturating_sub(first_sample) as u64, 0)
+    }
+}
+
 #[derive(Clone)]
 pub struct AudioExtractor {
     output_sample_rate: u32,
@@ -111,6 +134,102 @@ impl AudioExtractor {
         Ok(())
     }
 
+    /// Estimate the relative end of the selected audio stream in the input.
+    ///
+    /// mpv's `dump-cache` starts at a preceding seek point and rebases packet
+    /// timestamps to zero. The requested network chunk therefore does not
+    /// necessarily begin at zero in the dumped file. The final audio packet is
+    /// the one immediately before the requested end; its midpoint estimates
+    /// that end to within half an encoded audio packet. We use this only to
+    /// locate the chunk within the dumped file, avoiding the potentially much
+    /// larger video-keyframe pre-roll.
+    pub fn audio_end_relative_ms<P: AsRef<Path>>(&self, input_path: P) -> Result<u64> {
+        ensure_ffmpeg()?;
+        let start_time = Instant::now();
+        let run_generation = self.cancel_generation.load(Ordering::Relaxed);
+        let input_path = input_path.as_ref();
+        let cancel_generation = Arc::clone(&self.cancel_generation);
+        let ffmpeg_timeout = self.ffmpeg_timeout;
+
+        let mut ictx = ffmpeg::format::input_with_interrupt(input_path, move || {
+            (ffmpeg_timeout.as_millis() != 0 && start_time.elapsed() > ffmpeg_timeout)
+                || cancel_generation.load(Ordering::Relaxed) != run_generation
+        })
+        .map_err(|e| ffmpeg_err("open input failed while locating dumped audio", e))?;
+
+        check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
+        self.check_cancel(run_generation)?;
+
+        let format_start_time = unsafe { (*ictx.as_ptr()).start_time };
+        let (stream_index, stream_time_base, stream_start_time, stream_duration) = {
+            let stream = ictx
+                .streams()
+                .best(ffmpeg::media::Type::Audio)
+                .ok_or_else(|| {
+                    MpvSttError::AudioExtractionFailed(
+                        "No audio stream found in the dumped cache".to_string(),
+                    )
+                })?;
+            (
+                stream.index(),
+                stream.time_base(),
+                stream.start_time(),
+                stream.duration(),
+            )
+        };
+
+        let mut last_packet_midpoint = None;
+        for (stream, packet) in ictx.packets() {
+            if stream.index() != stream_index {
+                continue;
+            }
+            check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
+            self.check_cancel(run_generation)?;
+
+            let Some(packet_pts) = packet.pts().or_else(|| packet.dts()) else {
+                continue;
+            };
+            let packet_midpoint = packet_pts.saturating_add(packet.duration().max(0) / 2);
+            last_packet_midpoint = Some(
+                last_packet_midpoint.map_or(packet_midpoint, |last: i64| last.max(packet_midpoint)),
+            );
+        }
+
+        let end_pts = last_packet_midpoint.or_else(|| {
+            (stream_start_time != ffmpeg::ffi::AV_NOPTS_VALUE && stream_duration > 0)
+                .then(|| stream_start_time.saturating_add(stream_duration))
+        });
+        let Some(end_pts) = end_pts else {
+            return Err(MpvSttError::AudioExtractionFailed(
+                "cannot determine the audio timeline in the dumped cache".to_string(),
+            ));
+        };
+
+        let earliest_stream_start_us = ictx
+            .streams()
+            .filter_map(|stream| {
+                let stream_start = stream.start_time();
+                let time_base = stream.time_base();
+                (stream_start != ffmpeg::ffi::AV_NOPTS_VALUE && time_base.denominator() != 0)
+                    .then(|| stream_start.rescale(time_base, rescale::TIME_BASE))
+            })
+            .min();
+        let format_start_time_us = if format_start_time == ffmpeg::ffi::AV_NOPTS_VALUE {
+            earliest_stream_start_us.unwrap_or(0)
+        } else {
+            format_start_time
+        };
+        let end_time_us = end_pts.rescale(stream_time_base, rescale::TIME_BASE);
+        let relative_end_us = end_time_us.saturating_sub(format_start_time_us);
+        if relative_end_us <= 0 {
+            return Err(MpvSttError::AudioExtractionFailed(
+                "the dumped audio has no positive timeline duration".to_string(),
+            ));
+        }
+
+        Ok((relative_end_us / 1000) as u64)
+    }
+
     /// Extract audio segment from media file using ffmpeg libraries
     pub fn extract_audio_segment<P: AsRef<Path>>(
         &self,
@@ -134,7 +253,7 @@ impl AudioExtractor {
 
         trace!(
             start_ms,
-            end_ms = start_ms + duration_ms,
+            end_ms = start_ms.saturating_add(duration_ms),
             input = input_str,
             output = output_str,
             "extracting audio with ffmpeg"
@@ -153,10 +272,45 @@ impl AudioExtractor {
         check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
         self.check_cancel(run_generation)?;
 
+        // `time-pos` is relative to the media start, while FFmpeg frame PTS
+        // values are on the demuxer's absolute timeline. Keep both in the
+        // same clock so non-zero container start times are handled correctly.
+        // AVFormatContext.start_time is in AV_TIME_BASE units.
+        let format_start_time = unsafe { (*ictx.as_ptr()).start_time };
+        let earliest_stream_start_us = ictx
+            .streams()
+            .filter_map(|stream| {
+                let start_time = stream.start_time();
+                let time_base = stream.time_base();
+                (start_time != ffmpeg::ffi::AV_NOPTS_VALUE && time_base.denominator() != 0)
+                    .then(|| start_time.rescale(time_base, rescale::TIME_BASE))
+            })
+            .min();
+        let format_start_time_us = if format_start_time == ffmpeg::ffi::AV_NOPTS_VALUE {
+            earliest_stream_start_us.unwrap_or(0)
+        } else {
+            format_start_time
+        };
+        let target_time_us = format_start_time_us
+            .saturating_add((start_ms as i64).rescale((1, 1000), rescale::TIME_BASE));
+
+        let (stream_index, stream_time_base, stream_start_time) = {
+            let input_stream =
+                ictx.streams()
+                    .best(ffmpeg::media::Type::Audio)
+                    .ok_or_else(|| {
+                        MpvSttError::AudioExtractionFailed("No audio stream found".to_string())
+                    })?;
+            (
+                input_stream.index(),
+                input_stream.time_base(),
+                input_stream.start_time(),
+            )
+        };
+
         let mut seeked = false;
         if start_ms > 0 {
-            let position = (start_ms as i64).rescale((1, 1000), rescale::TIME_BASE);
-            if let Err(err) = ictx.seek(position, ..position) {
+            if let Err(err) = ictx.seek(target_time_us, ..target_time_us) {
                 trace!(error = %err, "ffmpeg seek failed; decoding from the start and skipping");
             } else {
                 seeked = true;
@@ -169,8 +323,6 @@ impl AudioExtractor {
             .ok_or_else(|| {
                 MpvSttError::AudioExtractionFailed("No audio stream found".to_string())
             })?;
-        let stream_index = input_stream.index();
-
         let context_decoder =
             ffmpeg::codec::context::Context::from_parameters(input_stream.parameters())
                 .map_err(|e| ffmpeg_err("decoder context failed", e))?;
@@ -220,19 +372,26 @@ impl AudioExtractor {
         };
         let mut writer = hound::WavWriter::create(output_path, spec)?;
 
-        let start_frames = if seeked {
-            0
+        let fallback_first_frame_us = if stream_start_time == ffmpeg::ffi::AV_NOPTS_VALUE {
+            format_start_time_us
         } else {
-            start_ms
-                .saturating_mul(self.output_sample_rate as u64)
-                .saturating_div(1000)
+            stream_start_time.rescale(stream_time_base, rescale::TIME_BASE)
         };
+        let fallback_alignment = sample_alignment(
+            target_time_us,
+            fallback_first_frame_us,
+            rescale::TIME_BASE,
+            self.output_sample_rate,
+        );
         let target_frames = duration_ms
             .saturating_mul(self.output_sample_rate as u64)
             .saturating_div(1000);
 
-        let mut skipped_frames = 0u64;
         let mut written_frames = 0u64;
+        let mut first_frame_seen = false;
+        let mut first_frame_pts = None;
+        let mut frames_to_skip = None;
+        let mut leading_silence_frames = 0u64;
 
         let mut decoded = ffmpeg::frame::Audio::empty();
 
@@ -264,6 +423,17 @@ impl AudioExtractor {
                 check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
                 self.check_cancel(run_generation)?;
 
+                if !first_frame_seen {
+                    first_frame_seen = true;
+                    first_frame_pts = decoded.timestamp().or_else(|| decoded.pts());
+                    if first_frame_pts.is_none() && seeked {
+                        return Err(MpvSttError::AudioExtractionFailed(
+                            "cannot align audio after seek: the first decoded frame has no timestamp"
+                                .to_string(),
+                        ));
+                    }
+                }
+
                 normalize_frame_layout(&mut decoded);
 
                 let mut resampled = ffmpeg::frame::Audio::empty();
@@ -283,13 +453,44 @@ impl AudioExtractor {
                         "resampled frame shorter than expected".to_string(),
                     ));
                 }
+
+                if frames_to_skip.is_none() {
+                    let (skip, pad) = first_frame_pts.map_or(fallback_alignment, |pts| {
+                        sample_alignment(
+                            target_time_us,
+                            pts,
+                            stream_time_base,
+                            self.output_sample_rate,
+                        )
+                    });
+                    frames_to_skip = Some(skip);
+                    leading_silence_frames = pad;
+                    trace!(
+                        target_time_us,
+                        first_frame_pts = ?first_frame_pts,
+                        skip_frames = skip,
+                        leading_silence_frames,
+                        "aligning extracted audio to the requested start"
+                    );
+                }
+
                 let samples = unsafe {
                     std::slice::from_raw_parts(data.as_ptr() as *const i16, sample_count)
                 };
 
+                while leading_silence_frames > 0
+                    && (target_frames == 0 || written_frames < target_frames)
+                {
+                    for _ in 0..channels {
+                        writer.write_sample(0)?;
+                    }
+                    written_frames += 1;
+                    leading_silence_frames -= 1;
+                }
+
                 for frame_idx in 0..frames {
-                    if skipped_frames < start_frames {
-                        skipped_frames += 1;
+                    if frames_to_skip.is_some_and(|remaining| remaining > 0) {
+                        frames_to_skip = frames_to_skip.map(|remaining| remaining - 1);
                         continue;
                     }
                     if target_frames > 0 && written_frames >= target_frames {
@@ -321,6 +522,17 @@ impl AudioExtractor {
                 check_timeout(start_time, self.ffmpeg_timeout, "ffmpeg")?;
                 self.check_cancel(run_generation)?;
 
+                if !first_frame_seen {
+                    first_frame_seen = true;
+                    first_frame_pts = decoded.timestamp().or_else(|| decoded.pts());
+                    if first_frame_pts.is_none() && seeked {
+                        return Err(MpvSttError::AudioExtractionFailed(
+                            "cannot align audio after seek: the first decoded frame has no timestamp"
+                                .to_string(),
+                        ));
+                    }
+                }
+
                 normalize_frame_layout(&mut decoded);
 
                 let mut resampled = ffmpeg::frame::Audio::empty();
@@ -340,13 +552,44 @@ impl AudioExtractor {
                         "resampled frame shorter than expected".to_string(),
                     ));
                 }
+
+                if frames_to_skip.is_none() {
+                    let (skip, pad) = first_frame_pts.map_or(fallback_alignment, |pts| {
+                        sample_alignment(
+                            target_time_us,
+                            pts,
+                            stream_time_base,
+                            self.output_sample_rate,
+                        )
+                    });
+                    frames_to_skip = Some(skip);
+                    leading_silence_frames = pad;
+                    trace!(
+                        target_time_us,
+                        first_frame_pts = ?first_frame_pts,
+                        skip_frames = skip,
+                        leading_silence_frames,
+                        "aligning extracted audio to the requested start"
+                    );
+                }
+
                 let samples = unsafe {
                     std::slice::from_raw_parts(data.as_ptr() as *const i16, sample_count)
                 };
 
+                while leading_silence_frames > 0
+                    && (target_frames == 0 || written_frames < target_frames)
+                {
+                    for _ in 0..channels {
+                        writer.write_sample(0)?;
+                    }
+                    written_frames += 1;
+                    leading_silence_frames -= 1;
+                }
+
                 for frame_idx in 0..frames {
-                    if skipped_frames < start_frames {
-                        skipped_frames += 1;
+                    if frames_to_skip.is_some_and(|remaining| remaining > 0) {
+                        frames_to_skip = frames_to_skip.map(|remaining| remaining - 1);
                         continue;
                     }
                     if target_frames > 0 && written_frames >= target_frames {

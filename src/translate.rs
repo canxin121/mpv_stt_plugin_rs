@@ -398,10 +398,8 @@ pub struct TranslationResult {
     pub translated: String,
 }
 
-/// A translation that will never arrive: the queue gave up on it after its
-/// retries were exhausted. Reported so the caller can tell the user why new
-/// subtitles are staying untranslated, and so a dead backend is not retried
-/// for every single cue.
+/// A translation attempt that failed after the queue's short in-request
+/// retries. The plugin uses it to schedule a later retry with longer backoff.
 #[derive(Debug, Clone)]
 pub struct TranslationFailure {
     pub start_ms: u32,
@@ -409,6 +407,9 @@ pub struct TranslationFailure {
     pub reason: String,
     /// Full root-cause chain, for the log file.
     pub cause: String,
+    /// Longer initial cooldown for rate limits, before the normal exponential
+    /// backoff doubles it up to the plugin's cap.
+    pub retry_base_secs: u64,
 }
 
 /// Condense a transport error into something short enough for mpv's OSD, which
@@ -435,9 +436,8 @@ struct QueuedResult {
     outcome: TranslationOutcome,
 }
 
-/// What the worker managed to do with one task. `Failed` is not an error the
-/// caller can act on — the original subtitle is already on screen either way —
-/// but it is what lets the plugin stop re-queueing the same cue forever.
+/// What the worker managed to do with one task. A `Failed` result means the
+/// current batch's short retries were exhausted; the plugin may retry later.
 #[derive(Debug, Clone)]
 pub enum TranslationOutcome {
     Translated(TranslationResult),
@@ -502,14 +502,16 @@ impl AsyncTranslationQueue {
     }
 
     /// Submit a translation task to the queue
-    pub fn submit(&self, task: TranslationTask) {
+    pub fn submit(&self, task: TranslationTask) -> bool {
         let generation = self.generation.load(Ordering::Relaxed);
-        let _ = self.task_sender.send(Some(QueuedTask { generation, task }));
+        self.task_sender
+            .send(Some(QueuedTask { generation, task }))
+            .is_ok()
     }
 
     /// Try to get completed translation outcomes (non-blocking). Translations
-    /// and give-ups alike are returned, because the caller needs to know not to
-    /// queue that cue again.
+    /// and failures alike are returned, because the caller needs to clear its
+    /// in-flight marker and schedule the next retry when needed.
     pub fn try_recv_results(&self) -> Vec<TranslationOutcome> {
         let mut results = Vec::new();
         let generation = self.generation.load(Ordering::Acquire);
@@ -593,11 +595,25 @@ impl AsyncTranslationQueue {
             let client = match client {
                 Ok(client) => client,
                 Err(e) => {
+                    let cause = crate::logging::err_chain(&e);
+                    let reason = short_reason(&cause);
                     warn!(
                         error = %e,
-                        cause = %crate::logging::err_chain(&e),
-                        "cannot build the translation HTTP client; dropping this batch"
+                        cause = %cause,
+                        tasks = tasks.len(),
+                        "cannot build the translation HTTP client; reporting this batch as failed for retry"
                     );
+                    for task in tasks {
+                        let _ = result_sender.send(QueuedResult {
+                            generation: current_generation,
+                            outcome: TranslationOutcome::Failed(TranslationFailure {
+                                start_ms: task.start_ms,
+                                reason: reason.clone(),
+                                cause: cause.clone(),
+                                retry_base_secs: 2,
+                            }),
+                        });
+                    }
                     continue;
                 }
             };
@@ -690,11 +706,9 @@ impl AsyncTranslationQueue {
 
     /// Translate a single task with retry logic.
     ///
-    /// `None` means "no answer, and the caller should not care" — the task was
-    /// cancelled or superseded. A `Failed` outcome is the opposite: the
-    /// translation is not coming, so the caller must stop re-queueing this cue.
-    /// Neither case is an error for the subtitle itself; the original text is
-    /// already on screen and stays there.
+    /// `None` means the task was cancelled or superseded. A `Failed` outcome
+    /// means this batch's short retries were exhausted; the plugin will retry
+    /// the cue later. The original text remains available either way.
     async fn translate_single_task_async(
         task: TranslationTask,
         config: Arc<TranslatorConfig>,
@@ -708,6 +722,7 @@ impl AsyncTranslationQueue {
 
         let mut attempt = 0usize;
         let mut delay_ms = RETRY_BASE_DELAY_MS;
+        let mut retry_base_secs = 2;
         // Why the last attempt failed; reported if every attempt fails. Seeded
         // so a give-up always has something to show even in the impossible case
         // where the loop exits without recording one.
@@ -751,6 +766,11 @@ impl AsyncTranslationQueue {
                     );
                 }
                 Err(e) => {
+                    retry_base_secs = if matches!(&e, MpvSttError::HttpStatus { status: 429, .. }) {
+                        15
+                    } else {
+                        2
+                    };
                     last_error = crate::logging::err_chain(&e);
                     warn!(
                         start_ms = task.start_ms,
@@ -769,6 +789,7 @@ impl AsyncTranslationQueue {
                     start_ms: task.start_ms,
                     reason: short_reason(&last_error),
                     cause: last_error,
+                    retry_base_secs,
                 }));
             }
 
