@@ -15,7 +15,7 @@ use tracing::{Span, debug, error, info, trace, warn};
 
 use crate::audio::AudioExtractor;
 use crate::common::MpvSttError;
-use crate::config::Config;
+use crate::config::{Config, SttRetryConfig, SttRetryStrategy};
 use crate::logging::{self, LogSettings};
 use crate::srt::SrtFile;
 use crate::stt::{SttBackend, SttDeviceNotice, SttRunner};
@@ -25,9 +25,7 @@ use crate::translate::{
 };
 
 const SUBTITLE_TIMELINE_VERSION: u32 = 2;
-const TRANSCRIPTION_RETRY_BASE_SECS: u64 = 2;
 const TRANSLATION_RETRY_BASE_SECS: u64 = 2;
-const RATE_LIMIT_RETRY_BASE_SECS: u64 = 15;
 const RETRY_MAX_DELAY_SECS: u64 = 60;
 const TRANSLATION_SCAN_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -352,6 +350,7 @@ struct TranslationRetryState {
 
 struct PluginState {
     config: Config,
+    stt_retry: SttRetryConfig,
     paths: TempPaths,
     transcription_worker: TranscriptionWorker,
     pending_transcription: Option<PendingTranscription>,
@@ -412,6 +411,18 @@ impl PluginState {
             .with_ffmpeg_timeout(config.timeout.ffmpeg_ms)
             .with_ffprobe_timeout(config.timeout.ffprobe_ms);
 
+        let active_stt_source = config
+            .stt
+            .active_source_name()
+            .map_err(|e| MpvSttError::SttFailed(format!("{e}; protocols: openai, ferrum")))?;
+        let stt_retry = config
+            .stt
+            .sources
+            .get(active_stt_source)
+            .expect("the resolved STT source is declared")
+            .retry
+            .clone();
+
         // Initialize the STT backend of the source named by `[stt] source`.
         // Both remote protocols are compiled in; `from_config` resolves the
         // name and matches the source's protocol to the active backend.
@@ -427,6 +438,7 @@ impl PluginState {
         Ok(Self {
             chunk_dur,
             config,
+            stt_retry,
             paths,
             transcription_worker,
             pending_transcription: None,
@@ -538,15 +550,29 @@ impl PluginState {
             .min(RETRY_MAX_DELAY_SECS)
     }
 
-    fn defer_transcription_retry(&mut self, start_ms: u64, reason: &str) -> Duration {
-        self.defer_transcription_retry_with_base(start_ms, reason, TRANSCRIPTION_RETRY_BASE_SECS)
+    fn stt_retry_delay_secs(&self, attempts: u32, rate_limited: bool) -> u64 {
+        match self.stt_retry.strategy {
+            SttRetryStrategy::Fixed => self.stt_retry.interval_secs.max(1),
+            SttRetryStrategy::Exponential => {
+                let base_secs = if rate_limited {
+                    self.stt_retry.rate_limit_interval_secs
+                } else {
+                    self.stt_retry.interval_secs
+                };
+                Self::retry_delay_secs(attempts, base_secs.max(1))
+            }
+        }
     }
 
-    fn defer_transcription_retry_with_base(
+    fn defer_transcription_retry(&mut self, start_ms: u64, reason: &str) -> Duration {
+        self.defer_transcription_retry_with_rate_limit(start_ms, reason, false)
+    }
+
+    fn defer_transcription_retry_with_rate_limit(
         &mut self,
         start_ms: u64,
         reason: &str,
-        base_secs: u64,
+        rate_limited: bool,
     ) -> Duration {
         let previous_attempts = self
             .transcription_retry
@@ -555,7 +581,7 @@ impl PluginState {
             .map(|retry| retry.attempts)
             .unwrap_or(0);
         let attempts = previous_attempts.saturating_add(1);
-        let delay = Duration::from_secs(Self::retry_delay_secs(attempts, base_secs));
+        let delay = Duration::from_secs(self.stt_retry_delay_secs(attempts, rate_limited));
         self.transcription_retry = Some(ChunkRetryState {
             start_ms,
             attempts,
@@ -989,15 +1015,11 @@ impl PluginState {
                     // dump from its cache if the range is still available.
                     let _ = std::fs::remove_file(&self.paths.tmp_cache);
                 }
-                let base_secs = if matches!(&err, MpvSttError::HttpStatus { status: 429, .. }) {
-                    RATE_LIMIT_RETRY_BASE_SECS
-                } else {
-                    TRANSCRIPTION_RETRY_BASE_SECS
-                };
-                let delay = self.defer_transcription_retry_with_base(
+                let rate_limited = matches!(&err, MpvSttError::HttpStatus { status: 429, .. });
+                let delay = self.defer_transcription_retry_with_rate_limit(
                     pending.start_ms,
                     &err.to_string(),
-                    base_secs,
+                    rate_limited,
                 );
                 error!(
                     start_ms = pending.start_ms,

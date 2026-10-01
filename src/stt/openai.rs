@@ -3,8 +3,10 @@ use crate::common::{MpvSttError, Result};
 use crate::config::SttProtocol;
 use crate::srt::{SrtFile, SubtitleEntry, Timestamp};
 use reqwest::Client;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::multipart::{Form, Part};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
@@ -28,6 +30,9 @@ pub struct SttOpenAiConfig {
     /// require auth (e.g. OpenAI-hosted or any key-gated compatible service).
     /// `None` omits the header (local subtitle-gateway needs no key).
     pub api_key: Option<String>,
+    /// Additional HTTP headers. Applied after built-in headers, so a custom
+    /// value replaces a generated header with the same name.
+    pub headers: BTreeMap<String, String>,
     pub timeout_ms: u64,
     pub max_retry: usize,
 }
@@ -56,6 +61,7 @@ pub struct OpenAiBackend {
     model: String,
     language: Option<String>,
     api_key: Option<String>,
+    custom_headers: HeaderMap,
     max_retry: usize,
     cancel_generation: Arc<AtomicU64>,
     client: Client,
@@ -68,11 +74,23 @@ impl OpenAiBackend {
             .build()
             .map_err(|e| MpvSttError::SttFailed(format!("HTTP client build failed: {}", e)))?;
 
+        let mut custom_headers = HeaderMap::new();
+        for (name, value) in config.headers {
+            let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+                MpvSttError::SttFailed(format!("invalid custom STT header name {name:?}"))
+            })?;
+            let header_value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| {
+                MpvSttError::SttFailed(format!("invalid value for custom STT header {name:?}"))
+            })?;
+            custom_headers.insert(header_name, header_value);
+        }
+
         Ok(Self {
             server_url: normalize_server_url(&config.server_addr),
             model: config.model,
             language: config.language,
             api_key: config.api_key,
+            custom_headers,
             max_retry: config.max_retry,
             cancel_generation: Arc::new(AtomicU64::new(0)),
             client,
@@ -262,6 +280,9 @@ impl OpenAiBackend {
             .header("x-duration-ms", duration_ms.to_string());
         if let Some(key) = self.api_key.as_ref() {
             request = request.bearer_auth(key);
+        }
+        for (name, value) in &self.custom_headers {
+            request = request.header(name.clone(), value.clone());
         }
         let endpoint = format!("{}/v1/audio/transcriptions", self.server_url);
         let request_future = async {

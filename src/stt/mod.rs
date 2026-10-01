@@ -120,7 +120,13 @@ impl SttRunner {
                         server = %openai_cfg.server_addr,
                         model = %openai_cfg.model,
                         language = openai_cfg.language.as_deref().unwrap_or("auto"),
-                        authenticated = openai_cfg.api_key.is_some(),
+                        authenticated = openai_cfg.api_key.is_some()
+                            || openai_cfg.headers.keys().any(|name| {
+                                name.eq_ignore_ascii_case("authorization")
+                                    || name.eq_ignore_ascii_case("x-api-key")
+                                    || name.eq_ignore_ascii_case("api-key")
+                                    || name.eq_ignore_ascii_case("x-portkey-api-key")
+                            }),
                         "selected the STT source"
                     );
                     Ok(SttRunner::OpenAi(openai::OpenAiBackend::new(openai_cfg)?))

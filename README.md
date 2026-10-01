@@ -178,6 +178,32 @@ language = "ja"
 
 使用其他 OpenAI 兼容服务时，替换 `server_addr` 和 `model`；需要鉴权时添加 `api_key`。模型名称必须是服务端实际提供的 ID。为了让每句话按识别时间显示，服务端还必须支持 `verbose_json` 并返回带 `start` / `end` 的 `segments`；只返回整段 `text` 的模型无法提供句子时间，插件会报错而不会猜一个整片时间。
 
+需要额外请求头时，在 source 下添加 `[stt.sources.<name>.headers]`。例如 Portkey 可通过自定义头传入网关 key 和路由 provider：
+
+```toml
+[stt]
+source = "portkey"
+
+[stt.sources.portkey]
+protocol = "openai"
+server_addr = "https://api.portkey.ai"
+model = "whisper-large-v3"
+
+[stt.sources.portkey.headers]
+x-portkey-api-key = "填入 Portkey API Key"
+x-portkey-provider = "@account1"
+
+[stt.sources.portkey.retry]
+strategy = "fixed"
+interval_secs = 30
+```
+
+`headers` 表只用于 `openai` 协议；自定义头会覆盖同名的内置请求头。Portkey 配置也可用 `x-portkey-config` 指定路由配置。
+
+Portkey 网关 key 放在 `x-portkey-api-key`；如果用这个头传网关 key，请省略 `api_key`，因为 `api_key` 会额外发送为 `Authorization: Bearer ...`。
+
+`retry` 子表控制整段 STT 转写失败后的自动重试。`strategy = "fixed"` 始终按 `interval_secs` 等待；默认 `strategy = "exponential"` 会逐次加倍，普通错误从 2 秒开始，HTTP 429 从 15 秒开始，最长 60 秒。`rate_limit_interval_secs` 只影响指数退避。source 上的 `max_retry` 仍控制单个 HTTP 请求内部的快速重试次数；翻译重试不受这组 STT 设置影响。
+
 </details>
 
 <details>

@@ -223,6 +223,39 @@ impl Default for SttConfig {
     }
 }
 
+/// Strategy used when an STT chunk needs an automatic retry.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SttRetryStrategy {
+    /// Double the delay after each failure, retaining the existing defaults.
+    #[default]
+    Exponential,
+    /// Retry every failed chunk after the same configured interval.
+    Fixed,
+}
+
+/// Automatic retry timing for one STT source. `max_retry` on the source still
+/// controls short retries inside an individual HTTP request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SttRetryConfig {
+    pub strategy: SttRetryStrategy,
+    /// Delay for ordinary failures, and the fixed delay when strategy = fixed.
+    pub interval_secs: u64,
+    /// Exponential base delay for HTTP 429 responses.
+    pub rate_limit_interval_secs: u64,
+}
+
+impl Default for SttRetryConfig {
+    fn default() -> Self {
+        Self {
+            strategy: SttRetryStrategy::Exponential,
+            interval_secs: 2,
+            rate_limit_interval_secs: 15,
+        }
+    }
+}
+
 /// One declared STT source. The fields are the union of what both protocols
 /// read; `protocol` decides which of them the request actually uses.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -245,6 +278,14 @@ pub struct SttSourceConfig {
     /// Optional API key. `openai` sends `Authorization: Bearer {key}` for
     /// servers that require auth; omitted for a local gateway that needs none.
     pub api_key: Option<String>,
+    /// Additional HTTP headers for the `openai` protocol, declared under
+    /// `[stt.sources.<name>.headers]`. Custom values override generated headers
+    /// with the same name. Ignored by the `ferrum` protocol.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+    /// Automatic retry timing for failed transcription chunks.
+    #[serde(default)]
+    pub retry: SttRetryConfig,
     pub timeout_ms: Option<u64>,
     pub max_retry: Option<usize>,
     /// `ferrum` only: Opus compression to reduce network payload size.
@@ -272,6 +313,7 @@ impl SttSourceConfig {
                 .unwrap_or_else(|| "sensevoice".to_string()),
             language: self.language.clone(),
             api_key: self.api_key.clone(),
+            headers: self.headers.clone(),
             timeout_ms: self.timeout_ms.unwrap_or(120_000),
             max_retry: self.max_retry.unwrap_or(3),
         }
