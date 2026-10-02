@@ -993,6 +993,7 @@ name = "mpv_stt_plugin_rs"
 version = "0.2.3"
 dependencies = [
  "aes-gcm",
+ "base64 0.22.1",
  "cc",
  "directories",
  "ffmpeg-next",
@@ -1018,6 +1019,7 @@ dependencies = [
  "tracing-appender",
  "tracing-error",
  "tracing-subscriber",
+ "url",
  "wait-timeout",
 ]
 

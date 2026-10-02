@@ -154,7 +154,7 @@ Ctrl+Shift+C script-message-to libmpv_stt_plugin_rs clear-cache
 
 </details>
 
-本地视频的字幕默认保存为同目录、同名的 `.srt` 文件；已有同名字幕请先备份。翻译服务暂时失败时，识别出的原文仍会显示，插件会自动退避重试。
+启用 SRT 保存时，本地字幕写在视频旁边，并带有插件命名空间：例如 `movie.mkv` 对应 `movie.mkv.mpv_stt_plugin_rs.srt`，不同扩展名的视频不会冲突。普通的 `movie.srt` 不会被覆盖、导入或删除。网络媒体缓存保存在 mpv 配置目录的 `mpv_stt_plugin_rs_cache` 中，按规范化媒体地址生成稳定文件名，并配套保存缓存清单；重复播放、seek 和重试会复用同一份缓存。`Ctrl+Shift+C` 只清除当前媒体的插件缓存，不会扫描或删除普通字幕。旧版生成的未命名空间本地 `.srt` 会保留，但不会自动作为缓存复用。翻译服务暂时失败时，识别出的原文仍会显示，插件会自动退避重试。
 
 ## 按需配置
 
@@ -201,6 +201,24 @@ interval_secs = 30
 `headers` 表只用于 `openai` 协议；自定义头会覆盖同名的内置请求头。Portkey 配置也可用 `x-portkey-config` 指定路由配置。
 
 Portkey 网关 key 放在 `x-portkey-api-key`；如果用这个头传网关 key，请省略 `api_key`，因为 `api_key` 会额外发送为 `Authorization: Bearer ...`。
+
+### Cloudflare Workers AI（Whisper）
+
+先在 Cloudflare Dashboard 找到 Account ID，并按 [Workers AI REST API 指南](https://developers.cloudflare.com/workers-ai/get-started/rest-api/)创建可调用 Workers AI 的 API Token。Cloudflare 使用固定 REST API 地址，配置中不需要 `server_addr`；`api_key` 填 Bearer Token：
+
+```toml
+[stt]
+source = "cloudflare"
+
+[stt.sources.cloudflare]
+protocol = "cloudflare"
+account_id = "你的 Cloudflare Account ID"
+api_key = "你的 Workers AI API Token"
+model = "@cf/openai/whisper-large-v3-turbo"
+language = "ja"
+```
+
+默认推荐 `@cf/openai/whisper-large-v3-turbo`：它返回带时间戳的 segments，并支持可选 `language`（如 `ja`、`zh`、`en`）。也可将 `model` 改为 `@cf/openai/whisper`；这个模型自动识别语言，因此不要配置 `language`。模型详情见 [Whisper](https://developers.cloudflare.com/workers-ai/models/whisper/) 和 [Whisper Large v3 Turbo](https://developers.cloudflare.com/workers-ai/models/whisper-large-v3-turbo/)，API 路径与鉴权见 [Run API reference](https://developers.cloudflare.com/api/resources/ai/methods/run/)。
 
 `retry` 子表控制整段 STT 转写失败后的自动重试。`strategy = "fixed"` 始终按 `interval_secs` 等待；默认 `strategy = "exponential"` 会逐次加倍，普通错误从 2 秒开始，HTTP 429 从 15 秒开始，最长 60 秒。`rate_limit_interval_secs` 只影响指数退避。source 上的 `max_retry` 仍控制单个 HTTP 请求内部的快速重试次数；翻译重试不受这组 STT 设置影响。
 
@@ -284,7 +302,7 @@ network_ms = 15000     # 网络媒体：每片 15 秒
 | :--- | :--- |
 | 播放后没有字幕 | 默认不会自动开始，先按 `Ctrl+Shift+S`；再检查配置路径和转写服务是否可用。 |
 | OpenAI 兼容服务报“没有有效的分段时间戳” | 确认所选模型和服务端支持 `verbose_json` 的带时间戳 `segments`。纯文本响应无法与每句话对齐。 |
-| 旧字幕仍然错位 | 网络字幕缓存会在本版自动重算；本地同名 `.srt` 会作为已有字幕缓存复用，先备份后移走旧文件，再重新转写。 |
+| 旧字幕仍然错位 | 使用 `Ctrl+Shift+C` 清除当前媒体的插件字幕缓存后重新转写。普通 `<视频名>.srt` 和旧版未命名空间字幕不会被插件导入或删除；如需清理，请手动检查后处理。 |
 | IINA 快捷键无效 | 确认已启用 mpv 配置目录、添加快捷键、保留正确插件文件名，并重启 IINA。 |
 | 服务返回 401 / 403 | 检查 API Key、权限与服务端鉴权配置。 |
 | 服务返回 404 | 检查服务地址和模型名称，不要把完整请求路径填入 `server_addr`。 |

@@ -50,6 +50,7 @@ srtlib = "0.2.0"
 # Config
 figment = { version = "0.10.19", features = ["env", "toml"] }
 directories = "6.0.0"
+url = "2.5.8"
 
 # Process
 wait-timeout = "0.2.1"
@@ -66,8 +67,11 @@ libc = "0.2.178"
 hex = { version = "0.4", optional = true }
 opusic-sys = { version = "0.5.8", optional = true }
 
+# stt_cloudflare feature: base64-encoded audio input for Workers AI Whisper Turbo
+base64 = { version = "0.22", optional = true }
+
 # Non-optional: used by the DeepL/LibreTranslate-compatible remote translation
-# backends (always compiled in) as well as the stt_ferrum / stt_openai backends.
+# backends (always compiled in) as well as the optional STT backends.
 reqwest = { version = "0.12.28", default-features = false, features = [
     "blocking",
     "json",
@@ -110,11 +114,12 @@ tracing-android = "0.2.0"
 mpv-client = { path = "third_party/mpv-client/mpv-client" }
 
 [features]
-# Pure remote client: both protocols are compiled in, the active one is picked
-# at runtime by the `protocol` of the STT source `[stt] source` names.
-default = ["stt_ferrum", "stt_openai"]
+# Pure remote client: enabled protocols are compiled in, and the active one
+# is picked at runtime by the `protocol` of the selected STT source.
+default = ["stt_ferrum", "stt_openai", "stt_cloudflare"]
 stt_ferrum = ["dep:hex", "dep:opusic-sys"]
 stt_openai = []
+stt_cloudflare = ["dep:base64"]
 
 [lints.clippy]
 # The group sits below the individual `allow`s so a listed lint can opt out.

@@ -11,7 +11,7 @@
 #   ./scripts/build-android.sh                      # arm64-v8a (default)
 #   ./scripts/build-android.sh -a arm64-v8a,x86_64  # several ABIs
 #   ./scripts/build-android.sh --all-abis
-#   ./scripts/build-android.sh -f stt_openai        # single STT backend
+#   ./scripts/build-android.sh -f stt_cloudflare    # single STT backend
 #
 # Artifacts land in dist/android/<abi>/libmpv_stt_plugin_rs.so.
 set -euo pipefail
@@ -45,8 +45,8 @@ Options:
   -a, --abi <list>       Comma-separated ABIs (default: arm64-v8a).
                          arm64-v8a, armeabi-v7a, x86, x86_64
       --all-abis         Build every supported ABI
-  -f, --features <list>  Single STT backend: stt_ferrum and/or stt_openai.
-                         Default: both, in one .so
+  -f, --features <list>  Select STT backends: stt_ferrum, stt_openai,
+                         and/or stt_cloudflare. Default: all three, in one .so
   -l, --list             List the supported ABIs and exit
   -h, --help             Show this help
 
@@ -256,7 +256,7 @@ main() {
             -l|--list)
                 echo "abis    : ${SUPPORTED_ABIS[*]}"
                 echo "default : ${DEFAULT_ABIS[*]}"
-                echo "features: stt_ferrum stt_openai"
+                echo "features: stt_ferrum stt_openai stt_cloudflare"
                 exit 0
                 ;;
             -h|--help) usage; exit 0 ;;
@@ -271,8 +271,8 @@ main() {
     fi
 
     if [[ -n "${FEATURES}" ]] \
-        && [[ ! "${FEATURES}" =~ ^(stt_ferrum|stt_openai)(,(stt_ferrum|stt_openai))*$ ]]; then
-        echo "ERROR: --features takes stt_ferrum and/or stt_openai, comma-separated" >&2
+        && [[ ! "${FEATURES}" =~ ^(stt_ferrum|stt_openai|stt_cloudflare)(,(stt_ferrum|stt_openai|stt_cloudflare))*$ ]]; then
+        echo "ERROR: --features takes stt_ferrum, stt_openai, and/or stt_cloudflare, comma-separated" >&2
         exit 1
     fi
 
@@ -281,7 +281,7 @@ main() {
 
     log "==> mpv_stt_plugin_rs android build"
     log "    abis    : ${SELECTED_ABIS[*]}"
-    log "    features: ${FEATURES:-stt_ferrum,stt_openai}"
+    log "    features: ${FEATURES:-stt_ferrum,stt_openai,stt_cloudflare}"
     log "    ndk     : $(resolve_ndk)"
 
     local failed=0 abi

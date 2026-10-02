@@ -20,6 +20,8 @@ pub use config::{
     Config, InferenceDevice, LogConfig, SttProtocol, SttSourceConfig, TranslateSourceConfig,
     TranslateSourceProtocol,
 };
+#[cfg(feature = "stt_cloudflare")]
+pub use stt::SttCloudflareConfig;
 #[cfg(feature = "stt_ferrum")]
 pub use stt::SttFerrumConfig;
 #[cfg(feature = "stt_openai")]

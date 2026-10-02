@@ -1,5 +1,6 @@
 use mpv_client::{Event, Handle, mpv_handle};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -9,9 +10,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use tempfile::TempDir;
 use tracing::{Span, debug, error, info, trace, warn};
+use url::Url;
 
 use crate::audio::AudioExtractor;
 use crate::common::MpvSttError;
@@ -25,6 +27,7 @@ use crate::translate::{
 };
 
 const SUBTITLE_TIMELINE_VERSION: u32 = 2;
+const SUBTITLE_CACHE_SCHEMA_VERSION: u32 = 1;
 const TRANSLATION_RETRY_BASE_SECS: u64 = 2;
 const RETRY_MAX_DELAY_SECS: u64 = 60;
 const TRANSLATION_SCAN_INTERVAL: Duration = Duration::from_secs(1);
@@ -70,6 +73,8 @@ impl TempPaths {
 struct CachePaths {
     subtitle_path: PathBuf,
     manifest_path: PathBuf,
+    media_identity_hash: String,
+    media_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -81,11 +86,20 @@ struct TranslationCacheEntry {
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct CacheManifest {
+    #[serde(default)]
+    schema_version: u32,
     /// Bump when subtitle timestamps can no longer be reused safely.
     #[serde(default)]
     timeline_version: u32,
+    #[serde(default)]
+    media_identity_hash: String,
+    #[serde(default)]
+    media_fingerprint: Option<String>,
+    #[serde(default)]
     chunk_size_ms: u64,
+    #[serde(default)]
     processed_chunks: Vec<u64>,
+    #[serde(default)]
     translations: Vec<TranslationCacheEntry>,
 }
 
@@ -119,6 +133,45 @@ impl ControlCommand {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeekTarget {
+    position_ms: u64,
+    forward: bool,
+}
+
+fn detect_seek_target(
+    playback_pos_ms: u64,
+    last_pos_ms: Option<u64>,
+    elapsed_ms: Option<u64>,
+    current_pos_ms: u64,
+    chunk_size_ms: u64,
+    explicit_seek: bool,
+) -> Option<SeekTarget> {
+    let chunk_size_ms = chunk_size_ms.max(1);
+    let comparison_pos_ms = last_pos_ms.unwrap_or(current_pos_ms);
+    let delta_ms = playback_pos_ms.abs_diff(comparison_pos_ms);
+    if delta_ms == 0 {
+        return None;
+    }
+
+    let seek_threshold_ms = std::cmp::max(5_000, chunk_size_ms);
+    if !explicit_seek {
+        if delta_ms < seek_threshold_ms {
+            return None;
+        }
+        if elapsed_ms.is_some_and(|elapsed| delta_ms <= elapsed.saturating_add(seek_threshold_ms)) {
+            return None;
+        }
+    }
+
+    Some(SeekTarget {
+        position_ms: playback_pos_ms - playback_pos_ms % chunk_size_ms,
+        forward: last_pos_ms
+            .map(|last| playback_pos_ms > last)
+            .unwrap_or(playback_pos_ms >= current_pos_ms),
+    })
+}
+
 const KEY_BINDINGS: [(&str, &str); 3] = [
     ("Ctrl+Shift+S", "toggle-stt"),
     ("Ctrl+Shift+T", "toggle-translate"),
@@ -133,8 +186,7 @@ fn key_binding_section(target: &str) -> String {
         .join("\n")
 }
 
-struct TranscriptionJob {
-    generation: u64,
+struct TranscriptionJobInput {
     media_path: String,
     chunk_start_ms: u64,
     audio_start_ms: u64,
@@ -149,6 +201,19 @@ struct TranscriptionJob {
     /// to the chunk they belong to instead of floating free. `Span` is
     /// `Send + Sync`; note the span is *entered*, never *held* (a held `Entered`
     /// guard would not be `Send`).
+    span: Span,
+}
+
+struct TranscriptionJob {
+    generation: u64,
+    stt_generation: u64,
+    media_path: String,
+    chunk_start_ms: u64,
+    audio_start_ms: u64,
+    align_audio_to_chunk_end: bool,
+    duration_ms: u64,
+    wav_path: PathBuf,
+    output_prefix: PathBuf,
     span: Span,
 }
 
@@ -227,10 +292,11 @@ impl TranscriptionWorker {
                         if worker_generation.load(Ordering::Acquire) != job.generation {
                             return Err(MpvSttError::SttCancelled);
                         }
-                        stt_runner.transcribe(
+                        stt_runner.transcribe_with_generation(
                             job.wav_path.to_str().unwrap_or_default(),
                             job.output_prefix.to_str().unwrap_or_default(),
                             job.duration_ms,
+                            job.stt_generation,
                         )
                     })();
                     let device_notice = stt_runner.take_device_notice();
@@ -254,28 +320,20 @@ impl TranscriptionWorker {
         }
     }
 
-    fn submit(
-        &self,
-        media_path: String,
-        chunk_start_ms: u64,
-        audio_start_ms: u64,
-        align_audio_to_chunk_end: bool,
-        duration_ms: u64,
-        wav_path: PathBuf,
-        output_prefix: PathBuf,
-        span: Span,
-    ) -> Option<u64> {
+    fn submit(&self, input: TranscriptionJobInput) -> Option<u64> {
         let generation = self.generation.load(Ordering::Acquire);
+        let stt_generation = self.stt_cancel_generation.load(Ordering::Acquire);
         let job = TranscriptionJob {
             generation,
-            media_path,
-            chunk_start_ms,
-            audio_start_ms,
-            align_audio_to_chunk_end,
-            duration_ms,
-            wav_path,
-            output_prefix,
-            span,
+            stt_generation,
+            media_path: input.media_path,
+            chunk_start_ms: input.chunk_start_ms,
+            audio_start_ms: input.audio_start_ms,
+            align_audio_to_chunk_end: input.align_audio_to_chunk_end,
+            duration_ms: input.duration_ms,
+            wav_path: input.wav_path,
+            output_prefix: input.output_prefix,
+            span: input.span,
         };
         self.job_sender.send(Some(job)).ok().map(|()| generation)
     }
@@ -372,7 +430,7 @@ struct PluginState {
     /// OSD, avoiding one message per failed cue.
     translation_failure_reported: bool,
     processed_chunks: HashSet<u64>,
-    network_cache: Option<CachePaths>,
+    subtitle_cache: Option<CachePaths>,
 
     running: bool,
     shutting_down: bool,
@@ -381,6 +439,7 @@ struct PluginState {
     current_pos_ms: u64,
     last_playback_pos_ms: Option<u64>,
     last_playback_instant: Option<Instant>,
+    seek_pending: bool,
     chunk_dur: u64,
     mode: Option<ProcessingMode>,
     pending_auto_start: bool, // Delayed auto-start after file loads
@@ -411,10 +470,9 @@ impl PluginState {
             .with_ffmpeg_timeout(config.timeout.ffmpeg_ms)
             .with_ffprobe_timeout(config.timeout.ffprobe_ms);
 
-        let active_stt_source = config
-            .stt
-            .active_source_name()
-            .map_err(|e| MpvSttError::SttFailed(format!("{e}; protocols: openai, ferrum")))?;
+        let active_stt_source = config.stt.active_source_name().map_err(|e| {
+            MpvSttError::SttFailed(format!("{e}; protocols: openai, ferrum, cloudflare"))
+        })?;
         let stt_retry = config
             .stt
             .sources
@@ -424,8 +482,8 @@ impl PluginState {
             .clone();
 
         // Initialize the STT backend of the source named by `[stt] source`.
-        // Both remote protocols are compiled in; `from_config` resolves the
-        // name and matches the source's protocol to the active backend.
+        // `from_config` resolves the name and selects the backend compiled for
+        // the source's protocol.
         let stt_runner = SttRunner::from_config(&config.stt)?;
         let transcription_worker = TranscriptionWorker::new(audio_extractor, stt_runner);
         let paths = TempPaths::new()?;
@@ -453,7 +511,7 @@ impl PluginState {
             last_translation_scan: None,
             translation_failure_reported: false,
             processed_chunks: HashSet::new(),
-            network_cache: None,
+            subtitle_cache: None,
             running: false,
             shutting_down: false,
             translate_enabled: true,
@@ -461,6 +519,7 @@ impl PluginState {
             current_pos_ms: 0,
             last_playback_pos_ms: None,
             last_playback_instant: None,
+            seek_pending: false,
             mode: None,
             pending_auto_start: false,
             file_loaded: false,
@@ -684,7 +743,7 @@ impl PluginState {
                 let retry_due = self
                     .translation_retries
                     .get(&start_ms)
-                    .map_or(true, |retry| retry.retry_at <= now);
+                    .is_none_or(|retry| retry.retry_at <= now);
                 if !retry_due {
                     waiting_retry += 1;
                     continue;
@@ -816,37 +875,77 @@ impl PluginState {
         }
     }
 
-    /// Delete the current media's on-disk subtitle/translation cache and drop
-    /// the in-memory translation + processed-chunk state, so replaying the same
-    /// file re-transcribes instead of reusing stale cached subtitles.
-    fn clear_cache(&mut self, client: &mut Handle) {
+    fn remove_plugin_cache_files(paths: &[CachePaths]) -> usize {
         let mut removed = 0usize;
-        if let Some(media_id) = Self::media_id_for_cache(client) {
-            if let Some(paths) = self.cache_paths_for_media(&media_id) {
-                for p in [&paths.subtitle_path, &paths.manifest_path] {
-                    if p.exists() {
-                        match std::fs::remove_file(p) {
-                            Ok(()) => removed += 1,
-                            // A cache file the user asked to delete but could
-                            // not be: worth recording, not worth a session
-                            // teardown or a line on screen.
-                            Err(e) => warn!(
-                                error = %e,
-                                cause = %logging::err_chain(&e),
-                                path = %p.display(),
-                                "cannot remove a cache file"
-                            ),
-                        }
-                    }
+        for paths in paths {
+            for path in [&paths.subtitle_path, &paths.manifest_path] {
+                if !path.exists() {
+                    continue;
+                }
+                match fs::remove_file(path) {
+                    Ok(()) => removed += 1,
+                    Err(error) => warn!(
+                        error = %error,
+                        cause = %logging::err_chain(&error),
+                        path = %path.display(),
+                        "cannot remove a plugin subtitle cache file"
+                    ),
                 }
             }
         }
-        // Drop in-memory state so a fresh playback re-transcribes from scratch.
+        removed
+    }
+
+    /// Delete only the current media's plugin-owned subtitle cache, leaving
+    /// ordinary `.srt` sidecars untouched.
+    fn clear_cache(&mut self, client: &mut Handle) {
+        let is_network = matches!(&self.mode, Some(ProcessingMode::Network))
+            || self.detect_network_stream(client);
+        let media_id = is_network
+            .then(|| Self::media_id_for_cache(client))
+            .flatten();
+        let current_paths = self.subtitle_cache.clone().or_else(|| {
+            if is_network {
+                media_id
+                    .as_deref()
+                    .and_then(|id| self.cache_paths_for_network_media(id))
+            } else {
+                client
+                    .get_property::<String>("path")
+                    .ok()
+                    .and_then(|path| Self::local_cache_paths_for_media_uri(&path))
+            }
+        });
+
+        let mut paths_to_clear = Vec::new();
+        if let Some(paths) = current_paths {
+            paths_to_clear.push(paths);
+        }
+        if is_network
+            && let (Some(media_id), Some(root)) = (media_id.as_deref(), Self::cache_root_dir())
+        {
+            paths_to_clear.push(Self::legacy_cache_paths_for_network_media_at(
+                &root, media_id,
+            ));
+        }
+
+        let removed = Self::remove_plugin_cache_files(&paths_to_clear);
+
+        // Drop in-memory cues as well, so the next result cannot rewrite the
+        // cache with subtitles the user just cleared.
         let chunk_entries = self.translation_cache.len();
+        self.subtitle_manager.clear();
         self.translation_cache.clear();
+        self.known_original_cues.clear();
+        self.pending_translations.clear();
         self.cancel_translation_inflight();
         self.reset_translation_failures();
         self.processed_chunks.clear();
+        self.transcription_retry = None;
+        self.cached_subtitle_path = None;
+        // Keep the loaded-track state: mpv may still hold the external subtitle
+        // track after its file is removed, so the next save must reload it
+        // rather than adding a duplicate track.
 
         info!(
             removed_files = removed,
@@ -888,16 +987,16 @@ impl PluginState {
             duration_ms,
             self.transcription_worker.generation(),
         );
-        let Some(generation) = self.transcription_worker.submit(
+        let Some(generation) = self.transcription_worker.submit(TranscriptionJobInput {
             media_path,
             chunk_start_ms,
             audio_start_ms,
             align_audio_to_chunk_end,
             duration_ms,
-            self.paths.tmp_wav.clone(),
+            wav_path: self.paths.tmp_wav.clone(),
             output_prefix,
-            span.clone(),
-        ) else {
+            span: span.clone(),
+        }) else {
             let start_ms = self.current_pos_ms;
             let delay =
                 self.defer_transcription_retry(start_ms, "transcription worker is unavailable");
@@ -1047,11 +1146,16 @@ impl PluginState {
         self.transcription_complete = false;
         self.transcription_retry = None;
         self.last_translation_scan = None;
+        self.subtitle_cache = None;
+        self.cached_subtitle_path = None;
+        self.subs_loaded = false;
 
         // Get current position
         let time_pos: f64 = client.get_property("time-pos").unwrap_or(0.0);
         self.current_pos_ms = (time_pos * 1000.0) as u64;
         self.last_playback_pos_ms = Some(self.current_pos_ms);
+        self.last_playback_instant = Some(Instant::now());
+        self.seek_pending = false;
 
         // Check if network stream - use multiple detection methods
         let is_network = self.detect_network_stream(client);
@@ -1092,38 +1196,24 @@ impl PluginState {
             }
 
             self.mode = Some(ProcessingMode::Network);
-            self.network_cache = None;
+            self.subtitle_cache = None;
             let chunk_size = self.network_chunk_size();
             self.current_pos_ms -= self.current_pos_ms % chunk_size;
 
             if self.config.playback.save_srt {
                 if let Some(media_id) = Self::media_id_for_cache(client) {
-                    if let Some(cache_paths) = self.cache_paths_for_media(&media_id) {
-                        if let Some(parent) = cache_paths.subtitle_path.parent() {
-                            if let Err(err) = fs::create_dir_all(parent) {
-                                warn!(
-                                    error = %err,
-                                    cause = %logging::err_chain(&err),
-                                    dir = %parent.display(),
-                                    "cannot create the subtitle cache directory"
-                                );
-                            }
+                    if let Some(cache_paths) = self.cache_paths_for_network_media(&media_id) {
+                        Self::create_cache_parent(&cache_paths);
+                        Self::migrate_legacy_network_cache(&media_id, &cache_paths);
+                        if cache_paths.subtitle_path.exists()
+                            && self.load_cached_subs(&cache_paths, self.network_chunk_size())
+                        {
+                            let _ = client
+                                .command(&["sub-add", cache_paths.subtitle_path.to_str().unwrap()]);
+                            self.subs_loaded = true;
+                            self.cached_subtitle_path = Some(cache_paths.subtitle_path.clone());
                         }
-                        if cache_paths.subtitle_path.exists() {
-                            if self.load_cached_subs(
-                                &cache_paths.subtitle_path,
-                                Some(&cache_paths.manifest_path),
-                                self.network_chunk_size(),
-                            ) {
-                                let _ = client.command(&[
-                                    "sub-add",
-                                    cache_paths.subtitle_path.to_str().unwrap(),
-                                ]);
-                                self.subs_loaded = true;
-                                self.cached_subtitle_path = Some(cache_paths.subtitle_path.clone());
-                            }
-                        }
-                        self.network_cache = Some(cache_paths);
+                        self.subtitle_cache = Some(cache_paths);
                     }
                 }
             }
@@ -1141,14 +1231,17 @@ impl PluginState {
             if let (Ok(path), Ok(dur)) = (media_path, duration) {
                 let file_length_ms = (dur * 1000.0) as u64;
 
-                // Calculate subtitle path next to the video file when possible.
-                // SAF content:// URIs are not writable as filesystem paths.
-                let subtitle_path = if self.config.playback.save_srt {
-                    Self::get_subtitle_path_for_media_uri(&path)
-                        .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"))
+                // Save a namespaced SRT next to local media when the path is
+                // filesystem-backed. Opaque URIs remain temporary-only.
+                let cache_paths = if self.config.playback.save_srt {
+                    Self::local_cache_paths_for_media_uri(&path)
                 } else {
-                    self.paths.tmp_sub.with_extension("srt")
+                    None
                 };
+                let subtitle_path = cache_paths
+                    .as_ref()
+                    .map(|cache| cache.subtitle_path.clone())
+                    .unwrap_or_else(|| self.paths.tmp_sub.with_extension("srt"));
 
                 info!(
                     display = %logging::osd_line("STT: Starting local file transcription..."),
@@ -1165,14 +1258,19 @@ impl PluginState {
                     file_length_ms,
                     subtitle_path: subtitle_path.clone(),
                 });
-                self.network_cache = None;
+                self.subtitle_cache = None;
 
-                if self.config.playback.save_srt && subtitle_path.exists() {
-                    if self.load_cached_subs(&subtitle_path, None, self.local_chunk_size()) {
-                        let _ = client.command(&["sub-add", subtitle_path.to_str().unwrap()]);
+                if let Some(cache_paths) = cache_paths {
+                    Self::create_cache_parent(&cache_paths);
+                    if cache_paths.subtitle_path.exists()
+                        && self.load_cached_subs(&cache_paths, self.local_chunk_size())
+                    {
+                        let _ = client
+                            .command(&["sub-add", cache_paths.subtitle_path.to_str().unwrap()]);
                         self.subs_loaded = true;
-                        self.cached_subtitle_path = Some(subtitle_path.clone());
+                        self.cached_subtitle_path = Some(cache_paths.subtitle_path.clone());
                     }
+                    self.subtitle_cache = Some(cache_paths);
                 }
 
                 // Create initial subtitles if this chunk hasn't been processed.
@@ -1211,11 +1309,18 @@ impl PluginState {
             return;
         }
 
+        if self.mode.is_some()
+            && (self.running || self.transcription_complete)
+            && self.check_seek(client)
+        {
+            return;
+        }
+
         if !self.running {
             if self.transcription_complete {
                 let subtitle_path = match &self.mode {
                     Some(ProcessingMode::Network) => self
-                        .network_cache
+                        .subtitle_cache
                         .as_ref()
                         .map(|cache| cache.subtitle_path.clone()),
                     Some(ProcessingMode::Local { subtitle_path, .. }) => {
@@ -1229,9 +1334,6 @@ impl PluginState {
             return;
         }
 
-        if self.pending_transcription.is_some() && self.check_seek(client) {
-            return;
-        }
         self.poll_transcription(client);
         if !self.running || self.shutting_down {
             return;
@@ -1255,15 +1357,9 @@ impl PluginState {
 
     fn tick_network(&mut self, client: &mut Handle) {
         let subtitle_path = self
-            .network_cache
+            .subtitle_cache
             .as_ref()
             .map(|cache| cache.subtitle_path.clone());
-
-        // Check for seek first. If cache isn't ready yet after a seek, we still want to update
-        // `current_pos_ms` so we don't keep generating subtitles for the old position.
-        if self.check_seek(client) {
-            return;
-        }
 
         // Check for completed translations from async queue
         self.process_translation_results(client, subtitle_path.as_deref());
@@ -1358,11 +1454,6 @@ impl PluginState {
         file_length_ms: u64,
         subtitle_path: &Path,
     ) {
-        // Check for seek
-        if self.check_seek(client) {
-            return;
-        }
-
         // Check for completed translations from async queue
         self.process_translation_results(client, Some(subtitle_path));
         self.enqueue_missing_translations(false);
@@ -1448,70 +1539,101 @@ impl PluginState {
     }
 
     fn check_seek(&mut self, client: &mut Handle) -> bool {
-        let playback_pos: Option<f64> = client.get_property("time-pos").ok();
-        if let Some(pos) = playback_pos {
-            let playback_pos_ms = (pos * 1000.0) as u64;
-            let now = Instant::now();
+        let Ok(playback_pos) = client.get_property::<f64>("time-pos") else {
+            return false;
+        };
+        let playback_pos_ms = (playback_pos * 1000.0) as u64;
+        let now = Instant::now();
+        let last_pos_ms = self.last_playback_pos_ms;
+        let elapsed_ms = self.last_playback_instant.map(|last| {
+            now.duration_since(last)
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX)
+        });
+        let explicit_seek = self.seek_pending;
 
-            // Detect user seek by comparing against the last observed playback position.
-            // IMPORTANT: `current_pos_ms` is the *processing cursor* (next chunk start), which can
-            // legitimately run ahead of playback when the cache is full. Comparing playback to
-            // `current_pos_ms` causes false "seek backward" detections and makes subtitles vanish.
-            let Some(last_ms) = self.last_playback_pos_ms.replace(playback_pos_ms) else {
-                self.last_playback_instant = Some(now);
-                return false;
-            };
-            let last_instant = self.last_playback_instant.replace(now);
+        self.last_playback_pos_ms = Some(playback_pos_ms);
+        self.last_playback_instant = Some(now);
+        self.seek_pending = false;
 
-            // Avoid treating normal playback progression (or time spent inside STT/translate)
-            // as a seek. Since we process in chunk units, only treat jumps of >= 1 chunk as seek.
-            let chunk_size = self.active_chunk_size();
-            let seek_threshold_ms = std::cmp::max(5_000, chunk_size);
-            let delta_ms = playback_pos_ms.abs_diff(last_ms);
-            if delta_ms < seek_threshold_ms {
-                return false;
-            }
-            if let Some(last_instant) = last_instant {
-                let elapsed_ms = now
-                    .duration_since(last_instant)
-                    .as_millis()
-                    .try_into()
-                    .unwrap_or(u64::MAX);
-                if delta_ms <= elapsed_ms.saturating_add(seek_threshold_ms) {
-                    return false;
-                }
-            }
+        // `current_pos_ms` is the processing cursor and may run ahead of playback
+        // when cache is available. Use the playback sample baseline instead.
+        let Some(target) = detect_seek_target(
+            playback_pos_ms,
+            last_pos_ms,
+            elapsed_ms,
+            self.current_pos_ms,
+            self.active_chunk_size(),
+            explicit_seek,
+        ) else {
+            return false;
+        };
 
-            let new_pos = playback_pos_ms - (playback_pos_ms % chunk_size);
-            if new_pos == self.current_pos_ms {
-                debug!(
-                    new_pos,
-                    "seek landed inside the chunk in flight; keeping its tasks"
-                );
-                return false;
-            }
-
-            let forward = playback_pos_ms > last_ms;
+        if target.position_ms == self.current_pos_ms {
             debug!(
-                direction = if forward { "forward" } else { "backward" },
-                from_ms = last_ms,
-                to_ms = new_pos,
-                delta_ms,
-                "seeked"
+                new_pos = target.position_ms,
+                "seek landed inside the chunk in flight; keeping its tasks"
             );
+            return false;
+        }
+
+        debug!(
+            direction = if target.forward {
+                "forward"
+            } else {
+                "backward"
+            },
+            from_ms = last_pos_ms.unwrap_or(self.current_pos_ms),
+            to_ms = target.position_ms,
+            delta_ms = playback_pos_ms.abs_diff(last_pos_ms.unwrap_or(self.current_pos_ms)),
+            explicit = explicit_seek,
+            "seeked"
+        );
+
+        if self.apply_seek_target(target) {
             // Drawn directly: the seek overlay is transient feedback for an
             // action the user just took, not a diagnostic worth queueing.
             let _ = client.command(&[
                 "show-text",
-                &format!("STT: Seeked to {}", Self::format_progress(new_pos)),
+                &format!(
+                    "STT: Seeked to {}",
+                    Self::format_progress(target.position_ms)
+                ),
                 "3000",
             ]);
-
-            self.current_pos_ms = new_pos;
-            self.handle_seek_to(new_pos, forward);
-            return true;
+            true
+        } else {
+            false
         }
-        false
+    }
+
+    fn apply_seek_target(&mut self, target: SeekTarget) -> bool {
+        if target.position_ms == self.current_pos_ms {
+            return false;
+        }
+
+        let completed_session = !self.running && self.transcription_complete && self.mode.is_some();
+        if completed_session && self.is_chunk_processed(target.position_ms) {
+            debug!(
+                target_ms = target.position_ms,
+                "completed session already covers the seek target; keeping its results"
+            );
+            return false;
+        }
+
+        if completed_session {
+            self.running = true;
+            self.transcription_complete = false;
+            debug!(
+                target_ms = target.position_ms,
+                "resuming transcription for an uncovered seek target"
+            );
+        }
+
+        self.current_pos_ms = target.position_ms;
+        self.handle_seek_to(target.position_ms, target.forward);
+        true
     }
 
     /// Realign the session after a seek to `new_pos` (already chunk-aligned).
@@ -1947,11 +2069,12 @@ impl PluginState {
         self.known_original_cues.clear();
         self.reset_translation_failures();
         self.processed_chunks.clear();
-        self.network_cache = None;
+        self.subtitle_cache = None;
         self.subs_loaded = false;
         self.current_pos_ms = 0;
         self.last_playback_pos_ms = None;
         self.last_playback_instant = None;
+        self.seek_pending = false;
         self.mode = None;
         self.transcription_complete = false;
     }
@@ -2016,14 +2139,176 @@ impl PluginState {
         )
     }
 
-    fn cache_paths_for_media(&self, media_id: &str) -> Option<CachePaths> {
-        let dir = Self::cache_root_dir()?;
-        let hash = Self::fnv1a_hash64(media_id);
-        let stem = format!("{:016x}", hash);
+    fn cache_paths_for_network_media(&self, media_id: &str) -> Option<CachePaths> {
+        let root = Self::cache_root_dir()?;
+        Some(Self::cache_paths_for_network_media_at(&root, media_id))
+    }
+
+    fn cache_paths_for_network_media_at(root: &Path, media_id: &str) -> CachePaths {
+        let normalized_id = Self::normalize_network_media_id(media_id);
+        let media_identity_hash = Self::sha256_hex(&normalized_id);
+        let basename = Self::safe_media_basename(media_id);
+        let stem = format!("{basename}.mpv_stt_plugin_rs-{media_identity_hash}");
+        CachePaths {
+            subtitle_path: root.join(format!("{stem}.srt")),
+            manifest_path: root.join(format!("{stem}.json")),
+            media_identity_hash,
+            media_fingerprint: None,
+        }
+    }
+
+    fn legacy_cache_paths_for_network_media_at(root: &Path, media_id: &str) -> CachePaths {
+        let stem = format!("{:016x}", Self::fnv1a_hash64(media_id));
+        CachePaths {
+            subtitle_path: root.join(format!("{stem}.srt")),
+            manifest_path: root.join(format!("{stem}.json")),
+            media_identity_hash: String::new(),
+            media_fingerprint: None,
+        }
+    }
+
+    fn local_cache_paths_for_media_uri(media_uri: &str) -> Option<CachePaths> {
+        let media_path = Self::canonical_local_media_path(media_uri)?;
+        let filename = media_path.file_name()?.to_string_lossy();
+        let parent = media_path.parent()?;
+        let identity = media_path.to_string_lossy();
+        let media_identity_hash = Self::sha256_hex(&identity);
+        let media_fingerprint = Self::local_media_fingerprint(&media_path);
         Some(CachePaths {
-            subtitle_path: dir.join(format!("{stem}.srt")),
-            manifest_path: dir.join(format!("{stem}.json")),
+            subtitle_path: parent.join(format!("{filename}.mpv_stt_plugin_rs.srt")),
+            manifest_path: parent.join(format!("{filename}.mpv_stt_plugin_rs.json")),
+            media_identity_hash,
+            media_fingerprint,
         })
+    }
+
+    fn canonical_local_media_path(media_uri: &str) -> Option<PathBuf> {
+        let media_uri = media_uri.trim();
+        let path = match Url::parse(media_uri) {
+            Ok(url) if url.scheme().eq_ignore_ascii_case("file") => url.to_file_path().ok()?,
+            _ if media_uri.contains("://") => return None,
+            _ => PathBuf::from(media_uri),
+        };
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        };
+        Some(
+            fs::canonicalize(&absolute)
+                .unwrap_or_else(|_| Self::normalize_absolute_path(&absolute)),
+        )
+    }
+
+    fn normalize_absolute_path(path: &Path) -> PathBuf {
+        use std::path::Component;
+
+        let mut normalized = PathBuf::new();
+        for component in path.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    normalized.pop();
+                }
+                component => normalized.push(component.as_os_str()),
+            }
+        }
+        normalized
+    }
+
+    fn local_media_fingerprint(path: &Path) -> Option<String> {
+        let metadata = fs::metadata(path).ok()?;
+        let modified_ns = metadata
+            .modified()
+            .ok()?
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        Some(format!("{}:{modified_ns}", metadata.len()))
+    }
+
+    fn normalize_network_media_id(media_id: &str) -> String {
+        let Ok(mut url) = Url::parse(media_id.trim()) else {
+            return media_id.trim().to_string();
+        };
+        url.set_fragment(None);
+        // Authentication in URL userinfo must not split cache identity or be
+        // retained in any value used to derive a persistent cache name.
+        let _ = url.set_username("");
+        let _ = url.set_password(None);
+
+        let mut query: Vec<(String, String)> = url
+            .query_pairs()
+            .filter(|(key, _)| !Self::is_volatile_auth_query_parameter(key))
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        query.sort_unstable();
+        url.set_query(None);
+        if !query.is_empty() {
+            url.query_pairs_mut().extend_pairs(query);
+        }
+        url.to_string()
+    }
+
+    fn is_volatile_auth_query_parameter(key: &str) -> bool {
+        matches!(
+            key.to_ascii_lowercase().as_str(),
+            "access_token"
+                | "auth"
+                | "expires"
+                | "expiry"
+                | "hdnea"
+                | "hdnts"
+                | "jwt"
+                | "key-pair-id"
+                | "policy"
+                | "sig"
+                | "signature"
+                | "token"
+                | "x-amz-credential"
+                | "x-amz-date"
+                | "x-amz-expires"
+                | "x-amz-security-token"
+                | "x-amz-signature"
+        )
+    }
+
+    fn safe_media_basename(media_id: &str) -> String {
+        let candidate = Url::parse(media_id)
+            .ok()
+            .and_then(|url| {
+                url.path_segments()
+                    .and_then(Iterator::last)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+            })
+            .or_else(|| {
+                Path::new(media_id)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .unwrap_or_else(|| "stream".to_string());
+        let safe: String = candidate
+            .chars()
+            .take(80)
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                    character
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let safe = safe.trim_matches('.');
+        if safe.is_empty() {
+            "stream".to_string()
+        } else {
+            safe.to_string()
+        }
+    }
+
+    fn sha256_hex(input: &str) -> String {
+        format!("{:x}", Sha256::digest(input.as_bytes()))
     }
 
     fn fnv1a_hash64(input: &str) -> u64 {
@@ -2037,45 +2322,109 @@ impl PluginState {
         hash
     }
 
-    fn load_cached_subs(
-        &mut self,
-        srt_path: &Path,
-        manifest_path: Option<&Path>,
-        chunk_size_ms: u64,
-    ) -> bool {
-        if !srt_path.exists() {
+    fn create_cache_parent(paths: &CachePaths) {
+        if let Some(parent) = paths.subtitle_path.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            warn!(
+                error = %error,
+                cause = %logging::err_chain(&error),
+                dir = %parent.display(),
+                "cannot create the subtitle cache directory"
+            );
+        }
+    }
+
+    fn migrate_legacy_network_cache(media_id: &str, new_paths: &CachePaths) {
+        if new_paths.subtitle_path.exists() || new_paths.manifest_path.exists() {
+            return;
+        }
+        let Some(root) = new_paths.manifest_path.parent() else {
+            return;
+        };
+        let legacy = Self::legacy_cache_paths_for_network_media_at(root, media_id);
+        if !legacy.subtitle_path.exists() || !legacy.manifest_path.exists() {
+            return;
+        }
+
+        let Some(mut manifest) = Self::read_cache_manifest(&legacy.manifest_path) else {
+            return;
+        };
+        if manifest.schema_version != 0
+            || manifest.timeline_version != SUBTITLE_TIMELINE_VERSION
+            || !manifest.media_identity_hash.is_empty()
+            || SrtFile::parse(&legacy.subtitle_path).is_err()
+        {
+            return;
+        }
+
+        manifest.schema_version = SUBTITLE_CACHE_SCHEMA_VERSION;
+        manifest.media_identity_hash = new_paths.media_identity_hash.clone();
+        manifest.media_fingerprint = new_paths.media_fingerprint.clone();
+        let Ok(content) = serde_json::to_string(&manifest) else {
+            return;
+        };
+        if let Err(error) = fs::copy(&legacy.subtitle_path, &new_paths.subtitle_path) {
+            warn!(
+                error = %error,
+                path = %legacy.subtitle_path.display(),
+                "cannot copy a legacy network subtitle cache"
+            );
+            return;
+        }
+        if let Err(error) = fs::write(&new_paths.manifest_path, content) {
+            let _ = fs::remove_file(&new_paths.subtitle_path);
+            warn!(
+                error = %error,
+                path = %new_paths.manifest_path.display(),
+                "cannot migrate the legacy network cache manifest"
+            );
+            return;
+        }
+
+        for legacy_path in [&legacy.subtitle_path, &legacy.manifest_path] {
+            if let Err(error) = fs::remove_file(legacy_path) {
+                warn!(
+                    error = %error,
+                    path = %legacy_path.display(),
+                    "cannot remove a migrated legacy cache file"
+                );
+            }
+        }
+        info!(
+            path = %new_paths.subtitle_path.display(),
+            "migrated the current network subtitle cache"
+        );
+    }
+
+    fn cache_manifest_matches(paths: &CachePaths, manifest: &CacheManifest) -> bool {
+        manifest.schema_version == SUBTITLE_CACHE_SCHEMA_VERSION
+            && manifest.timeline_version == SUBTITLE_TIMELINE_VERSION
+            && manifest.media_identity_hash == paths.media_identity_hash
+            && manifest.media_fingerprint == paths.media_fingerprint
+    }
+
+    fn load_cached_subs(&mut self, paths: &CachePaths, chunk_size_ms: u64) -> bool {
+        if !paths.subtitle_path.exists() {
             return false;
         }
 
-        // Network subtitle files are plugin-owned caches. If their manifest
-        // predates a timeline fix, do not load the old cues or treat them as
-        // completed chunks; the next successful chunk will rewrite the cache.
-        let manifest = if let Some(path) = manifest_path {
-            match self.load_cache_manifest(path) {
-                Some(manifest) if manifest.timeline_version == SUBTITLE_TIMELINE_VERSION => {
-                    Some(manifest)
-                }
-                Some(manifest) => {
-                    warn!(
-                        cached_version = manifest.timeline_version,
-                        current_version = SUBTITLE_TIMELINE_VERSION,
-                        path = %srt_path.display(),
-                        "ignoring network subtitles produced with an older timeline"
-                    );
-                    return false;
-                }
-                None => {
-                    debug!(
-                        path = %srt_path.display(),
-                        "ignoring network subtitles without a current timeline manifest"
-                    );
-                    return false;
-                }
-            }
-        } else {
-            None
+        let Some(manifest) = self.load_cache_manifest(&paths.manifest_path) else {
+            debug!(
+                path = %paths.subtitle_path.display(),
+                "ignoring subtitles without a readable plugin manifest"
+            );
+            return false;
         };
+        if !Self::cache_manifest_matches(paths, &manifest) {
+            debug!(
+                path = %paths.subtitle_path.display(),
+                "ignoring subtitles with a stale or mismatched plugin manifest"
+            );
+            return false;
+        }
 
+        let srt_path = &paths.subtitle_path;
         let srt_file = match SrtFile::parse(srt_path) {
             Ok(srt) => srt,
             Err(err) => {
@@ -2098,23 +2447,13 @@ impl PluginState {
         self.subtitle_manager.add_from_srt(&srt_file);
 
         let chunk_size = chunk_size_ms.max(1);
-        for entry in &srt_file.entries {
-            let start_ms = Self::timestamp_to_millis(entry.start_time) as u64;
-            let chunk_start = start_ms - (start_ms % chunk_size);
-            self.processed_chunks.insert(chunk_start);
+        if manifest.chunk_size_ms == chunk_size {
+            self.processed_chunks.extend(manifest.processed_chunks);
         }
-
-        if let Some(manifest) = manifest {
-            if manifest.chunk_size_ms == chunk_size {
-                for chunk in manifest.processed_chunks {
-                    self.processed_chunks.insert(chunk);
-                }
-            }
-            for entry in manifest.translations {
-                if !entry.translated.trim().is_empty() {
-                    self.translation_cache
-                        .insert(entry.start_ms, (entry.original, entry.translated));
-                }
+        for entry in manifest.translations {
+            if !entry.translated.trim().is_empty() {
+                self.translation_cache
+                    .insert(entry.start_ms, (entry.original, entry.translated));
             }
         }
 
@@ -2128,6 +2467,10 @@ impl PluginState {
     }
 
     fn load_cache_manifest(&self, path: &Path) -> Option<CacheManifest> {
+        Self::read_cache_manifest(path)
+    }
+
+    fn read_cache_manifest(path: &Path) -> Option<CacheManifest> {
         let content = match fs::read_to_string(path) {
             Ok(content) => content,
             Err(err) => {
@@ -2153,7 +2496,7 @@ impl PluginState {
     }
 
     fn save_cache_manifest_if_needed(&self) {
-        let Some(cache) = &self.network_cache else {
+        let Some(cache) = &self.subtitle_cache else {
             return;
         };
 
@@ -2170,9 +2513,17 @@ impl PluginState {
             })
             .collect();
 
+        let chunk_size_ms = match self.mode.as_ref() {
+            Some(ProcessingMode::Network) => self.network_chunk_size(),
+            Some(ProcessingMode::Local { .. }) => self.local_chunk_size(),
+            None => self.chunk_dur,
+        };
         let manifest = CacheManifest {
+            schema_version: SUBTITLE_CACHE_SCHEMA_VERSION,
             timeline_version: SUBTITLE_TIMELINE_VERSION,
-            chunk_size_ms: self.network_chunk_size(),
+            media_identity_hash: cache.media_identity_hash.clone(),
+            media_fingerprint: cache.media_fingerprint.clone(),
+            chunk_size_ms,
             processed_chunks,
             translations,
         };
@@ -2232,30 +2583,6 @@ impl PluginState {
 
         trace!("no network stream signal; treating the media as a local file");
         false
-    }
-
-    /// Get subtitle path for a media file (same directory, same name, .srt extension)
-    fn get_subtitle_path_for_media(media_path: &str) -> PathBuf {
-        let path = Path::new(media_path);
-        if let Some(stem) = path.file_stem() {
-            if let Some(parent) = path.parent() {
-                return parent.join(format!("{}.srt", stem.to_string_lossy()));
-            }
-        }
-        // Fallback: just append .srt
-        PathBuf::from(format!("{}.srt", media_path))
-    }
-
-    /// Try to map a media path/URI to a writable filesystem subtitle path.
-    /// Returns None for non-filesystem URIs like content://.
-    fn get_subtitle_path_for_media_uri(media_path: &str) -> Option<PathBuf> {
-        if let Some(rest) = media_path.strip_prefix("file://") {
-            return Some(Self::get_subtitle_path_for_media(rest));
-        }
-        if media_path.contains("://") {
-            return None;
-        }
-        Some(Self::get_subtitle_path_for_media(media_path))
     }
 }
 
@@ -2436,6 +2763,7 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                         state.stop_transcription();
                     }
                     state.file_loaded = false;
+                    state.seek_pending = false;
                     state.pending_auto_start = state.config.playback.auto_start;
                 }
                 Event::FileLoaded => {
@@ -2452,6 +2780,16 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                         state.running = true;
                         state.start_transcription(client);
                     }
+                }
+                Event::Seek => {
+                    if state.shutting_down {
+                        continue;
+                    }
+                    // mpv emits Seek before the new playback position is fully
+                    // settled. Keep the marker until the following restart or
+                    // tick, where `time-pos` is reconciled without chunk-size
+                    // heuristics.
+                    state.seek_pending = true;
                 }
                 Event::PlaybackRestart => {
                     if state.shutting_down {
@@ -2474,6 +2812,7 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                         state.stop_transcription();
                     }
                     state.file_loaded = false; // Reset for next file
+                    state.seek_pending = false;
                 }
                 Event::None => {
                     if state.shutting_down {
@@ -2483,10 +2822,11 @@ pub extern "C" fn mpv_open_cplugin(handle: *mut mpv_handle) -> std::os::raw::c_i
                     state.tick(client);
                 }
                 _ => {
-                    if state.shutting_down {
+                    if state.shutting_down || state.seek_pending {
                         continue;
                     }
-                    // Other events - still tick
+                    // Other events - still tick unless a seek is awaiting its
+                    // settled position from PlaybackRestart or the next timeout.
                     state.tick(client);
                 }
             }
@@ -2527,9 +2867,18 @@ fn report_escaped_panic(payload: &(dyn std::any::Any + Send)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "stt_openai", feature = "stt_cloudflare"))]
     use std::io::Read;
+    #[cfg(feature = "stt_cloudflare")]
+    use std::io::Write;
+    #[cfg(any(feature = "stt_openai", feature = "stt_cloudflare"))]
     use std::net::TcpListener;
-    use std::time::{Duration, Instant};
+    #[cfg(feature = "stt_cloudflare")]
+    use std::net::TcpStream;
+    #[cfg(any(feature = "stt_openai", feature = "stt_cloudflare"))]
+    use std::time::Duration;
+    #[cfg(any(feature = "stt_openai", feature = "stt_cloudflare"))]
+    use std::time::Instant;
 
     #[test]
     fn control_messages_support_all_shortcuts_and_legacy_shape() {
@@ -2564,23 +2913,397 @@ mod tests {
         }
     }
 
+    #[test]
+    fn local_cache_paths_are_stable_and_distinguish_container_extensions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mkv = dir.path().join("movie.mkv");
+        let mp4 = dir.path().join("movie.mp4");
+        fs::write(&mkv, b"mkv media").unwrap();
+        fs::write(&mp4, b"mp4 media").unwrap();
+
+        let paths = PluginState::local_cache_paths_for_media_uri(mkv.to_str().unwrap()).unwrap();
+        let alias = dir.path().join(".").join("movie.mkv");
+        let alias_paths =
+            PluginState::local_cache_paths_for_media_uri(alias.to_str().unwrap()).unwrap();
+        let file_uri = Url::from_file_path(&mkv).unwrap().to_string();
+        let uri_paths = PluginState::local_cache_paths_for_media_uri(&file_uri).unwrap();
+        let mp4_paths =
+            PluginState::local_cache_paths_for_media_uri(mp4.to_str().unwrap()).unwrap();
+        let canonical_dir = fs::canonicalize(dir.path()).unwrap();
+
+        assert_eq!(
+            paths.subtitle_path,
+            canonical_dir.join("movie.mkv.mpv_stt_plugin_rs.srt")
+        );
+        assert_eq!(
+            paths.manifest_path,
+            canonical_dir.join("movie.mkv.mpv_stt_plugin_rs.json")
+        );
+        assert_eq!(paths.subtitle_path, alias_paths.subtitle_path);
+        assert_eq!(paths.media_identity_hash, alias_paths.media_identity_hash);
+        assert_eq!(paths.subtitle_path, uri_paths.subtitle_path);
+        assert_eq!(paths.media_identity_hash, uri_paths.media_identity_hash);
+        assert_ne!(paths.subtitle_path, mp4_paths.subtitle_path);
+        assert_ne!(paths.media_identity_hash, mp4_paths.media_identity_hash);
+    }
+
+    #[test]
+    fn network_cache_paths_ignore_only_volatile_url_identity_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = "HTTPS://user:old-secret@EXAMPLE.com:443/video.mkv?z=2&token=old&a=1#chapter";
+        let refreshed = "https://EXAMPLE.com/video.mkv?a=1&token=new&z=2#other";
+        let different_content = "https://example.com/video.mkv?a=1&token=new&v=2&z=2";
+
+        let first_paths = PluginState::cache_paths_for_network_media_at(dir.path(), first);
+        let refreshed_paths = PluginState::cache_paths_for_network_media_at(dir.path(), refreshed);
+        let different_paths =
+            PluginState::cache_paths_for_network_media_at(dir.path(), different_content);
+
+        assert_eq!(first_paths.subtitle_path, refreshed_paths.subtitle_path);
+        assert_eq!(
+            first_paths.media_identity_hash,
+            refreshed_paths.media_identity_hash
+        );
+        assert_ne!(first_paths.subtitle_path, different_paths.subtitle_path);
+        let filename = first_paths
+            .subtitle_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        assert!(filename.contains("video.mkv.mpv_stt_plugin_rs-"));
+        assert!(!filename.contains("old-secret"));
+        assert!(!filename.contains("token"));
+    }
+
+    #[test]
+    fn cache_manifest_must_match_schema_timeline_identity_and_fingerprint() {
+        let paths = CachePaths {
+            subtitle_path: PathBuf::from("movie.srt"),
+            manifest_path: PathBuf::from("movie.json"),
+            media_identity_hash: "media-hash".to_string(),
+            media_fingerprint: Some("12:345".to_string()),
+        };
+        let manifest =
+            |schema_version, timeline_version, identity: &str, fingerprint: Option<&str>| {
+                CacheManifest {
+                    schema_version,
+                    timeline_version,
+                    media_identity_hash: identity.to_string(),
+                    media_fingerprint: fingerprint.map(str::to_string),
+                    chunk_size_ms: 15_000,
+                    processed_chunks: Vec::new(),
+                    translations: Vec::new(),
+                }
+            };
+
+        assert!(PluginState::cache_manifest_matches(
+            &paths,
+            &manifest(
+                SUBTITLE_CACHE_SCHEMA_VERSION,
+                SUBTITLE_TIMELINE_VERSION,
+                "media-hash",
+                Some("12:345")
+            )
+        ));
+        assert!(!PluginState::cache_manifest_matches(
+            &paths,
+            &manifest(0, SUBTITLE_TIMELINE_VERSION, "media-hash", Some("12:345"))
+        ));
+        assert!(!PluginState::cache_manifest_matches(
+            &paths,
+            &manifest(
+                SUBTITLE_CACHE_SCHEMA_VERSION,
+                SUBTITLE_TIMELINE_VERSION + 1,
+                "media-hash",
+                Some("12:345")
+            )
+        ));
+        assert!(!PluginState::cache_manifest_matches(
+            &paths,
+            &manifest(
+                SUBTITLE_CACHE_SCHEMA_VERSION,
+                SUBTITLE_TIMELINE_VERSION,
+                "other-media",
+                Some("12:345")
+            )
+        ));
+        assert!(!PluginState::cache_manifest_matches(
+            &paths,
+            &manifest(
+                SUBTITLE_CACHE_SCHEMA_VERSION,
+                SUBTITLE_TIMELINE_VERSION,
+                "media-hash",
+                Some("12:346")
+            )
+        ));
+    }
+
+    #[test]
+    fn clearing_plugin_cache_files_preserves_regular_srt_sidecars() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = dir.path().join("movie.mkv");
+        let ordinary_srt = dir.path().join("movie.srt");
+        fs::write(&media, b"media").unwrap();
+        fs::write(&ordinary_srt, b"user subtitle").unwrap();
+        let paths = PluginState::local_cache_paths_for_media_uri(media.to_str().unwrap()).unwrap();
+        fs::write(&paths.subtitle_path, b"plugin subtitle").unwrap();
+        fs::write(&paths.manifest_path, b"plugin manifest").unwrap();
+
+        assert_eq!(
+            PluginState::remove_plugin_cache_files(std::slice::from_ref(&paths)),
+            2
+        );
+        assert!(media.exists());
+        assert!(ordinary_srt.exists());
+        assert!(!paths.subtitle_path.exists());
+        assert!(!paths.manifest_path.exists());
+    }
+
+    #[test]
+    fn valid_legacy_network_cache_is_migrated_to_the_namespaced_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let media_id = "https://example.test/video.mkv?token=old";
+        let paths = PluginState::cache_paths_for_network_media_at(dir.path(), media_id);
+        let legacy = PluginState::legacy_cache_paths_for_network_media_at(dir.path(), media_id);
+        fs::write(
+            &legacy.subtitle_path,
+            "1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+        )
+        .unwrap();
+        let manifest = CacheManifest {
+            schema_version: 0,
+            timeline_version: SUBTITLE_TIMELINE_VERSION,
+            media_identity_hash: String::new(),
+            media_fingerprint: None,
+            chunk_size_ms: 15_000,
+            processed_chunks: vec![0],
+            translations: Vec::new(),
+        };
+        fs::write(
+            &legacy.manifest_path,
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        PluginState::migrate_legacy_network_cache(media_id, &paths);
+
+        assert!(paths.subtitle_path.exists());
+        assert!(paths.manifest_path.exists());
+        assert!(!legacy.subtitle_path.exists());
+        assert!(!legacy.manifest_path.exists());
+        let migrated = PluginState::read_cache_manifest(&paths.manifest_path).unwrap();
+        assert_eq!(migrated.schema_version, SUBTITLE_CACHE_SCHEMA_VERSION);
+        assert_eq!(migrated.media_identity_hash, paths.media_identity_hash);
+        assert!(PluginState::cache_manifest_matches(&paths, &migrated));
+    }
+
+    #[test]
+    fn explicit_short_seeks_align_forward_and_backward_without_chunk_threshold() {
+        let forward = detect_seek_target(17_500, Some(16_000), Some(100), 60_000, 15_000, true)
+            .expect("explicit forward seek should be detected");
+        assert_eq!(
+            forward,
+            SeekTarget {
+                position_ms: 15_000,
+                forward: true,
+            }
+        );
+
+        let backward = detect_seek_target(14_000, Some(16_000), Some(100), 60_000, 15_000, true)
+            .expect("explicit backward seek should be detected");
+        assert_eq!(
+            backward,
+            SeekTarget {
+                position_ms: 0,
+                forward: false,
+            }
+        );
+    }
+
+    #[test]
+    fn repeated_small_explicit_seeks_are_not_lost_to_polling_thresholds() {
+        let first = detect_seek_target(15_500, Some(14_500), Some(100), 60_000, 15_000, true);
+        let second = detect_seek_target(17_000, Some(15_500), Some(100), 60_000, 15_000, true);
+        assert_eq!(first.map(|target| target.position_ms), Some(15_000));
+        assert_eq!(second.map(|target| target.position_ms), Some(15_000));
+    }
+
+    #[test]
+    fn ordinary_playback_progress_is_not_mistaken_for_a_seek() {
+        assert_eq!(
+            detect_seek_target(10_100, Some(10_000), Some(100), 0, 15_000, false),
+            None
+        );
+        assert_eq!(
+            detect_seek_target(30_000, Some(10_000), Some(20_000), 0, 15_000, false),
+            None
+        );
+    }
+
+    #[cfg(any(feature = "stt_openai", feature = "stt_cloudflare"))]
+    #[test]
+    fn a_seek_inside_the_current_chunk_keeps_its_inflight_work() {
+        let mut state = PluginState::new(test_config()).unwrap();
+        state.running = true;
+        state.current_pos_ms = 30_000;
+        let generation = state.transcription_worker.generation();
+
+        let changed = state.apply_seek_target(SeekTarget {
+            position_ms: 30_000,
+            forward: true,
+        });
+
+        assert!(!changed);
+        assert_eq!(state.transcription_worker.generation(), generation);
+    }
+
+    #[cfg(any(feature = "stt_openai", feature = "stt_cloudflare"))]
+    #[test]
+    fn completed_local_session_resumes_for_an_unprocessed_seek_target() {
+        let mut state = PluginState::new(test_config()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        state.mode = Some(ProcessingMode::Local {
+            media_path: "movie.mkv".to_string(),
+            file_length_ms: 60_000,
+            subtitle_path: dir.path().join("movie.srt"),
+        });
+        state.current_pos_ms = 60_000;
+        state.running = false;
+        state.transcription_complete = true;
+        state.processed_chunks.extend([15_000, 30_000, 45_000]);
+
+        assert!(state.apply_seek_target(SeekTarget {
+            position_ms: 0,
+            forward: false,
+        }));
+
+        assert!(state.running);
+        assert!(!state.transcription_complete);
+        assert_eq!(state.current_pos_ms, 0);
+        assert!(state.processed_chunks.is_empty());
+    }
+
+    #[cfg(any(feature = "stt_openai", feature = "stt_cloudflare"))]
+    #[test]
+    fn completed_local_session_does_not_restart_for_a_processed_chunk() {
+        let mut state = PluginState::new(test_config()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        state.mode = Some(ProcessingMode::Local {
+            media_path: "movie.mkv".to_string(),
+            file_length_ms: 60_000,
+            subtitle_path: dir.path().join("movie.srt"),
+        });
+        state.current_pos_ms = 60_000;
+        state.running = false;
+        state.transcription_complete = true;
+        state.processed_chunks.insert(30_000);
+        let generation = state.transcription_worker.generation();
+
+        assert!(!state.apply_seek_target(SeekTarget {
+            position_ms: 30_000,
+            forward: false,
+        }));
+
+        assert!(!state.running);
+        assert!(state.transcription_complete);
+        assert_eq!(state.current_pos_ms, 60_000);
+        assert_eq!(state.transcription_worker.generation(), generation);
+        assert!(state.is_chunk_processed(30_000));
+    }
+
     /// A config with one declared STT source. The plugin refuses to start
     /// without one, so every test that builds a `PluginState` needs this.
+    #[cfg(any(feature = "stt_openai", feature = "stt_cloudflare"))]
     fn test_config() -> Config {
         let mut config = Config::default();
+        let protocol = if cfg!(feature = "stt_openai") {
+            crate::config::SttProtocol::OpenAi
+        } else {
+            crate::config::SttProtocol::Cloudflare
+        };
         config.stt.sources.insert(
             "local".to_string(),
             crate::config::SttSourceConfig {
-                protocol: Some(crate::config::SttProtocol::OpenAi),
+                protocol: Some(protocol),
                 server_addr: Some("http://127.0.0.1:8000".to_string()),
+                account_id: Some("test-account".to_string()),
+                api_key: Some("test-token".to_string()),
                 ..Default::default()
             },
         );
         config
     }
 
+    #[cfg(any(feature = "stt_openai", feature = "stt_cloudflare"))]
+    #[test]
+    fn cached_srt_requires_a_matching_manifest_and_chunks_come_from_manifest_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let srt_path = dir.path().join("movie.mkv.mpv_stt_plugin_rs.srt");
+        let manifest_path = dir.path().join("movie.mkv.mpv_stt_plugin_rs.json");
+        fs::write(&srt_path, "1\n00:00:00,000 --> 00:00:01,000\nhello\n").unwrap();
+        let paths = CachePaths {
+            subtitle_path: srt_path.clone(),
+            manifest_path: manifest_path.clone(),
+            media_identity_hash: "current-media".to_string(),
+            media_fingerprint: Some("5:100".to_string()),
+        };
+
+        let mut state = PluginState::new(test_config()).unwrap();
+        assert!(!state.load_cached_subs(&paths, 15_000));
+        fs::write(
+            &manifest_path,
+            serde_json::to_string(&CacheManifest {
+                schema_version: SUBTITLE_CACHE_SCHEMA_VERSION,
+                timeline_version: SUBTITLE_TIMELINE_VERSION,
+                media_identity_hash: paths.media_identity_hash.clone(),
+                media_fingerprint: paths.media_fingerprint.clone(),
+                chunk_size_ms: 15_000,
+                processed_chunks: Vec::new(),
+                translations: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(state.load_cached_subs(&paths, 15_000));
+        assert_eq!(state.subtitle_manager.len(), 1);
+        assert!(!state.is_chunk_processed(0));
+
+        let mismatched_dir = tempfile::tempdir().unwrap();
+        let mismatched_paths = CachePaths {
+            subtitle_path: mismatched_dir.path().join("movie.srt"),
+            manifest_path: mismatched_dir.path().join("movie.json"),
+            media_identity_hash: "current-media".to_string(),
+            media_fingerprint: Some("5:100".to_string()),
+        };
+        fs::write(
+            &mismatched_paths.subtitle_path,
+            "1\n00:00:00,000 --> 00:00:01,000\nhello\n",
+        )
+        .unwrap();
+        fs::write(
+            &mismatched_paths.manifest_path,
+            serde_json::to_string(&CacheManifest {
+                schema_version: SUBTITLE_CACHE_SCHEMA_VERSION,
+                timeline_version: SUBTITLE_TIMELINE_VERSION,
+                media_identity_hash: "different-media".to_string(),
+                media_fingerprint: mismatched_paths.media_fingerprint.clone(),
+                chunk_size_ms: 15_000,
+                processed_chunks: vec![0],
+                translations: Vec::new(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut mismatched_state = PluginState::new(test_config()).unwrap();
+        assert!(!mismatched_state.load_cached_subs(&mismatched_paths, 15_000));
+        assert_eq!(mismatched_state.subtitle_manager.len(), 0);
+        assert!(!mismatched_state.is_chunk_processed(0));
+    }
+
     /// Failed cues are held during their backoff, and an explicit reset lets
     /// the user immediately retry after correcting the translation backend.
+    #[cfg(feature = "stt_openai")]
     #[test]
     fn translation_retry_state_can_be_reset_explicitly() {
         let mut state = PluginState::new(test_config()).unwrap();
@@ -2609,6 +3332,7 @@ mod tests {
 
     /// Ending a session (stop / new file / plugin shutdown) starts a clean
     /// slate, so a stale cooldown cannot mute the next media's subtitles.
+    #[cfg(feature = "stt_openai")]
     #[test]
     fn stopping_a_session_clears_translation_failures() {
         let mut state = PluginState::new(test_config()).unwrap();
@@ -2629,6 +3353,7 @@ mod tests {
         assert!(!state.translation_failure_reported);
     }
 
+    #[cfg(feature = "stt_openai")]
     #[test]
     fn stopping_a_session_does_not_permanently_shutdown_the_plugin() {
         let mut state = PluginState::new(test_config()).unwrap();
@@ -2652,6 +3377,7 @@ mod tests {
         assert!(state.async_translation_queue.is_none());
     }
 
+    #[cfg(feature = "stt_openai")]
     #[test]
     fn transcription_worker_cancels_a_blocked_stt_request_promptly() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -2696,16 +3422,16 @@ mod tests {
         let stt = SttRunner::from_config(&config.stt).unwrap();
         let mut worker = TranscriptionWorker::new(audio, stt);
         worker
-            .submit(
-                input.to_string_lossy().into_owned(),
-                0,
-                0,
-                false,
-                100,
-                output_wav,
+            .submit(TranscriptionJobInput {
+                media_path: input.to_string_lossy().into_owned(),
+                chunk_start_ms: 0,
+                audio_start_ms: 0,
+                align_audio_to_chunk_end: false,
+                duration_ms: 100,
+                wav_path: output_wav,
                 output_prefix,
-                logging::chunk_span(1, 0, 0, 100, 0),
-            )
+                span: logging::chunk_span(1, 0, 0, 100, 0),
+            })
             .expect("failed to submit transcription job");
         request_seen_rx
             .recv_timeout(Duration::from_secs(2))
@@ -2719,5 +3445,172 @@ mod tests {
             started.elapsed()
         );
         assert!(worker.worker_handle.is_none());
+    }
+
+    #[cfg(feature = "stt_cloudflare")]
+    fn accept_with_timeout(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => return stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for mock request"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("mock server accept failed: {error}"),
+            }
+        }
+    }
+
+    #[cfg(feature = "stt_cloudflare")]
+    fn read_complete_http_request(stream: &mut TcpStream) {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 4096];
+        let mut header_end = None;
+        let mut content_length = 0usize;
+        loop {
+            let count = stream.read(&mut chunk).unwrap();
+            assert_ne!(count, 0, "mock request ended before its body was read");
+            bytes.extend_from_slice(&chunk[..count]);
+            if header_end.is_none()
+                && let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n")
+            {
+                let end = position + 4;
+                let headers = String::from_utf8_lossy(&bytes[..end]);
+                content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                header_end = Some(end);
+            }
+            if header_end.is_some_and(|end| bytes.len() >= end + content_length) {
+                return;
+            }
+        }
+    }
+
+    #[cfg(feature = "stt_cloudflare")]
+    #[test]
+    fn transcription_worker_processes_the_next_cloudflare_job_after_seek_cancel() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (first_request_tx, first_request_rx) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let mut first = accept_with_timeout(&listener);
+            let mut byte = [0u8; 1];
+            first.read_exact(&mut byte).unwrap();
+            first_request_tx.send(()).unwrap();
+            // Keep the first request pending until the test cancels it.
+            thread::sleep(Duration::from_millis(150));
+            drop(first);
+
+            let mut second = accept_with_timeout(&listener);
+            read_complete_http_request(&mut second);
+            let body = r#"{"success":true,"errors":[],"result":{"text":"replacement chunk","segments":[{"start":0.0,"end":0.8,"text":"replacement chunk"}]}}"#;
+            write!(
+                second,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input.wav");
+        let first_wav = temp.path().join("first.wav");
+        let second_wav = temp.path().join("second.wav");
+        let output_prefix = temp.path().join("chunk_append");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(&input, spec).unwrap();
+        for _ in 0..1_600 {
+            writer.write_sample(0i16).unwrap();
+        }
+        writer.finalize().unwrap();
+
+        let stt = SttRunner::cloudflare_for_test(
+            crate::stt::SttCloudflareConfig {
+                account_id: "account123".to_string(),
+                model: "@cf/openai/whisper-large-v3-turbo".to_string(),
+                language: None,
+                api_key: Some("test-token".to_string()),
+                timeout_ms: 5_000,
+                max_retry: 1,
+            },
+            &format!("http://{addr}/client/v4"),
+        )
+        .unwrap();
+        let audio = AudioExtractor::default().with_ffmpeg_timeout(5_000);
+        let mut worker = TranscriptionWorker::new(audio, stt);
+        let media_path = input.to_string_lossy().into_owned();
+        worker
+            .submit(TranscriptionJobInput {
+                media_path: media_path.clone(),
+                chunk_start_ms: 0,
+                audio_start_ms: 0,
+                align_audio_to_chunk_end: false,
+                duration_ms: 100,
+                wav_path: first_wav,
+                output_prefix: output_prefix.clone(),
+                span: logging::chunk_span(1, 0, 0, 100, 0),
+            })
+            .expect("failed to submit the original chunk");
+        first_request_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("Cloudflare worker never started the original request");
+
+        worker.cancel_inflight();
+        worker
+            .submit(TranscriptionJobInput {
+                media_path,
+                chunk_start_ms: 15_000,
+                audio_start_ms: 0,
+                align_audio_to_chunk_end: false,
+                duration_ms: 100,
+                wav_path: second_wav,
+                output_prefix: output_prefix.clone(),
+                span: logging::chunk_span(1, 1, 15_000, 100, 1),
+            })
+            .expect("failed to submit the seek replacement chunk");
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let result = loop {
+            if let Some(result) = worker.try_recv() {
+                break result;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "replacement Cloudflare job did not finish"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            result.result.is_ok(),
+            "replacement job failed: {:?}",
+            result.result
+        );
+        assert!(
+            std::fs::read_to_string(output_prefix.with_extension("srt"))
+                .unwrap()
+                .contains("replacement chunk")
+        );
+        worker.shutdown();
+        server.join().unwrap();
     }
 }

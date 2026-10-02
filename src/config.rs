@@ -10,13 +10,14 @@ use std::path::PathBuf;
 use tracing::warn;
 
 /// Wire protocol an STT source speaks. The plugin is a pure remote client:
-/// both protocols are compiled in, and a source's `protocol` picks which one
-/// its requests use.
+/// enabled protocols are compiled in, and a source's `protocol` picks which
+/// one its requests use.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum SttProtocol {
     Ferrum,
     OpenAi,
+    Cloudflare,
 }
 
 impl std::fmt::Display for SttProtocol {
@@ -24,6 +25,7 @@ impl std::fmt::Display for SttProtocol {
         let label = match self {
             SttProtocol::Ferrum => "ferrum",
             SttProtocol::OpenAi => "openai",
+            SttProtocol::Cloudflare => "cloudflare",
         };
         write!(f, "{label}")
     }
@@ -256,7 +258,7 @@ impl Default for SttRetryConfig {
     }
 }
 
-/// One declared STT source. The fields are the union of what both protocols
+/// One declared STT source. The fields are the union of what enabled protocols
 /// read; `protocol` decides which of them the request actually uses.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SttSourceConfig {
@@ -264,19 +266,25 @@ pub struct SttSourceConfig {
     /// source, so nothing here can be inferred from the name alone.
     pub protocol: Option<SttProtocol>,
     /// Base URL of the transcription server, e.g. `http://127.0.0.1:8000`
-    /// (OpenAI-compatible) or `http://127.0.0.1:9000` (ferrum).
+    /// (OpenAI-compatible) or `http://127.0.0.1:9000` (ferrum). Cloudflare
+    /// always uses its fixed REST API host and ignores this field.
     pub server_addr: Option<String>,
+    /// Cloudflare account id. Used only by the `cloudflare` protocol.
+    pub account_id: Option<String>,
     /// Model id. `openai` sends it as the multipart `model` field, `ferrum` as
-    /// the `x-model` header. Must be one the server offers — subtitle-gateway:
-    /// "sensevoice" / "fun-asr-mlt-nano", OpenAI: "whisper-1", Groq:
-    /// "whisper-large-v3" / "whisper-large-v3-turbo".
+    /// the `x-model` header, and `cloudflare` in the Run API path. Must be one
+    /// the server offers — subtitle-gateway: "sensevoice" / "fun-asr-mlt-nano",
+    /// OpenAI: "whisper-1", Groq: "whisper-large-v3" / "whisper-large-v3-turbo",
+    /// Cloudflare: "@cf/openai/whisper" / "@cf/openai/whisper-large-v3-turbo".
     pub model: Option<String>,
     /// Optional language hint (e.g. "ja", "zh", "en"); omitted = server
     /// auto-detects. `openai` sends it as the multipart `language` field,
-    /// `ferrum` as the `x-language` header.
+    /// `ferrum` as the `x-language` header, and Cloudflare Turbo sends it in
+    /// its JSON input (`@cf/openai/whisper` auto-detects).
     pub language: Option<String>,
-    /// Optional API key. `openai` sends `Authorization: Bearer {key}` for
-    /// servers that require auth; omitted for a local gateway that needs none.
+    /// Optional API key/token. `openai` sends `Authorization: Bearer {key}` for
+    /// servers that require auth; Cloudflare uses it as the Workers AI bearer
+    /// token. Omitted for a local gateway that needs no auth.
     pub api_key: Option<String>,
     /// Additional HTTP headers for the `openai` protocol, declared under
     /// `[stt.sources.<name>.headers]`. Custom values override generated headers
@@ -301,6 +309,7 @@ pub struct SttSourceConfig {
 impl SttSourceConfig {
     /// The fields the OpenAI protocol reads, with the shipped defaults filled
     /// in for anything the source left out.
+    #[cfg(feature = "stt_openai")]
     pub fn openai(&self) -> crate::stt::SttOpenAiConfig {
         crate::stt::SttOpenAiConfig {
             server_addr: self
@@ -319,10 +328,28 @@ impl SttSourceConfig {
         }
     }
 
+    /// The fields the Cloudflare protocol reads, with the Workers AI API and
+    /// timestamp-capable Whisper model as defaults.
+    #[cfg(feature = "stt_cloudflare")]
+    pub fn cloudflare(&self) -> crate::stt::SttCloudflareConfig {
+        crate::stt::SttCloudflareConfig {
+            account_id: self.account_id.clone().unwrap_or_default(),
+            model: self
+                .model
+                .clone()
+                .unwrap_or_else(|| "@cf/openai/whisper-large-v3-turbo".to_string()),
+            language: self.language.clone(),
+            api_key: self.api_key.clone(),
+            timeout_ms: self.timeout_ms.unwrap_or(120_000),
+            max_retry: self.max_retry.unwrap_or(3),
+        }
+    }
+
     /// The fields the ferrum protocol reads, with the shipped defaults filled
     /// in. A ferrum source carries the auth/encryption knobs verbatim: the
     /// protocol itself talks raw-body POST, Opus and AES-GCM, so nothing is
     /// inferred from the name.
+    #[cfg(feature = "stt_ferrum")]
     pub fn ferrum(&self) -> crate::stt::SttFerrumConfig {
         crate::stt::SttFerrumConfig {
             server_addr: self

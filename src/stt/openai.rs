@@ -1,3 +1,4 @@
+use super::segments::{RawSegment, Segment, normalize_segments};
 use super::{SttBackend, SttDeviceNotice};
 use crate::common::{MpvSttError, Result};
 use crate::config::SttProtocol;
@@ -347,28 +348,13 @@ impl OpenAiBackend {
 }
 
 #[derive(Debug, Deserialize)]
-struct ResponseSegment {
-    start: Option<f64>,
-    end: Option<f64>,
-    #[serde(default)]
-    text: String,
-}
-
-#[derive(Debug)]
-struct Segment {
-    start: f64,
-    end: f64,
-    text: String,
-}
-
-#[derive(Debug, Deserialize)]
 struct TranscriptionResponse {
     /// Present in every response shape: plain `json` / `text`, and also in
     /// `verbose_json` (which adds `segments` and timing metadata on top).
     #[serde(default)]
     text: String,
     #[serde(default)]
-    segments: Vec<ResponseSegment>,
+    segments: Vec<RawSegment>,
     /// `verbose_json` only: the server's own measured audio duration.
     #[serde(default)]
     duration: Option<f64>,
@@ -387,78 +373,13 @@ fn parse_transcription(json: &[u8], chunk_ms: u64) -> Result<Vec<Segment>> {
             ),
         })?;
 
-    // SRT timestamps are represented as milliseconds in u32 throughout this
-    // plugin; do not let a huge response overflow while converting seconds.
-    let chunk_duration_s = chunk_ms.min(u32::MAX as u64) as f64 / 1000.0;
-    let duration_s = resp
-        .duration
-        .filter(|duration| duration.is_finite() && *duration > 0.0)
-        .map(|duration| duration.min(chunk_duration_s))
-        .unwrap_or(chunk_duration_s);
-    let response_has_text = !resp.text.trim().is_empty()
-        || resp
-            .segments
-            .iter()
-            .any(|segment| !segment.text.trim().is_empty());
-
-    let mut segments = Vec::with_capacity(resp.segments.len());
-    let mut rejected_segments = 0usize;
-    for segment in resp.segments {
-        let text = segment.text.trim();
-        if text.is_empty() {
-            continue;
-        }
-
-        let (Some(start), Some(end)) = (segment.start, segment.end) else {
-            rejected_segments += 1;
-            continue;
-        };
-        if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start {
-            rejected_segments += 1;
-            continue;
-        }
-
-        // A model can round its final segment a little past the WAV duration.
-        // Keep the part inside this audio chunk, but never move a segment that
-        // begins after the chunk back onto its final millisecond.
-        if start >= duration_s || end <= 0.0 {
-            rejected_segments += 1;
-            continue;
-        }
-        let end = end.min(duration_s);
-        if end <= start {
-            rejected_segments += 1;
-            continue;
-        }
-
-        segments.push(Segment {
-            start,
-            end,
-            text: text.to_string(),
-        });
-    }
-
-    if rejected_segments > 0 {
-        warn!(
-            rejected_segments,
-            accepted_segments = segments.len(),
-            chunk_ms,
-            "discarded transcription segments with invalid or out-of-range timestamps"
-        );
-    }
-
-    segments.sort_by(|a, b| a.start.total_cmp(&b.start));
-    if !segments.is_empty() {
-        return Ok(segments);
-    }
-
-    if !response_has_text {
-        return Ok(Vec::new());
-    }
-
-    Err(MpvSttError::SttFailed(
-        "the transcription server returned text without valid segment timestamps; use a model/server that supports verbose_json segment timestamps".to_string(),
-    ))
+    normalize_segments(
+        &resp.text,
+        resp.segments,
+        resp.duration,
+        chunk_ms,
+        "OpenAI-compatible server",
+    )
 }
 
 fn normalize_server_url(raw: &str) -> String {

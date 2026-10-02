@@ -47,8 +47,9 @@ Usage: ./scripts/build-all.sh [options]
 Options:
   -p, --platform <list>  Comma-separated platforms to build (default: all).
                          linux-x86_64, darwin-arm64, darwin-x86_64, windows-x86_64
-  -f, --features <list>  Build a single STT backend (--no-default-features):
-                         stt_ferrum or stt_openai. Default: both in one artifact.
+  -f, --features <list>  Select STT backends (--no-default-features):
+                         stt_ferrum, stt_openai, and/or stt_cloudflare.
+                         Default: all three in one artifact.
       --clean            Remove dist/ first
   -l, --list             List the supported platforms and exit
   -h, --help             Show this help
@@ -335,13 +336,13 @@ main() {
 
     if ((SHOW_LIST)); then
         echo "platforms: ${PLATFORMS[*]} android"
-        echo "features : stt_ferrum stt_openai (omit to build both into one artifact)"
+        echo "features : stt_ferrum stt_openai stt_cloudflare (omit to build all into one artifact)"
         exit 0
     fi
 
     if [[ -n "${FEATURES}" ]] \
-        && [[ ! "${FEATURES}" =~ ^(stt_ferrum|stt_openai)(,(stt_ferrum|stt_openai))*$ ]]; then
-        echo "ERROR: --features takes stt_ferrum and/or stt_openai, comma-separated" >&2
+        && [[ ! "${FEATURES}" =~ ^(stt_ferrum|stt_openai|stt_cloudflare)(,(stt_ferrum|stt_openai|stt_cloudflare))*$ ]]; then
+        echo "ERROR: --features takes stt_ferrum, stt_openai, and/or stt_cloudflare, comma-separated" >&2
         exit 1
     fi
 
@@ -358,7 +359,7 @@ main() {
 
     log "==> mpv_stt_plugin_rs build"
     log "    platforms: ${platforms[*]}"
-    log "    features : ${FEATURES:-stt_ferrum,stt_openai}"
+    log "    features : ${FEATURES:-stt_ferrum,stt_openai,stt_cloudflare}"
     log "    host     : $(host_platform || echo unknown)"
 
     ensure_mpv_headers
