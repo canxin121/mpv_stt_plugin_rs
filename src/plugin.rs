@@ -139,6 +139,117 @@ struct SeekTarget {
     forward: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CacheRange {
+    start_sec: f64,
+    end_sec: f64,
+}
+
+fn cache_ranges_from_node(node: &mpv_client::Node) -> Option<Vec<CacheRange>> {
+    let mpv_client::Node::Map(state) = node else {
+        return None;
+    };
+    let Some(mpv_client::Node::Array(ranges)) = state.get("seekable-ranges") else {
+        return None;
+    };
+
+    let to_seconds = |value: &mpv_client::Node| match value {
+        mpv_client::Node::Double(value) => Some(*value),
+        mpv_client::Node::Int(value) => Some(*value as f64),
+        _ => None,
+    };
+
+    Some(
+        ranges
+            .iter()
+            .filter_map(|range| {
+                let mpv_client::Node::Map(range) = range else {
+                    return None;
+                };
+                let (start, end) = (range.get("start")?, range.get("end")?);
+                let (start_sec, end_sec) = (to_seconds(start)?, to_seconds(end)?);
+                (start_sec.is_finite() && end_sec.is_finite() && end_sec > start_sec)
+                    .then_some(CacheRange { start_sec, end_sec })
+            })
+            .collect(),
+    )
+}
+
+fn cache_ranges_have_single_cover(ranges: &[CacheRange], start_sec: f64, end_sec: f64) -> bool {
+    if !start_sec.is_finite() || !end_sec.is_finite() || end_sec <= start_sec {
+        return false;
+    }
+
+    let mut intersecting = 0usize;
+    let mut request_is_covered = false;
+    for range in ranges {
+        if range.end_sec <= start_sec || range.start_sec >= end_sec {
+            continue;
+        }
+        intersecting += 1;
+        request_is_covered = range.start_sec <= start_sec && range.end_sec >= end_sec;
+    }
+
+    intersecting == 1 && request_is_covered
+}
+
+struct NetworkCacheRecovery<'a> {
+    cursor_ms: u64,
+    playback_ms: Option<u64>,
+    chunk_ms: u64,
+    cache_end_ms: Option<u64>,
+    ranges: Option<&'a [CacheRange]>,
+    processed_chunks: &'a HashSet<u64>,
+    retry_pending: bool,
+}
+
+fn next_covered_chunk_after_playback(recovery: NetworkCacheRecovery<'_>) -> Option<u64> {
+    if recovery.retry_pending {
+        return None;
+    }
+    let (Some(playback_ms), Some(cache_end_ms), Some(ranges)) =
+        (recovery.playback_ms, recovery.cache_end_ms, recovery.ranges)
+    else {
+        return None;
+    };
+
+    let chunk_ms = recovery.chunk_ms.max(1);
+    let current_end_ms = recovery.cursor_ms.saturating_add(chunk_ms);
+    if playback_ms < current_end_ms
+        || cache_ranges_have_single_cover(
+            ranges,
+            recovery.cursor_ms as f64 / 1000.0,
+            current_end_ms as f64 / 1000.0,
+        )
+    {
+        return None;
+    }
+
+    let playback_chunk_ms = playback_ms - playback_ms % chunk_ms;
+    let mut candidate_ms = playback_chunk_ms.max(current_end_ms);
+    let remainder = candidate_ms % chunk_ms;
+    if remainder != 0 {
+        candidate_ms = candidate_ms.saturating_add(chunk_ms - remainder);
+    }
+
+    loop {
+        let end_ms = candidate_ms.saturating_add(chunk_ms);
+        if end_ms <= candidate_ms || end_ms > cache_end_ms {
+            return None;
+        }
+        if !recovery.processed_chunks.contains(&candidate_ms)
+            && cache_ranges_have_single_cover(
+                ranges,
+                candidate_ms as f64 / 1000.0,
+                end_ms as f64 / 1000.0,
+            )
+        {
+            return Some(candidate_ms);
+        }
+        candidate_ms = end_ms;
+    }
+}
+
 fn detect_seek_target(
     playback_pos_ms: u64,
     last_pos_ms: Option<u64>,
@@ -1386,17 +1497,7 @@ impl PluginState {
                 self.current_pos_ms
                     .saturating_add(self.network_chunk_size())
             });
-        let available_ms = cache_end_ms.saturating_sub(self.current_pos_ms);
         let chunk_ms = self.network_chunk_size();
-
-        if available_ms < chunk_ms && !retry_dump_available {
-            trace!(
-                needed_ms = self.current_pos_ms.saturating_add(chunk_ms),
-                cached_ms = cache_end_ms,
-                "waiting for the demuxer cache to grow"
-            );
-            return;
-        }
 
         // Catch-up mode: check if we're too far behind playback (always enabled)
         // Look-ahead processing for network streams (always enabled)
@@ -1419,7 +1520,60 @@ impl PluginState {
             self.current_pos_ms = self.current_pos_ms.saturating_add(chunk_ms);
         }
 
-        let chunk_end_ms = self.current_pos_ms.saturating_add(chunk_ms);
+        let mut chunk_end_ms = self.current_pos_ms.saturating_add(chunk_ms);
+        if !retry_dump_available {
+            let cache_ranges = Self::demuxer_cache_ranges(client);
+            let current_chunk_covered = cache_ranges.as_deref().is_some_and(|ranges| {
+                cache_ranges_have_single_cover(
+                    ranges,
+                    self.current_pos_ms as f64 / 1000.0,
+                    chunk_end_ms as f64 / 1000.0,
+                )
+            });
+            if !current_chunk_covered {
+                let retry_pending = self
+                    .transcription_retry
+                    .as_ref()
+                    .is_some_and(|retry| retry.start_ms == self.current_pos_ms);
+                let resume_pos_ms = next_covered_chunk_after_playback(NetworkCacheRecovery {
+                    cursor_ms: self.current_pos_ms,
+                    playback_ms: self.last_playback_pos_ms,
+                    chunk_ms,
+                    cache_end_ms: Some(cache_end_ms),
+                    ranges: cache_ranges.as_deref(),
+                    processed_chunks: &self.processed_chunks,
+                    retry_pending,
+                });
+                if let Some(resume_pos_ms) = resume_pos_ms {
+                    let skipped_start_ms = self.current_pos_ms;
+                    self.current_pos_ms = resume_pos_ms;
+                    chunk_end_ms = self.current_pos_ms.saturating_add(chunk_ms);
+                    warn!(
+                        skipped_start_ms,
+                        resume_start_ms = self.current_pos_ms,
+                        playback_pos_ms = self.last_playback_pos_ms,
+                        "skipping a network chunk without a single covering cache range"
+                    );
+                } else {
+                    trace!(
+                        start_sec = self.current_pos_ms as f64 / 1000.0,
+                        end_sec = chunk_end_ms as f64 / 1000.0,
+                        "waiting for one continuous demuxer cache range to cover the chunk"
+                    );
+                    return;
+                }
+            }
+        }
+
+        let available_ms = cache_end_ms.saturating_sub(self.current_pos_ms);
+        if available_ms < chunk_ms && !retry_dump_available {
+            trace!(
+                needed_ms = self.current_pos_ms.saturating_add(chunk_ms),
+                cached_ms = cache_end_ms,
+                "waiting for the demuxer cache to grow"
+            );
+            return;
+        }
         let lookahead_limit_ms =
             chunk_ms.saturating_mul(self.config.prefetch.lookahead_chunks.max(1) as u64);
         if let Some(playback_pos_ms) = self.last_playback_pos_ms {
@@ -1752,44 +1906,16 @@ impl PluginState {
     /// request. If a request crosses a gap or overlapping ranges, mpv may
     /// rebase discontinuous packets into one output timeline. Such a dump has
     /// no single reliable offset back to the source media.
+    fn demuxer_cache_ranges(client: &mut Handle) -> Option<Vec<CacheRange>> {
+        let Ok(state) = client.get_property::<mpv_client::Node>("demuxer-cache-state") else {
+            return None;
+        };
+        cache_ranges_from_node(&state)
+    }
+
     fn single_cache_range_covers(client: &mut Handle, start_sec: f64, end_sec: f64) -> bool {
-        let Ok(mpv_client::Node::Map(state)) =
-            client.get_property::<mpv_client::Node>("demuxer-cache-state")
-        else {
-            return false;
-        };
-        let Some(mpv_client::Node::Array(ranges)) = state.get("seekable-ranges") else {
-            return false;
-        };
-
-        let mut intersecting = 0usize;
-        let mut request_is_covered = false;
-        let to_seconds = |value: &mpv_client::Node| match value {
-            mpv_client::Node::Double(value) => Some(*value),
-            mpv_client::Node::Int(value) => Some(*value as f64),
-            _ => None,
-        };
-        for range in ranges {
-            let mpv_client::Node::Map(range) = range else {
-                continue;
-            };
-            let (Some(start), Some(end)) = (range.get("start"), range.get("end")) else {
-                continue;
-            };
-            let (Some(range_start), Some(range_end)) = (to_seconds(start), to_seconds(end)) else {
-                continue;
-            };
-            if !range_start.is_finite() || !range_end.is_finite() {
-                continue;
-            }
-            if range_end <= start_sec || range_start >= end_sec {
-                continue;
-            }
-            intersecting += 1;
-            request_is_covered = range_start <= start_sec && range_end >= end_sec;
-        }
-
-        intersecting == 1 && request_is_covered
+        Self::demuxer_cache_ranges(client)
+            .is_some_and(|ranges| cache_ranges_have_single_cover(&ranges, start_sec, end_sec))
     }
 
     /// Process one chunk from local file
@@ -3136,6 +3262,114 @@ mod tests {
         );
         assert_eq!(
             detect_seek_target(30_000, Some(10_000), Some(20_000), 0, 15_000, false),
+            None
+        );
+    }
+
+    fn cache_range_ms(start_ms: u64, end_ms: u64) -> CacheRange {
+        CacheRange {
+            start_sec: start_ms as f64 / 1000.0,
+            end_sec: end_ms as f64 / 1000.0,
+        }
+    }
+
+    fn recovery_target(
+        playback_ms: u64,
+        ranges: &[CacheRange],
+        processed_chunks: &HashSet<u64>,
+        retry_pending: bool,
+    ) -> Option<u64> {
+        next_covered_chunk_after_playback(NetworkCacheRecovery {
+            cursor_ms: 15_000,
+            playback_ms: Some(playback_ms),
+            chunk_ms: 15_000,
+            cache_end_ms: Some(60_000),
+            ranges: Some(ranges),
+            processed_chunks,
+            retry_pending,
+        })
+    }
+
+    #[test]
+    fn cache_recovery_waits_until_playback_passes_the_chunk() {
+        let ranges = [cache_range_ms(30_000, 60_000)];
+        assert_eq!(
+            recovery_target(29_999, &ranges, &HashSet::new(), false),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_recovery_selects_the_first_covered_chunk_at_the_playhead() {
+        let ranges = [cache_range_ms(30_000, 60_000)];
+        assert_eq!(
+            recovery_target(30_000, &ranges, &HashSet::new(), false),
+            Some(30_000)
+        );
+    }
+
+    #[test]
+    fn cache_recovery_skips_processed_chunks_and_requires_one_raw_range() {
+        let ranges = [cache_range_ms(30_000, 60_000)];
+        assert_eq!(
+            recovery_target(30_000, &ranges, &HashSet::from([30_000]), false),
+            Some(45_000)
+        );
+
+        let overlapping_ranges = [
+            cache_range_ms(30_000, 45_000),
+            cache_range_ms(40_000, 60_000),
+        ];
+        assert!(!cache_ranges_have_single_cover(
+            &overlapping_ranges,
+            30.0,
+            45.0
+        ));
+        assert_eq!(
+            recovery_target(30_000, &overlapping_ranges, &HashSet::new(), false),
+            Some(45_000)
+        );
+
+        let adjacent_ranges = [
+            cache_range_ms(30_000, 45_000),
+            cache_range_ms(45_000, 60_000),
+        ];
+        assert!(!cache_ranges_have_single_cover(
+            &adjacent_ranges,
+            30.0,
+            60.0
+        ));
+
+        let disjoint_ranges = [
+            cache_range_ms(30_000, 40_000),
+            cache_range_ms(50_000, 60_000),
+        ];
+        assert_eq!(
+            recovery_target(30_000, &disjoint_ranges, &HashSet::new(), false),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_recovery_waits_when_no_later_chunk_is_covered_or_a_retry_is_pending() {
+        let partial_range = [cache_range_ms(30_000, 44_000)];
+        assert_eq!(
+            recovery_target(30_000, &partial_range, &HashSet::new(), false),
+            None
+        );
+
+        let later_range = [cache_range_ms(30_000, 60_000)];
+        assert_eq!(
+            recovery_target(30_000, &later_range, &HashSet::new(), true),
+            None
+        );
+    }
+
+    #[test]
+    fn cache_recovery_keeps_a_chunk_that_still_has_single_range_coverage() {
+        let ranges = [cache_range_ms(15_000, 30_000)];
+        assert_eq!(
+            recovery_target(30_000, &ranges, &HashSet::new(), false),
             None
         );
     }
